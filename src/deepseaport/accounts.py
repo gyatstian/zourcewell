@@ -94,10 +94,35 @@ def _is_duplicate(a: AccountConfig, b: AccountConfig) -> bool:
 
 
 @dataclass
+class AccountHealth:
+    """In-memory health for one pooled account: cooldown + login backoff.
+
+    Persisted ban state stays on ``cfg.banned``/``cfg.banned_until`` so it
+    survives restarts; this object is the single in-memory home for the two
+    transient timers (cooldown and browser-login backoff). Every mutation
+    path (server routes, completion engine, TUI working copy) touches the
+    same state instead of parallel dicts/labels.
+    """
+
+    bad_until: float = 0.0
+    login_until: float = 0.0
+    login_reason: str = ""
+
+    @property
+    def login_backoff_remaining(self) -> float:
+        return max(0.0, self.login_until - time.time())
+
+    def clear(self) -> None:
+        self.bad_until = 0.0
+        self.login_until = 0.0
+        self.login_reason = ""
+
+
+@dataclass
 class PooledAccount:
     cfg: AccountConfig
     lock: threading.Lock = field(default_factory=threading.Lock)
-    bad_until: float = 0.0
+    health: AccountHealth = field(default_factory=AccountHealth)
     uses: int = 0
 
     def __post_init__(self) -> None:
@@ -108,9 +133,19 @@ class PooledAccount:
         except Exception:
             until = 0.0
         if until > time.time():
-            self.bad_until = max(self.bad_until, until)
+            self.health.bad_until = max(self.health.bad_until, until)
         elif getattr(self.cfg, "banned", False):
-            self.bad_until = max(self.bad_until, time.time() + COOLDOWN_SECONDS)
+            self.health.bad_until = max(self.health.bad_until,
+                                        time.time() + COOLDOWN_SECONDS)
+
+    @property
+    def bad_until(self) -> float:
+        """Cooldown deadline. Stored on ``health`` (kept as a property alias)."""
+        return self.health.bad_until
+
+    @bad_until.setter
+    def bad_until(self, value: float) -> None:
+        self.health.bad_until = value
 
     @property
     def identifier(self) -> str:
@@ -119,6 +154,26 @@ class PooledAccount:
     @property
     def busy(self) -> bool:
         return self.lock.locked()
+
+    def login_backoff_skip(self) -> str | None:
+        """Remaining-skipping reason when a recent login failure backs off."""
+        if self.health.login_until <= 0:
+            return None
+        now = time.time()
+        if now >= self.health.login_until:
+            self.health.login_until = 0.0
+            self.health.login_reason = ""
+            return None
+        return (f"recent {self.health.login_reason} "
+                f"{int(self.health.login_until - now)}s ago")
+
+    def set_login_backoff(self, reason: str, seconds: float) -> None:
+        self.health.login_reason = str(reason or "")
+        self.health.login_until = time.time() + max(0.0, float(seconds))
+
+    def clear_login_backoff(self) -> None:
+        self.health.login_until = 0.0
+        self.health.login_reason = ""
 
     @property
     def banned(self) -> bool:
@@ -351,21 +406,40 @@ class AccountPool:
         return rows
 
     def clear_cooldown(self, identifier: str | None = None) -> int:
-        """Clear cooldown/ban state for one account (or all when None)."""
+        """Clear cooldown, persisted ban, AND login backoff (one/all).
+
+        The single unblock entry point: every part of ``AccountHealth`` is
+        reset here so the REST unblock/set-token paths cannot leave a stale
+        login backoff behind."""
         n = 0
         with self._guard:
             for item in self._items:
                 if identifier is None or _matches(item.cfg, identifier):
-                    if item.bad_until > 0 or getattr(item.cfg, "banned", False):
+                    if (item.health.bad_until > 0
+                            or getattr(item.cfg, "banned", False)
+                            or item.health.login_until > 0):
                         n += 1
-                    item.bad_until = 0.0
+                    item.health.clear()
                     try:
                         item.cfg.banned = False
                         item.cfg.banned_until = 0.0
                     except Exception:
                         pass
         if n:
-            logger.info("cooldown/ban state cleared for %d account(s)", n)
+            logger.info("cooldown/ban/login state cleared for %d account(s)", n)
+        return n
+
+    def clear_login_backoff(self, identifier: str | None = None) -> int:
+        """Clear only the browser-login backoff for one account (or all)."""
+        n = 0
+        with self._guard:
+            for item in self._items:
+                if identifier is None or _matches(item.cfg, identifier):
+                    if item.health.login_until > 0:
+                        n += 1
+                    item.clear_login_backoff()
+        if n:
+            logger.info("login backoff cleared for %d account(s)", n)
         return n
 
     def _next_ordered(self, allow_failover: bool

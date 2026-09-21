@@ -723,6 +723,10 @@ def accounts_menu(settings: Settings) -> None:
     from .config import AccountConfig
 
     def _pool() -> AccountPool:
+        # Throwaway working copy, not the server's app.state.pools: the TUI
+        # and the server never mutate at once (serve_fn blocks), and a
+        # cross-process/thread shared pool would be unsound. Settings (saved
+        # to disk) is the single hand-off; the server rebuilds/syncs from it.
         pool = AccountPool(settings.accounts, current=settings.active_account)
         if sync_current_from_settings(pool, settings):
             settings.save()

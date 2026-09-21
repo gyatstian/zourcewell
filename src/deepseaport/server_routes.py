@@ -21,7 +21,6 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from .accounts import AccountPool
-from .providers.deepseek.completion_service import clear_login_backoff
 from .config import AccountConfig, Settings
 from .core import pools
 from .core.obscura_bridge import ObscuraBridge
@@ -66,6 +65,15 @@ def register_routes(app: FastAPI) -> None:
             total = with_token = banned = 0
         try:
             pool = getattr(app.state, "pool", None)
+            if pool is None:
+                # Read the shared registry without building anything (health
+                # must stay side-effect free); fall back to account count.
+                cache = getattr(app.state, "pools", None) or {}
+                try:
+                    selected = pools.selected_provider(settings)
+                except Exception:
+                    selected = "deepseek"
+                pool = cache.get(selected)
             pool_size = len(pool) if pool is not None else total
             current = getattr(pool, "current", None)
             if current is None:
@@ -244,12 +252,9 @@ def register_routes(app: FastAPI) -> None:
         item.cfg.token = token
         await asyncio.to_thread(set_account_token, settings, identifier, token)
         await asyncio.to_thread(settings.save)
+        # clear_cooldown now resets the whole AccountHealth (cooldown + ban +
+        # browser-login backoff) through the pool the account actually lives in.
         await asyncio.to_thread(pool.clear_cooldown, identifier)
-        await asyncio.to_thread(clear_login_backoff, identifier)
-        try:
-            await asyncio.to_thread(clear_login_backoff, item.cfg.identifier)
-        except Exception:
-            pass
         return {"ok": True, "account": item.status()}
 
     @app.delete("/v1/accounts/{identifier}")
@@ -275,7 +280,6 @@ def register_routes(app: FastAPI) -> None:
         pid = str((body.get("provider") if isinstance(body, dict) else "") or provider or "").strip()
         pool = _pool_for(app, pid) if (pid and pools.is_multi(settings)) else _server()._pool(app)
         cleared = await asyncio.to_thread(pool.clear_cooldown, identifier)
-        await asyncio.to_thread(clear_login_backoff, identifier)
         # Persist the ban-flag clear so labels survive the next restart too.
         await asyncio.to_thread(settings.save)
         return {"ok": True, "cleared": cleared}
@@ -289,13 +293,28 @@ def _check_auth(settings: Settings, authorization: str) -> None:
         raise HTTPException(status_code=401, detail="invalid API key")
 
 
+def _pool_cache(app: FastAPI) -> dict:
+    """Return the single provider->pool registry, creating it on demand.
+
+    One storage for every mode: single-provider is just ``{selected: pool}``.
+    ``app.state.pool`` remains only as an explicit injected override
+    (tests/embedded CLI); when set, it wins and the registry is not consulted.
+    """
+    cache = getattr(app.state, "pools", None)
+    if cache is None:
+        cache = {}
+        app.state.pools = cache
+    return cache
+
+
 def _pool_for(app: FastAPI, provider_id) -> AccountPool:
     """Return the account pool for ``provider_id``.
 
     Single-provider mode (or an unknown provider id) delegates to the
     historical ``_server()._pool(app)`` so tests patching
     ``deepseaport.server._pool`` keep their monkeypatch seam. Multi mode
-    lazily builds ``app.state.pools`` keyed by provider id.
+    returns the provider's pool from the shared ``app.state.pools`` registry
+    (the same registry single mode uses), building it lazily.
     """
     settings = app.state.settings
     pid = str(provider_id or "").strip().lower()
@@ -304,44 +323,66 @@ def _pool_for(app: FastAPI, provider_id) -> AccountPool:
     if pid not in pools.active_provider_ids(settings):
         # Unknown provider: fall back to the primary pool.
         return _server()._pool(app)
-    cache = getattr(app.state, "pools", None)
-    if cache is None:
-        cache = {}
-        app.state.pools = cache
+    cache = _pool_cache(app)
     if pid not in cache:
         cache[pid] = pools.make_pool(settings, pid, current=pools.current_for(settings, pid))
     return cache[pid]
 
 
 def _pool(app: FastAPI) -> AccountPool:
+    """Return the pool for the selected provider.
+
+    Backed by the same ``app.state.pools`` registry as ``_pool_for`` so single
+    and multi mode never keep two divergent stores. An explicitly injected
+    ``app.state.pool`` (tests/embedding) still wins for backward compat.
+    """
     from .accounts import _matches, sync_current_from_settings
     from .core import registry as _registry
     settings = app.state.settings
-    selected = pools.selected_provider(settings)
-    if app.state.pool is None:
-        accounts = pools.accounts_for_provider(settings, selected)
-        if not accounts and getattr(settings, "accounts", []):
-            if _registry.get(selected) is None:
-                logger.warning("provider '%s' not registered; using all accounts", selected)
-                accounts = list(settings.accounts)
-        current = getattr(settings, "active_account", "")
-        if current and not any(_matches(a, current) for a in accounts):
-            current = ""
-        app.state.pool = AccountPool(accounts, current=current)
-    else:
+
+    injected = getattr(app.state, "pool", None)
+    if injected is not None:
         # Settings may change via API (add/remove/select): keep pool in sync.
         # Pool holds refs to same AccountConfig objects when created via API,
         # but CLI/TUI edits replace settings.accounts list: rebind not needed
         # for in-memory pool except CURRENT selection.
         try:
-            if sync_current_from_settings(app.state.pool, app.state.settings):
+            if sync_current_from_settings(injected, settings):
                 try:
-                    app.state.settings.save()
+                    settings.save()
                 except Exception:
                     pass
         except Exception:
             pass
-    return app.state.pool
+        return injected
+
+    selected = pools.selected_provider(settings)
+    cache = _pool_cache(app)
+    pool = cache.get(selected)
+    if pool is None:
+        accounts = pools.accounts_for_provider(settings, selected)
+        if not accounts and getattr(settings, "accounts", []):
+            if _registry.get(selected) is None:
+                logger.warning("provider '%s' not registered; using all accounts", selected)
+                accounts = list(settings.accounts)
+        # current_for returns "" in multi mode: no shared CURRENT there.
+        current = pools.current_for(settings, selected)
+        if current and not any(_matches(a, current) for a in accounts):
+            current = ""
+        pool = AccountPool(accounts, current=current)
+        cache[selected] = pool
+    elif not pools.is_multi(settings):
+        # Single provider follows settings.active_account; multi keeps each
+        # provider on independent auto-failover (see core.pools.current_for).
+        try:
+            if sync_current_from_settings(pool, settings):
+                try:
+                    settings.save()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return pool
 
 
 def _prepare(body: dict, settings: Settings | None = None) -> dict:

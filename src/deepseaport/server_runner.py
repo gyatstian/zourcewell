@@ -262,8 +262,8 @@ def _run_server(settings, args, ensure_free=None) -> int:
     Supported mode is ``--workers 1`` (default). ``--workers N>1`` spawns
     separate OS processes with process-local state: token-refresh
     singleflight / login backoff (providers.deepseek.completion_service
-    ``_TOKEN_REFRESH_*`` / ``_LOGIN_FAIL_UNTIL``) and the config-save lock
-    (config ``_CONFIG_SAVE_LOCK``) do not cross workers, so concurrent
+    ``_TOKEN_REFRESH_*`` / per-account ``AccountHealth``) and the config-save
+    lock (config ``_CONFIG_SAVE_LOCK``) do not cross workers, so concurrent
     saves last-writer-win (atomic os.replace keeps valid JSON). No
     hard-fail here (see test_run_server_workers_calls_uvicorn_run); run
     one worker per port / per config instead.

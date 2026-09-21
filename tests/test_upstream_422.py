@@ -89,7 +89,7 @@ def _stub_session_pow(monkeypatch):
     monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-1")
     monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
     monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
-    monkeypatch.setattr("deepseaport.server._delete_session_bg", lambda *a, **k: None)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
 
 
 # 1. client preserves 422 body even with text/* content-type -------------
@@ -152,7 +152,7 @@ def test_run_core_maps_http_422_to_502(monkeypatch, tmp_path):
     _cached_wasm(monkeypatch, tmp_path)
     _stub_session_pow(monkeypatch)
     monkeypatch.setattr(
-        "deepseaport.server._attempt", lambda *a, **k: ("", "", "HTTP_422: ", 0))
+        "deepseaport.providers.deepseek.completion_service._attempt", lambda *a, **k: ("", "", "HTTP_422: ", 0))
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
@@ -168,7 +168,7 @@ def test_run_core_maps_422_with_body_to_502(monkeypatch, tmp_path):
     _cached_wasm(monkeypatch, tmp_path)
     _stub_session_pow(monkeypatch)
     monkeypatch.setattr(
-        "deepseaport.server._attempt",
+        "deepseaport.providers.deepseek.completion_service._attempt",
         lambda *a, **k: ("", "", 'HTTP_422: {"detail":[{"loc":["body"]}]}', 0))
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
@@ -186,7 +186,7 @@ def test_run_core_maps_generic_upstream_to_502_not_500(monkeypatch, tmp_path):
     _cached_wasm(monkeypatch, tmp_path)
     _stub_session_pow(monkeypatch)
     monkeypatch.setattr(
-        "deepseaport.server._attempt",
+        "deepseaport.providers.deepseek.completion_service._attempt",
         lambda *a, **k: ("", "", "HTTP_500: Internal Server Error", 0))
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
@@ -213,7 +213,7 @@ def test_endpoint_returns_502_on_upstream_422(monkeypatch):
         raise HTTPException(status_code=502,
                             detail="DeepSeek rejected the request as invalid (HTTP_422: )")
 
-    monkeypatch.setattr("deepseaport.server._run_completion_core", fake_core)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
     # Stub the pool so no real account/network is touched.
     import deepseaport.server as S
 

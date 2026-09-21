@@ -179,3 +179,25 @@ def test_single_provider_pool_for_delegates_to_server_pool(monkeypatch):
     app = create_app(_settings(provider="deepseek"))
     assert _pool_for(app, "deepseek") is sentinel
     assert _pool_for(app, "") is sentinel
+
+
+def test_single_provider_uses_shared_pool_registry():
+    """Single mode stores in app.state.pools too (one store, not two)."""
+    s = _settings(provider="deepseek",
+                  accounts=[AccountConfig(email="a@x.com", token="t1")])
+    app = create_app(s)
+    pool = _pool(app)
+    assert app.state.pools == {"deepseek": pool}
+    assert _pool_for(app, "deepseek") is pool
+
+
+def test_multi_provider_pools_share_one_registry():
+    _register_fake()
+    try:
+        app = create_app(_multi_settings())
+        ds = _pool_for(app, "deepseek")
+        fp = _pool_for(app, "fakep")
+        assert app.state.pools == {"deepseek": ds, "fakep": fp}
+        assert _pool(app) is ds  # selected provider is deepseek
+    finally:
+        registry._REGISTRY.pop("fakep", None)

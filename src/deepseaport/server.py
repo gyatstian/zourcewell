@@ -51,7 +51,6 @@ from .core.tools import (
 from .core.openai import _openai_response  # noqa: F401
 from .providers.deepseek.completion_service import (
     _AttemptOutcome,  # noqa: F401
-    _LOGIN_FAIL_UNTIL,  # noqa: F401
     _TOKEN_REFRESH_BAN_HINT,  # noqa: F401
     _TOKEN_REFRESH_INFLIGHT,  # noqa: F401
     _TOKEN_REFRESH_LOCK,  # noqa: F401
@@ -66,19 +65,15 @@ from .providers.deepseek.completion_service import (
     _is_ban_http_exception,  # noqa: F401
     _is_invalid_token_error,  # noqa: F401
     _is_transient_overload,  # noqa: F401
-    _login_backoff_set,  # noqa: F401
-    _login_backoff_skip,  # noqa: F401
     _probe_ban,  # noqa: F401
     _refresh_token_via_obscura,  # noqa: F401
     _refresh_waf_without_account_lock,  # noqa: F401
     _run_completion,  # noqa: F401
     _run_completion_core,  # noqa: F401
-    _server_override,  # noqa: F401
     _session_and_challenge,  # noqa: F401
     _solve,  # noqa: F401
     _stream_completion,  # noqa: F401
     _switch_current_after_ban_failover,  # noqa: F401
-    clear_login_backoff,  # noqa: F401
 )
 from .server_concurrency import (
     FAILOVER_ACQUIRE_TIMEOUT,  # noqa: F401
@@ -133,6 +128,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="deepseaport", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings or load_settings()
     apply_log_level(getattr(app.state.settings, "log_level", "INFO"))
+    # One registry for every mode; `pool` stays as an explicit override seam.
+    app.state.pools = {}
     app.state.pool = None
     register_routes(app)
     return app

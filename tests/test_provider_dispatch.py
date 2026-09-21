@@ -47,7 +47,7 @@ def _body(**kw) -> dict:
 
 
 def test_nonstream_dispatches_through_provider(monkeypatch):
-    import deepseaport.server as S
+    import deepseaport.providers.deepseek.completion_service as CS
 
     registry.register(_FakeProvider())
     try:
@@ -56,7 +56,7 @@ def test_nonstream_dispatches_through_provider(monkeypatch):
         def _boom(*a, **k):
             raise AssertionError("DeepSeek engine must not run for fakep")
 
-        monkeypatch.setattr(S, "_complete_with_failover_sync", _boom)
+        monkeypatch.setattr(CS, "_complete_with_failover_sync", _boom)
         resp = TestClient(app).post("/v1/chat/completions", json=_body())
         assert resp.status_code == 200, resp.text
         assert resp.json()["choices"][0]["message"]["content"] == "P"
@@ -76,11 +76,11 @@ def test_stream_dispatches_through_provider():
 
 
 def test_default_deepseek_honors_engine_monkeypatch(monkeypatch):
-    import deepseaport.server as S
+    import deepseaport.providers.deepseek.completion_service as CS
 
     app = create_app(_settings(accounts=[AccountConfig(email="a@x.com", token="tok")]))
     monkeypatch.setattr(
-        S, "_complete_with_failover_sync",
+        CS, "_complete_with_failover_sync",
         lambda *a, **k: {"content": "hi", "thinking": "", "usage_total": 5},
     )
     resp = TestClient(app).post("/v1/chat/completions", json={

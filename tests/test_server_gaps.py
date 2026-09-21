@@ -27,11 +27,8 @@ from deepseaport.server import (
     _headers,
     _is_invalid_token_error,
     _is_transient_overload,
-    _login_backoff_set,
-    _login_backoff_skip,
     _openai_response,
     _prepare,
-    clear_login_backoff,
     create_app,
 )
 
@@ -212,7 +209,7 @@ class _FakePool:
 def _chat_post(app, monkeypatch, pool):
     monkeypatch.setattr("deepseaport.server._pool", lambda _app: pool)
     monkeypatch.setattr(
-        "deepseaport.server._complete_with_failover_sync",
+        "deepseaport.providers.deepseek.completion_service._complete_with_failover_sync",
         lambda *a, **k: {"content": "hi", "thinking": "", "usage_total": 5},
     )
     resp = TestClient(app).post("/v1/chat/completions", json={
@@ -305,27 +302,33 @@ def test_unblock_clears_cooldown():
 # login backoff ---------------------------------------------------------------
 
 def test_login_backoff_roundtrip():
-    key = "gap-test-acct@example.com"
-    clear_login_backoff(key)
-    try:
-        assert _login_backoff_skip(key) is None
-        _login_backoff_set(key, "no-token", 120)
-        reason = _login_backoff_skip(key)
-        assert reason and "no-token" in reason
-        assert clear_login_backoff(key) == 1
-        assert _login_backoff_skip(key) is None
-    finally:
-        clear_login_backoff(key)
+    item = PooledAccount(cfg=AccountConfig(email="gap-test-acct@example.com",
+                                           token="tok"))
+    assert item.login_backoff_skip() is None
+    item.set_login_backoff("no-token", 120)
+    reason = item.login_backoff_skip()
+    assert reason and "no-token" in reason
+    item.clear_login_backoff()
+    assert item.login_backoff_skip() is None
 
 
 def test_login_backoff_expired_clears():
-    key = "gap-test-expired@example.com"
-    clear_login_backoff(key)
-    try:
-        _login_backoff_set(key, "no-token", 0)
-        assert _login_backoff_skip(key) is None
-    finally:
-        clear_login_backoff(key)
+    item = PooledAccount(cfg=AccountConfig(email="gap-test-expired@example.com",
+                                           token="tok"))
+    item.set_login_backoff("no-token", 0)
+    assert item.login_backoff_skip() is None
+
+
+def test_pool_clear_cooldown_clears_login_backoff():
+    settings = _settings(accounts=[AccountConfig(email="a@x.com", token="tok")],
+                         config_path="")
+    pool = AccountPool(settings.accounts)
+    item = pool.get("a@x.com")
+    AccountPool.mark_bad(item, seconds=600)
+    item.set_login_backoff("no-token", 120)
+    assert pool.clear_cooldown("a@x.com") == 1
+    assert item.cooldown_remaining == 0
+    assert item.login_backoff_skip() is None
 
 
 # _acquire_slot_or_499 ----------------------------------------------------------

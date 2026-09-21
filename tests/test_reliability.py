@@ -90,7 +90,7 @@ def test_session_cleaned_up_when_pow_solve_raises(monkeypatch, tmp_path):
     app = _app_with_bridge(_settings())
     _cached_wasm(monkeypatch, tmp_path)
     deleted: list = []
-    monkeypatch.setattr("deepseaport.server._delete_session_bg",
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg",
                         lambda *a, **k: deleted.append(a))
     monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-1")
     monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
@@ -284,12 +284,12 @@ def test_malformed_port_env_falls_back(monkeypatch, tmp_path):
 def test_session_retry_refreshes_pow_header(monkeypatch, tmp_path):
     app = _app_with_bridge(_settings())
     _cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.server._delete_session_bg", lambda *a, **k: None)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
     sessions = iter(["sess-1", "sess-2"])
     monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: next(sessions))
     monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
     monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
-    monkeypatch.setattr("deepseaport.server._solve",
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._solve",
                         lambda a, token: {"X-DS-PoW-Response": "FRESH"})
 
     seen: list = []
@@ -303,7 +303,7 @@ def test_session_retry_refreshes_pow_header(monkeypatch, tmp_path):
             return "", "", "INVALID_SESSION_ID: gone", 0
         return "hi", "", None, 5
 
-    monkeypatch.setattr("deepseaport.server._attempt", fake_attempt)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._attempt", fake_attempt)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
@@ -438,10 +438,10 @@ def test_banned_error_raises_403_with_expiry(monkeypatch, tmp_path):
     monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-ban")
     monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
     monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
-    monkeypatch.setattr("deepseaport.server._delete_session_bg", lambda *a, **k: None)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
     ban_until = _time.time() + 86400
     monkeypatch.setattr(
-        "deepseaport.server._attempt",
+        "deepseaport.providers.deepseek.completion_service._attempt",
         lambda *a, **k: ("", "", "5: user is muted (suspended until 16 September 2026 12:49)", 0),
     )
     monkeypatch.setattr("deepseaport.server.DS.check_ban", lambda h, timeout=15: (True, ban_until))
@@ -497,7 +497,7 @@ def test_ban_failover_uses_next_account_and_switches_current(monkeypatch):
             raise _ban_403("a@x.com")
         return {"content": "hi from b", "thinking": "", "usage_total": 5}
 
-    monkeypatch.setattr("deepseaport.server._run_completion_core", fake_core)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     first = pool.acquire(timeout=1)
@@ -529,7 +529,7 @@ def test_ban_failover_all_banned_raises_403(monkeypatch):
         AccountPool.mark_bad(item_, seconds=86400)
         raise _ban_403(item_.cfg.email)
 
-    monkeypatch.setattr("deepseaport.server._run_completion_core", fake_core)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     first = pool.acquire(timeout=1)
@@ -555,7 +555,7 @@ def test_non_ban_error_does_not_failover(monkeypatch):
         used.append(item_.cfg.email)
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("deepseaport.server._run_completion_core", fake_core)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     first = pool.acquire(timeout=1)
@@ -645,7 +645,7 @@ def test_no_bridge_surfaces_real_error(monkeypatch, tmp_path):
     app = create_app(_settings())
     assert not hasattr(app.state, "bridge")
     _cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.server._delete_session_bg",
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg",
                         lambda *a, **k: None)
     monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-1")
     monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
@@ -672,7 +672,7 @@ def test_endpoint_failover_banned_current_serves_from_healthy(monkeypatch):
             raise _ban_403("a@x.com")
         return {"content": "served by b", "thinking": "", "usage_total": 3}
 
-    monkeypatch.setattr("deepseaport.server._run_completion_core", fake_core)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
     resp = TestClient(app).post("/v1/chat/completions", json={
         "model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}]})
     assert resp.status_code == 200, resp.text
@@ -692,11 +692,11 @@ def test_completion_40003_refreshes_token_and_retries(monkeypatch, tmp_path):
     """A 40003 error event must trigger one Obscura refresh + retry."""
     app = _app_with_bridge(_token_settings())
     _cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.server._delete_session_bg", lambda *a, **k: None)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
     monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-1")
     monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
     monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
-    monkeypatch.setattr("deepseaport.server._solve",
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._solve",
                         lambda a, token: {"Authorization": f"Bearer {token}"})
 
     calls = {"n": 0, "refresh": 0}
@@ -712,7 +712,7 @@ def test_completion_40003_refreshes_token_and_retries(monkeypatch, tmp_path):
         calls["refresh"] += 1
         return "fresh-token-1234567890"
 
-    monkeypatch.setattr("deepseaport.server._attempt", fake_attempt)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._attempt", fake_attempt)
     monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token", fake_login)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
@@ -734,13 +734,13 @@ def test_completion_40003_after_refresh_surfaces_401(monkeypatch, tmp_path):
 
     app = _app_with_bridge(_token_settings())
     _cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.server._delete_session_bg", lambda *a, **k: None)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
     monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-1")
     monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
     monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
-    monkeypatch.setattr("deepseaport.server._solve",
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._solve",
                         lambda a, token: {"Authorization": f"Bearer {token}"})
-    monkeypatch.setattr("deepseaport.server._attempt",
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._attempt",
                         lambda *a, **k: ("", "", "40003: Authorization Failed (invalid token)", 0))
     monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings: "fresh-token-1234567890")
@@ -759,7 +759,7 @@ def test_session_create_40003_refreshes_token(monkeypatch, tmp_path):
     """40003 raised at session create must refresh and retry, not 500."""
     app = _app_with_bridge(_token_settings())
     _cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.server._delete_session_bg", lambda *a, **k: None)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
 
     sessions = {"n": 0}
 
@@ -773,9 +773,9 @@ def test_session_create_40003_refreshes_token(monkeypatch, tmp_path):
     monkeypatch.setattr("deepseaport.server.DS.create_session", fake_create)
     monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
     monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
-    monkeypatch.setattr("deepseaport.server._solve",
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._solve",
                         lambda a, token: {"Authorization": f"Bearer {token}"})
-    monkeypatch.setattr("deepseaport.server._attempt",
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._attempt",
                         lambda *a, **k: ("hi", "", None, 5))
     monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings: "fresh-token-1234567890")
@@ -809,7 +809,7 @@ def test_auth_failover_uses_next_token_account_and_switches_current(monkeypatch)
                                 detail="account a@x.com has no token.")
         return {"content": "hi from b", "thinking": "", "usage_total": 5}
 
-    monkeypatch.setattr("deepseaport.server._run_completion_core", fake_core)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     first = pool.acquire(timeout=1)
@@ -842,7 +842,7 @@ def test_auth_failover_all_invalid_raises_original_401(monkeypatch):
         raise HTTPException(status_code=401,
                             detail=f"account {item_.cfg.email} has no token.")
 
-    monkeypatch.setattr("deepseaport.server._run_completion_core", fake_core)
+    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     first = pool.acquire(timeout=1)
