@@ -386,3 +386,15 @@ def browser_login(email: str, password: str, settings: Settings) -> LoginResult:
         return LoginResult(token=extract_token(token) or None,
                            banned=banned, detail=detail)
     return BrowserLogin(settings).run(email, password)
+
+
+def obscura_login_token(email: str, password: str,
+                        settings: Settings) -> tuple[str | None, bool, str]:
+    """Canonical browser-login entry returning the legacy tuple shape.
+
+    Single implementation for CLI, TUI, and the completion engine's token
+    refresh. ``cli._obscura_login_token`` is a thin alias kept for backward
+    compatibility; new code imports this directly from the provider auth
+    module so the engine never depends on the CLI layer.
+    """
+    return unpack_login_result(browser_login(email, password, settings))

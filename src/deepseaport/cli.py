@@ -361,9 +361,26 @@ def _unpack_login_token_result(res) -> tuple[str | None, bool, str]:
     return _unpack_login_result(res)
 
 
-def _obscura_login_token(email: str, password: str, settings) -> tuple[str | None, bool, str]:
-    """Run the shared Obscura browser login and return legacy tuple shape."""
-    return _browser_login(email, password, settings).as_tuple()
+def _obscura_login_token(email: str, password: str, settings,
+                         provider: str | None = None) -> tuple[str | None, bool, str]:
+    """Login via registry.get(pid).login for non-DeepSeek, else historical shim.
+
+    DeepSeek default keeps the canonical ``providers.deepseek.auth`` path so
+    existing monkeypatch seams (tests) and behavior are unchanged.
+    """
+    pid = (str(provider or "").strip().lower()
+           or (str(getattr(settings, "provider", "") or "").strip().lower())
+           or "deepseek")
+    if pid != "deepseek":
+        try:
+            from .core import registry as _reg
+            prov = _reg.get(pid)
+            if prov is not None:
+                return _unpack_login_token_result(prov.login(email, password, settings))
+        except Exception:
+            pass
+    from .providers.deepseek.auth import obscura_login_token as _impl
+    return _impl(email, password, settings)
 
 
 def cmd_login(args) -> int:
@@ -375,8 +392,24 @@ def cmd_login(args) -> int:
     settings = load_settings(args.config)
     email = args.email or input("DeepSeek email: ").strip()
     password = args.password or getpass.getpass("DeepSeek password: ")
-    token, login_banned, ban_detail = _unpack_login_token_result(
-        _obscura_login_token(email, password, settings))
+    _login_prov = _valid_provider_id(getattr(args, "provider", None)) or None
+    if _login_prov and _login_prov != "deepseek":
+        # Non-DeepSeek: registry login (keeps 3-arg mock seam for default).
+        try:
+            from .core import registry as _reg_login
+            _prov_obj = _reg_login.get(_login_prov)
+            if _prov_obj is not None:
+                token, login_banned, ban_detail = _unpack_login_token_result(
+                    _prov_obj.login(email, password, settings))
+            else:
+                token, login_banned, ban_detail = _unpack_login_token_result(
+                    _obscura_login_token(email, password, settings))
+        except Exception as exc:
+            print(f"Auto-login failed: {exc}")
+            return 3
+    else:
+        token, login_banned, ban_detail = _unpack_login_token_result(
+            _obscura_login_token(email, password, settings))
     if not token:
         if login_banned:
             print(f"login refused for {email}: account BANNED per login page.")
@@ -397,7 +430,14 @@ def cmd_login(args) -> int:
             until = None
         try:
             from .accounts import check_ban_for_token
-            _banned, _until = check_ban_for_token(token)
+            try:
+                if _prov and _prov != "deepseek":
+                    _banned, _until = check_ban_for_token(token, provider=_prov)
+                else:
+                    _banned, _until = check_ban_for_token(token)
+            except TypeError:
+                # Legacy monkeypatch without the provider kwarg (tests).
+                _banned, _until = check_ban_for_token(token)
             until = _until or until
         except Exception:
             pass

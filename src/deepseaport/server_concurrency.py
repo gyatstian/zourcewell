@@ -17,7 +17,6 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 
-from .providers.deepseek import pow as PoW
 from .config import Settings
 from .core.obscura_bridge import ObscuraBridge, register_default_bridge
 
@@ -188,7 +187,11 @@ def _startup_warm(bridge: ObscuraBridge, settings=None) -> None:
             return
     except Exception as exc:
         logger.debug("provider warmup unavailable, using inline PoW: %s", exc)
+    # Inline PoW fallback is DeepSeek-specific and lazy-imported so this
+    # module has no top-level providers.deepseek import. Provider.warmup
+    # above is the preferred path.
     try:
+        from .providers.deepseek import pow as PoW
         PoW.ensure_wasm(cookies=bridge.cookie_header(), user_agent=bridge.state.user_agent)
     except Exception as exc:
         logger.warning("PoW wasm fetch failed (will retry on demand): %s", exc)

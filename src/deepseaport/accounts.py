@@ -14,7 +14,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator
 
-from .providers.deepseek import protocol as P
 from .config import AccountConfig
 from .core.tokens import extract_token
 
@@ -40,6 +39,22 @@ TOKEN_HELP = (
     "Password-only accounts need browser login via CLI/TUI; direct POST is "
     "fingerprint-gated (RISK_DEVICE_DETECTED)."
 )
+
+
+def token_help_for(provider: str = "deepseek") -> str:
+    """Per-provider token help. DeepSeek keeps TOKEN_HELP; others get generic."""
+    pid = (provider or "deepseek").strip().lower() or "deepseek"
+    if pid == "deepseek":
+        return TOKEN_HELP
+    return (
+        f"{pid} token needed per account. Two ways:\n"
+        f"  AUTO: python -m deepseaport login --provider {pid} --email you@x.com\n"
+        "    Browser login captures token, appends to pool.\n"
+        "  MANUAL: paste raw value OR full JSON; both accepted.\n"
+        "    Then: python -m deepseaport accounts add "
+        "--email you@x.com --token <value> --provider "
+        f"{pid}\n"
+    )
 
 
 
@@ -353,6 +368,56 @@ class AccountPool:
             logger.info("cooldown/ban state cleared for %d account(s)", n)
         return n
 
+    def _next_ordered(self, allow_failover: bool
+                      ) -> tuple[list[PooledAccount], float]:
+        """Snapshot + CURRENT-first ordering; advances the round-robin cursor.
+
+        Single source for acquire()/aacquire() rotation, CURRENT pinning, and
+        failover ordering. Raises ValueError when the pool is empty.
+        """
+        with self._guard:
+            if not self._items:
+                raise ValueError("no DeepSeek accounts in pool")
+            snapshot = list(self._items)
+            cur = self._current
+            start = self._cursor % len(snapshot)
+            self._cursor += 1
+        now = time.time()
+        ordered = snapshot[start:] + snapshot[:start]
+        if cur:
+            preferred = [it for it in snapshot if _matches(it.cfg, cur)]
+            if preferred and not allow_failover:
+                ordered = preferred
+            else:
+                rest = [it for it in ordered if not _matches(it.cfg, cur)]
+                ordered = preferred + rest
+        return ordered, now
+
+    def _try_acquire_once(self, ordered: list[PooledAccount], now: float,
+                          ) -> PooledAccount | None:
+        """One nonblocking pass over ordered; holder or None.
+
+        Skips cooldown/banned, takes the first free lock, then rechecks pool
+        membership + bad_until under race (releasing on either) so a removed
+        or newly-cooled account never leaks a held lock to the caller.
+        """
+        for item in ordered:
+            with self._guard:
+                if item not in self._items:
+                    continue  # removed concurrently
+            if item.bad_until > now or item.banned:
+                continue  # on cool/ban -> fail over to next
+            if item.lock.acquire(blocking=False):
+                with self._guard:
+                    if item not in self._items:
+                        item.lock.release()
+                        continue
+                if item.bad_until > time.time():
+                    item.lock.release()  # marked bad while racing
+                    continue
+                return item
+        return None
+
     def acquire(self, timeout: float = 60, allow_failover: bool = True) -> PooledAccount:
         """Return account with lock held. Skips busy + cooldown, round-robin.
 
@@ -365,37 +430,9 @@ class AccountPool:
         """
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
-            with self._guard:
-                if not self._items:
-                    raise ValueError("no DeepSeek accounts in pool")
-                snapshot = list(self._items)
-                cur = self._current
-                start = self._cursor % len(snapshot)
-                self._cursor += 1
-            now = time.time()
-            ordered = snapshot[start:] + snapshot[:start]
-            if cur:
-                preferred = [it for it in snapshot if _matches(it.cfg, cur)]
-                if preferred and not allow_failover:
-                    ordered = preferred
-                else:
-                    rest = [it for it in ordered if not _matches(it.cfg, cur)]
-                    ordered = preferred + rest
-            for item in ordered:
-                with self._guard:
-                    if item not in self._items:
-                        continue  # removed concurrently
-                if item.bad_until > now or item.banned:
-                    continue  # on cool/ban -> fail over to next
-                if item.lock.acquire(blocking=False):
-                    with self._guard:
-                        if item not in self._items:
-                            item.lock.release()
-                            continue
-                    if item.bad_until > time.time():
-                        item.lock.release()  # marked bad while racing
-                        continue
-                    return item
+            got = self._try_acquire_once(*self._next_ordered(allow_failover))
+            if got is not None:
+                return got
             if time.monotonic() >= deadline:
                 raise TimeoutError("no DeepSeek account free (busy or cooldown)")
             time.sleep(min(_POLL_INTERVAL, max(0.001, deadline - time.monotonic())))
@@ -410,37 +447,9 @@ class AccountPool:
         """
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
-            with self._guard:
-                if not self._items:
-                    raise ValueError("no DeepSeek accounts in pool")
-                snapshot = list(self._items)
-                cur = self._current
-                start = self._cursor % len(snapshot)
-                self._cursor += 1
-            now = time.time()
-            ordered = snapshot[start:] + snapshot[:start]
-            if cur:
-                preferred = [it for it in snapshot if _matches(it.cfg, cur)]
-                if preferred and not allow_failover:
-                    ordered = preferred
-                else:
-                    rest = [it for it in ordered if not _matches(it.cfg, cur)]
-                    ordered = preferred + rest
-            for item in ordered:
-                with self._guard:
-                    if item not in self._items:
-                        continue  # removed concurrently
-                if item.bad_until > now or item.banned:
-                    continue  # on cool/ban -> fail over to next
-                if item.lock.acquire(blocking=False):
-                    with self._guard:
-                        if item not in self._items:
-                            item.lock.release()
-                            continue
-                    if item.bad_until > time.time():
-                        item.lock.release()  # marked bad while racing
-                        continue
-                    return item
+            got = self._try_acquire_once(*self._next_ordered(allow_failover))
+            if got is not None:
+                return got
             if time.monotonic() >= deadline:
                 raise TimeoutError("no DeepSeek account free (busy or cooldown)")
             await asyncio.sleep(min(_POLL_INTERVAL, max(0.001, deadline - time.monotonic())))
@@ -493,24 +502,53 @@ class AccountPool:
                        f" until {int(deadline)}" if deadline > now else "")
 
 
-def check_ban_for_token(token: str, timeout: int = BAN_CHECK_TIMEOUT) -> tuple[bool, float | None]:
+def check_ban_for_token(token: str, timeout: int = BAN_CHECK_TIMEOUT,
+                        provider: str = "deepseek",
+                        headers: dict | None = None) -> tuple[bool, float | None]:
     """Best-effort ban probe for one token. Never raises; (False, None) on skip/fail.
 
-    Ban probing is DeepSeek-shaped (users/current); new providers should
-    expose their own probe while ``Provider.probe_ban`` is the canonical hook.
+    Routes through ``Provider.probe_ban`` (registry) so non-DeepSeek accounts
+    use their own probe instead of the DeepSeek users/current shape. Defaults
+    preserve the historical DeepSeek behaviour (bridge headers + users/current)
+    so TUI/tests are unchanged.
 
-    Skips empty/short (test) tokens without network. Otherwise GETs
-    users/current and returns (is_banned, mute_until).
+    Skips empty/short (test) tokens without network.
     """
     tok = (token or "").strip()
     if len(tok) < MIN_TOKEN_LEN_FOR_BAN_CHECK:
         return False, None
     try:
-        # Local import: client pulls curl session, not needed at module import.
-        from .providers.deepseek import client as _DS
+        # Local import: registry/client pull network sessions, not needed at import.
+        # Delegates to Provider.probe_ban; DeepSeek header shape is lazy so
+        # this module has no top-level providers.deepseek import.
+        from .core import registry as _reg
 
-        headers = P.bridge_headers(bearer=tok)
-        return _DS.check_ban(headers, timeout=timeout)
+        pid = (provider or "deepseek").strip().lower() or "deepseek"
+        prov = _reg.get(pid)
+        if prov is None:
+            prov = _reg.get("deepseek")
+            pid = "deepseek" if prov is not None else pid
+        if prov is None:
+            # Registry unavailable: narrow legacy direct DeepSeek path.
+            from .providers.deepseek import client as _DS
+
+            if headers is None:
+                try:
+                    from .providers.deepseek.protocol import bridge_headers as _bh
+                    headers = _bh(bearer=tok)
+                except Exception:
+                    headers = {"Authorization": f"Bearer {tok}"}
+            return _DS.check_ban(headers, timeout=timeout)
+        if headers is None:
+            if pid == "deepseek":
+                try:
+                    from .providers.deepseek.protocol import bridge_headers as _bh
+                    headers = _bh(bearer=tok)
+                except Exception:
+                    headers = {"Authorization": f"Bearer {tok}"}
+            else:
+                headers = {"Authorization": f"Bearer {tok}"}
+        return prov.probe_ban(headers, timeout=timeout)
     except Exception as exc:
         logger.debug("ban check ignored: %s", exc)
         return False, None
@@ -657,11 +695,27 @@ def collect_ban_labels(accounts: list[AccountConfig],
         except Exception:
             pass
     out: dict[str, float | None] = dict(persisted)
+    # Per-account provider so each token probes through its own
+    # Provider.probe_ban instead of the DeepSeek users/current shape.
+    provider_by_pair: dict[tuple[str, str], str] = {}
+    try:
+        for _a in (accounts or []):
+            provider_by_pair[((_a.identifier or ""),
+                              (_a.token or "").strip())] = (
+                getattr(_a, "provider", "deepseek") or "deepseek")
+    except Exception:
+        provider_by_pair = {}
 
     def _one(pair: tuple[str, str]) -> tuple[str, bool, float | None]:
-        ident, tok = pair
+        ident, tok = pair[0], pair[1]
+        prov = provider_by_pair.get((ident, (tok or "").strip()), "deepseek")
         try:
-            banned, until = check_ban_for_token(tok, timeout=timeout)
+            try:
+                banned, until = check_ban_for_token(tok, timeout=timeout,
+                                                    provider=prov)
+            except TypeError:
+                # Legacy monkeypatch without the provider kwarg (tests).
+                banned, until = check_ban_for_token(tok, timeout=timeout)
             return ident, banned, until
         except Exception:
             return ident, False, None

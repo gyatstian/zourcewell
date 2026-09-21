@@ -1,8 +1,9 @@
 """DeepSeek provider implementation.
 
-Every method delegates to the existing DeepSeek modules through late imports
-so monkeypatch seams on ``deepseaport.server`` and the concrete client/engine
-modules keep working unchanged.
+Every method delegates to the local DeepSeek engine
+(``.completion_service``). A tiny ``sys.modules`` check honors historical
+``deepseaport.server`` monkeypatch seams without importing the server
+module (no provider->server->engine cycle).
 """
 
 from __future__ import annotations
@@ -18,9 +19,9 @@ logger = logging.getLogger("deepseaport.providers")
 class DeepSeekProvider(Provider):
     """DeepSeek web2api provider (models, ban probe, login, PoW warmup).
 
-    Execution uses the default ``Provider.complete_request`` /
-    ``Provider.stream_response`` engine methods (no override needed): they
-    late-bind the shared server engine so monkeypatch seams survive.
+    Execution uses the local DeepSeek engine (``.completion_service``);
+    a ``sys.modules`` lookup honors ``deepseaport.server`` monkeypatches
+    without importing the server module.
     """
 
     id = "deepseek"
@@ -75,11 +76,33 @@ class DeepSeekProvider(Provider):
 
     def complete(self, app, pool, prep, first_item, cancel_event=None,
                  on_content=None, on_thinking=None) -> dict:
-        """Delegate to the server's sync failover engine (monkeypatch seam)."""
-        from ... import server as _server
-        return _server._complete_with_failover_sync(
+        """Run one completion via the local DeepSeek failover engine."""
+        from .completion_service import (
+            _complete_with_failover_sync as _local,
+            _server_override as _ov,
+        )
+        fn = _ov("_complete_with_failover_sync", _local)
+        return fn(
             app, pool, prep, first_item,
             cancel_event=cancel_event, on_content=on_content, on_thinking=on_thinking)
+
+    def complete_request(self, app, pool, prep, item, cancel_event):
+        """Blocking completion via the local DeepSeek failover engine."""
+        from .completion_service import (
+            _complete_with_failover_sync as _local,
+            _server_override as _ov,
+        )
+        fn = _ov("_complete_with_failover_sync", _local)
+        return fn(app, pool, prep, item, cancel_event)
+
+    def stream_response(self, app, pool, item, prep):
+        """Async-gen streaming via the local DeepSeek streaming engine."""
+        from .completion_service import (
+            _stream_completion as _local_stream,
+            _server_override as _ov,
+        )
+        fn = _ov("_stream_completion", _local_stream)
+        return fn(app, pool, item, prep)
 
 
 def create_provider() -> DeepSeekProvider:

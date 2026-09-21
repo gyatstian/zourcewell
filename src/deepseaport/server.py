@@ -7,90 +7,96 @@ harness without waiting for the full reply. Tool calls are parsed from the
 buffered full text at FINISHED and emitted as OpenAI tool_call deltas.
 
 The endpoints live in ``deepseaport.server_routes``, the completion/retry
-engine in ``deepseaport.completion_service``, and the executors + lifecycle
-in ``deepseaport.server_concurrency``. This module keeps ``create_app`` as
-thin wiring and re-exports every historical name for backward compatibility.
+engine in ``deepseaport.providers.deepseek.completion_service``, and the
+executors + lifecycle in ``deepseaport.server_concurrency``. This module
+keeps ``create_app`` as thin wiring and re-exports every historical name
+for backward compatibility (tests + provider compat seams).
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
+import asyncio  # noqa: F401  (re-exported: historical surface)
+import json  # noqa: F401  (re-exported: historical surface)
 import logging
 import os
-import threading
-import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+import threading  # noqa: F401  (re-exported: historical surface)
+import time  # noqa: F401  (re-exported: historical surface)
+import uuid  # noqa: F401  (re-exported: historical surface)
+from concurrent.futures import ThreadPoolExecutor  # noqa: F401
+from contextlib import asynccontextmanager  # noqa: F401
 
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, Header, HTTPException, Request  # noqa: F401
+from fastapi.responses import JSONResponse, StreamingResponse  # noqa: F401
 
-from .providers.deepseek import client as DS
-from .providers.deepseek import pow as PoW
-from .providers.deepseek import protocol as P
+from .providers.deepseek import client as DS  # noqa: F401
+from .providers.deepseek import pow as PoW  # noqa: F401
+from .providers.deepseek import protocol as P  # noqa: F401
 from .providers.deepseek.models import MODELS_SPEC
-from .accounts import AccountPool, PooledAccount
+from .accounts import AccountPool, PooledAccount  # noqa: F401
 from .config import AccountConfig, Settings, load_settings
-from .core.obscura_bridge import ObscuraBridge, register_default_bridge
+from .core.obscura_bridge import ObscuraBridge, register_default_bridge  # noqa: F401
 from .core.tools import (
-    looks_truncated_tool_attempt,
-    parse_tool_calls,
-    render_prompt,
-    tool_reminder_prompt,
-    tool_system_prompt,
+    looks_truncated_tool_attempt,  # noqa: F401
+    parse_tool_calls,  # noqa: F401
+    render_prompt,  # noqa: F401
+    tool_reminder_prompt,  # noqa: F401
+    tool_system_prompt,  # noqa: F401
 )
 
 # --- Re-exports from the split modules (historical public surface) ---------
 # Order matters only for readability; all names are importable from
-# deepseaport.server exactly as before the split.
-from .core.openai import _openai_response
+# deepseaport.server exactly as before the split. The completion/stream
+# engine lives in providers.deepseek.completion_service; this module holds
+# no engine logic, only create_app + catalogue + compat aliases.
+from .core.openai import _openai_response  # noqa: F401
 from .providers.deepseek.completion_service import (
-    _AttemptOutcome,
-    _LOGIN_FAIL_UNTIL,
-    _TOKEN_REFRESH_BAN_HINT,
-    _TOKEN_REFRESH_INFLIGHT,
-    _TOKEN_REFRESH_LOCK,
-    _app_settings,
-    _attempt,
-    _ban_403_for_item,
-    _complete_with_failover_sync,
-    _delete_session_bg,
-    _ensure_token,
-    _header_from_challenge,
-    _headers,
-    _is_ban_http_exception,
-    _is_invalid_token_error,
-    _is_transient_overload,
-    _login_backoff_set,
-    _login_backoff_skip,
-    _probe_ban,
-    _refresh_token_via_obscura,
-    _refresh_waf_without_account_lock,
-    _run_completion_core,
-    _session_and_challenge,
-    _solve,
-    _switch_current_after_ban_failover,
-    clear_login_backoff,
+    _AttemptOutcome,  # noqa: F401
+    _LOGIN_FAIL_UNTIL,  # noqa: F401
+    _TOKEN_REFRESH_BAN_HINT,  # noqa: F401
+    _TOKEN_REFRESH_INFLIGHT,  # noqa: F401
+    _TOKEN_REFRESH_LOCK,  # noqa: F401
+    _app_settings,  # noqa: F401
+    _attempt,  # noqa: F401
+    _ban_403_for_item,  # noqa: F401
+    _complete_with_failover_sync,  # noqa: F401
+    _delete_session_bg,  # noqa: F401
+    _ensure_token,  # noqa: F401
+    _header_from_challenge,  # noqa: F401
+    _headers,  # noqa: F401
+    _is_ban_http_exception,  # noqa: F401
+    _is_invalid_token_error,  # noqa: F401
+    _is_transient_overload,  # noqa: F401
+    _login_backoff_set,  # noqa: F401
+    _login_backoff_skip,  # noqa: F401
+    _probe_ban,  # noqa: F401
+    _refresh_token_via_obscura,  # noqa: F401
+    _refresh_waf_without_account_lock,  # noqa: F401
+    _run_completion,  # noqa: F401
+    _run_completion_core,  # noqa: F401
+    _server_override,  # noqa: F401
+    _session_and_challenge,  # noqa: F401
+    _solve,  # noqa: F401
+    _stream_completion,  # noqa: F401
+    _switch_current_after_ban_failover,  # noqa: F401
+    clear_login_backoff,  # noqa: F401
 )
 from .server_concurrency import (
-    FAILOVER_ACQUIRE_TIMEOUT,
-    INVALID_TOKEN_COOLDOWN_SECONDS,
-    _CHALLENGE_EXECUTOR,
-    _CLEANUP_EXECUTOR,
-    _CONSUMER_GRACE_SECONDS,
-    _DEFAULT_POOL_SIZE,
-    _STREAM_EXECUTOR,
-    _StreamCancelled,
-    _acquire_slot_or_499,
-    _await_cancelable,
-    _startup_warm,
-    _watch_disconnect,
+    FAILOVER_ACQUIRE_TIMEOUT,  # noqa: F401
+    INVALID_TOKEN_COOLDOWN_SECONDS,  # noqa: F401
+    _CHALLENGE_EXECUTOR,  # noqa: F401
+    _CLEANUP_EXECUTOR,  # noqa: F401
+    _CONSUMER_GRACE_SECONDS,  # noqa: F401
+    _DEFAULT_POOL_SIZE,  # noqa: F401
+    _STREAM_EXECUTOR,  # noqa: F401
+    _StreamCancelled,  # noqa: F401
+    _acquire_slot_or_499,  # noqa: F401
+    _await_cancelable,  # noqa: F401
+    _startup_warm,  # noqa: F401
+    _watch_disconnect,  # noqa: F401
     apply_log_level,
     lifespan,
 )
-from .server_routes import _check_auth, _pool, _prepare, register_routes
+from .server_routes import _check_auth, _pool, _prepare, register_routes  # noqa: F401
 
 logger = logging.getLogger("deepseaport.server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -117,208 +123,6 @@ def active_models(settings=None) -> dict[str, tuple[bool, bool, str]]:
             continue
         out.update(provider.tuple_spec())
     return out or dict(MODELS)
-
-
-def _run_completion(app: FastAPI, item: PooledAccount, prep: dict,
-                    cancel_event: threading.Event | None = None) -> dict:
-    """Blocking full completion with retries per failure class."""
-    return _run_completion_core(app, item, prep, cancel_event=cancel_event)
-
-
-async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccount, prep: dict):
-    """Async generator: buffered (default) or live deltas, tools parsed at end."""
-    cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-    created = int(time.time())
-    model = prep["model"]
-    out: asyncio.Queue = asyncio.Queue()
-    loop = asyncio.get_running_loop()
-    settings = _app_settings(app)
-    live = str(getattr(settings, "stream_mode", "live")).lower() == "live"
-    # Consumer wait must outlast the blocking curl stream timeout, otherwise the
-    # async reader times out while the producer is still working on a valid long
-    # reply. Derive it so the two can never drift apart.
-    consumer_timeout = float(DS.DEFAULT_TIMEOUT) + _CONSUMER_GRACE_SECONDS
-    # Set when the client disconnects (generator GC/close): the producer checks
-    # it between SSE events and stops, releasing the account lock promptly.
-    cancel_event = threading.Event()
-
-    def _emit(item: tuple) -> None:
-        # call_soon_threadsafe raises RuntimeError once the loop is closed
-        # (shutdown). Swallow: producer work is best-effort at that point.
-        try:
-            loop.call_soon_threadsafe(out.put_nowait, item)
-        except RuntimeError:
-            pass
-
-    def _put(kind: str, text: str) -> None:
-        if text:
-            _emit((kind, text))
-
-    def produce_buffered():
-        # Ban failover lives in the helper (owns item's lock): a banned
-        # account retries on the next unbanned one inside the same request.
-        # Ban errors carry no content prefix, so nothing partial leaks.
-        try:
-            result = _complete_with_failover_sync(
-                app, pool, prep, item, cancel_event=cancel_event)
-            _emit(("done", result))
-        except _StreamCancelled:
-            pass
-        except HTTPException as exc:
-            _emit(("http_error", exc))
-        except Exception as exc:  # noqa: BLE001
-            _emit(("error", str(exc)))
-
-    def produce_live():
-        # Thinking always streams live (never contains tool JSON).
-        # Content streams live only when no tools requested; with tools the
-        # content is buffered so a tool_calls reply is not also emitted as
-        # user-visible text.
-        try:
-            result = _complete_with_failover_sync(
-                app, pool, prep, item,
-                on_content=(None if prep.get("tools") else lambda t: _put("content", t)),
-                on_thinking=lambda t: _put("thinking", t),
-                cancel_event=cancel_event,
-            )
-            _emit(("done", result))
-        except _StreamCancelled:
-            pass
-        except HTTPException as exc:
-            _emit(("http_error", exc))
-        except Exception as exc:  # noqa: BLE001
-            _emit(("error", str(exc)))
-
-    def chunk(delta: dict, finish: str | None = None) -> bytes:
-        return ("data: " + json.dumps(
-            {"id": cid, "object": "chat.completion.chunk", "created": created,
-             "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]},
-            ensure_ascii=False) + "\n\n").encode("utf-8")
-
-    async def _parse_stream_calls(content: str):
-        """Tool-parse buffered content (tools requested); log when none found."""
-        limit = prep.get("tool_args_max_chars")
-        forgiving = bool(prep.get("forgiving_toolcalls", False))
-        if limit:
-            calls, remaining = await asyncio.to_thread(
-                parse_tool_calls, content, prep["tools"],
-                max_args_chars=limit, forgiving=forgiving)
-        else:
-            calls, remaining = await asyncio.to_thread(
-                parse_tool_calls, content, prep["tools"], forgiving=forgiving)
-        truncated = False
-        if not calls:
-            truncated = bool(looks_truncated_tool_attempt(
-                content, prep["tools"], forgiving=forgiving))
-            if truncated:
-                logger.warning("stream tool call looks truncated model=%s preview=%.200s",
-                               prep.get("model"), (content or "")[:200])
-            else:
-                logger.debug("stream no tool call parsed model=%s preview=%.200s",
-                             prep.get("model"), (content or "")[:200])
-        return calls, remaining, truncated
-
-    def _tool_finish_chunks(calls, truncated: bool = False):
-        """tool_call deltas + finish chunk; length when a call was cut off."""
-        if calls:
-            for call in calls:
-                yield chunk({"tool_calls": [{
-                    "id": call["id"], "type": "function",
-                    "function": {"name": call["function"]["name"],
-                                 "arguments": call["function"]["arguments"]}}]})
-            yield chunk({}, "tool_calls")
-        else:
-            yield chunk({}, "length" if truncated else "stop")
-
-    # Bounded producer: one account-holding thread per stream, capped by the
-    # shared executor so a parallel-subagent burst queues instead of piling
-    # unbounded raw threads (each with account + PoW CPU).
-    try:
-        _STREAM_EXECUTOR.submit(produce_live if live else produce_buffered)
-    except RuntimeError:
-        # Executor shut down (interpreter exit): fall back to a raw thread.
-        threading.Thread(target=produce_live if live else produce_buffered, daemon=True).start()
-    try:
-        yield chunk({"role": "assistant"})
-        if not live:
-            # Buffered: producer sends one reply per request; emit thinking+content
-            # once the reply lands, then tool deltas. First-byte ~= model latency.
-            while True:
-                try:
-                    kind, payload = await asyncio.wait_for(out.get(), timeout=consumer_timeout)
-                except asyncio.TimeoutError:
-                    yield ("data: " + json.dumps({"error": {"message": "upstream timed out"}},
-                                                ensure_ascii=False) + "\n\n").encode()
-                    yield b"data: [DONE]\n\n"
-                    return
-                if kind == "done":
-                    thinking, content = payload["thinking"], payload["content"]
-                    truncated = False
-                    if prep["tools"]:
-                        calls, remaining, truncated = await _parse_stream_calls(content)
-                    else:
-                        calls, remaining = None, content
-                    if thinking:
-                        yield chunk({"reasoning_content": thinking})
-                    if remaining:
-                        yield chunk({"content": remaining})
-                    for piece in _tool_finish_chunks(calls, truncated):
-                        yield piece
-                    yield b"data: [DONE]\n\n"
-                    return
-                if kind == "http_error":
-                    err = payload
-                    yield ("data: " + json.dumps({"error": {"message": err.detail, "code": err.status_code}},
-                                                ensure_ascii=False) + "\n\n").encode()
-                    yield b"data: [DONE]\n\n"
-                    return
-                yield ("data: " + json.dumps({"error": {"message": str(payload)}},
-                                            ensure_ascii=False) + "\n\n").encode()
-                yield b"data: [DONE]\n\n"
-                return
-        # Live: forward thinking/content deltas as they arrive from DeepSeek.
-        while True:
-            try:
-                kind, payload = await asyncio.wait_for(out.get(), timeout=consumer_timeout)
-            except asyncio.TimeoutError:
-                yield ("data: " + json.dumps({"error": {"message": "upstream timed out"}},
-                                            ensure_ascii=False) + "\n\n").encode()
-                yield b"data: [DONE]\n\n"
-                return
-            if kind == "thinking":
-                yield chunk({"reasoning_content": payload})
-                continue
-            if kind == "content":
-                yield chunk({"content": payload})
-                continue
-            if kind == "done":
-                content = payload["content"]
-                if prep.get("tools"):
-                    calls, remaining, truncated = await _parse_stream_calls(content)
-                    # Thinking already streamed live; emit only the remainder.
-                    if remaining:
-                        yield chunk({"content": remaining})
-                    for piece in _tool_finish_chunks(calls, truncated):
-                        yield piece
-                else:
-                    # Content already streamed live; just close.
-                    yield chunk({}, "stop")
-                yield b"data: [DONE]\n\n"
-                return
-            if kind == "http_error":
-                err = payload
-                yield ("data: " + json.dumps({"error": {"message": err.detail, "code": err.status_code}},
-                                            ensure_ascii=False) + "\n\n").encode()
-                yield b"data: [DONE]\n\n"
-                return
-            yield ("data: " + json.dumps({"error": {"message": str(payload)}},
-                                        ensure_ascii=False) + "\n\n").encode()
-            yield b"data: [DONE]\n\n"
-            return
-    finally:
-        # Generator closed (client disconnect, cancellation, completion): tell
-        # the producer to stop at the next event so the account lock frees.
-        cancel_event.set()
 
 
 def error_json(request, exc: HTTPException):  # helper for tests

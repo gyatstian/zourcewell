@@ -560,7 +560,7 @@ def test_accounts_menu_offer_auto_login_declined(monkeypatch):
     def _fail(*a, **k):
         raise AssertionError("login must not run on decline")
 
-    monkeypatch.setattr("deepseaport.cli._obscura_login_token", _fail)
+    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token", _fail)
     inputs = iter(["t", "a@x.com", "", "n", "b"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
@@ -569,7 +569,7 @@ def test_accounts_menu_offer_auto_login_declined(monkeypatch):
 
 def test_accounts_menu_offer_auto_login_confirmed(monkeypatch):
     s = _fresh(accounts=[AccountConfig(email="a@x.com", password="pw", token="")])
-    monkeypatch.setattr("deepseaport.cli._obscura_login_token",
+    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
                         lambda email, pw, st: ("tok-confirmed", False, ""))
     inputs = iter(["t", "a@x.com", "", "", "b"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
@@ -583,7 +583,7 @@ def test_accounts_menu_set_token_literal(monkeypatch):
     def _fail(*a, **k):
         raise AssertionError("login must not run for literal token")
 
-    monkeypatch.setattr("deepseaport.cli._obscura_login_token", _fail)
+    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token", _fail)
     inputs = iter(["t", "a@x.com", "newtok123", "b"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)

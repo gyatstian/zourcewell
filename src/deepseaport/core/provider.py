@@ -81,14 +81,14 @@ class Provider(ABC):
         raise NotImplementedError
 
     def complete_request(self, app, pool, prep, item, cancel_event):
-        """Blocking completion. Default: the shared server engine (deepseek behavior). Override per provider."""
-        from .. import server as _server
-        return _server._complete_with_failover_sync(app, pool, prep, item, cancel_event)
+        """Blocking completion. No default engine: override per provider."""
+        raise NotImplementedError(
+            f"{type(self).__name__}.complete_request not implemented")
 
     def stream_response(self, app, pool, item, prep):
-        """Async-gen streaming. Default: the shared server streaming. Override per provider."""
-        from .. import server as _server
-        return _server._stream_completion(app, pool, item, prep)
+        """Async-gen streaming. No default engine: override per provider."""
+        raise NotImplementedError(
+            f"{type(self).__name__}.stream_response not implemented")
 
     def tuple_spec(self) -> dict[str, tuple[bool, bool, str]]:
         """Return ``{id: (thinking, search, model_type)}`` for compat MODELS."""

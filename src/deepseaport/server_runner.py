@@ -259,6 +259,15 @@ def _start_background_server(app, host: str, port: int,
 def _run_server(settings, args, ensure_free=None) -> int:
     """Blocking serve loop (single worker) or uvicorn.run (multi-worker).
 
+    Supported mode is ``--workers 1`` (default). ``--workers N>1`` spawns
+    separate OS processes with process-local state: token-refresh
+    singleflight / login backoff (providers.deepseek.completion_service
+    ``_TOKEN_REFRESH_*`` / ``_LOGIN_FAIL_UNTIL``) and the config-save lock
+    (config ``_CONFIG_SAVE_LOCK``) do not cross workers, so concurrent
+    saves last-writer-win (atomic os.replace keeps valid JSON). No
+    hard-fail here (see test_run_server_workers_calls_uvicorn_run); run
+    one worker per port / per config instead.
+
     `ensure_free` is an injection seam for deepseaport.cli so the historical
     cli-level `_ensure_free_port` monkeypatch keeps working.
     """

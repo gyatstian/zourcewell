@@ -713,7 +713,7 @@ def test_completion_40003_refreshes_token_and_retries(monkeypatch, tmp_path):
         return "fresh-token-1234567890"
 
     monkeypatch.setattr("deepseaport.server._attempt", fake_attempt)
-    monkeypatch.setattr("deepseaport.cli._obscura_login_token", fake_login)
+    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token", fake_login)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(
@@ -742,7 +742,7 @@ def test_completion_40003_after_refresh_surfaces_401(monkeypatch, tmp_path):
                         lambda a, token: {"Authorization": f"Bearer {token}"})
     monkeypatch.setattr("deepseaport.server._attempt",
                         lambda *a, **k: ("", "", "40003: Authorization Failed (invalid token)", 0))
-    monkeypatch.setattr("deepseaport.cli._obscura_login_token",
+    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings: "fresh-token-1234567890")
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
@@ -777,7 +777,7 @@ def test_session_create_40003_refreshes_token(monkeypatch, tmp_path):
                         lambda a, token: {"Authorization": f"Bearer {token}"})
     monkeypatch.setattr("deepseaport.server._attempt",
                         lambda *a, **k: ("hi", "", None, 5))
-    monkeypatch.setattr("deepseaport.cli._obscura_login_token",
+    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings: "fresh-token-1234567890")
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
@@ -890,7 +890,7 @@ def test_token_refresh_normalizes_json_wrapper(monkeypatch):
     app = _app_with_bridge(settings)
     item = PooledAccount(cfg=settings.accounts[0])
     raw = '{"value":"' + ("x" * 64) + '","__version":"0"}'
-    monkeypatch.setattr("deepseaport.cli._obscura_login_token",
+    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings_: raw)
 
     token, banned, detail = _refresh_token_via_obscura(app, item)

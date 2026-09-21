@@ -290,7 +290,7 @@ def test_tui_add_skip_token_offers_auto_login(monkeypatch):
     # a -> add flow: email, password, token(y = auto-token).
     inputs = iter(["a", "new@x.com", "pw", "y", "b"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
-    monkeypatch.setattr("deepseaport.cli._obscura_login_token",
+    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings: "auto-tok-123")
     accounts_menu(s)
     assert len(s.accounts) == 1
