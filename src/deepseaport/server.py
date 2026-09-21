@@ -23,18 +23,18 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import client as DS
-from . import pow as PoW
-from . import protocol as P
+from .providers.deepseek import client as DS
+from .providers.deepseek import pow as PoW
+from .providers.deepseek import protocol as P
+from .providers.deepseek.models import MODELS_SPEC
 from .accounts import AccountPool, PooledAccount
 from .config import AccountConfig, Settings, load_settings
-from .obscura_bridge import ObscuraBridge, register_default_bridge
-from .tools_support import (
+from .core.obscura_bridge import ObscuraBridge, register_default_bridge
+from .core.tools import (
     looks_truncated_tool_attempt,
     parse_tool_calls,
     render_prompt,
@@ -45,7 +45,8 @@ from .tools_support import (
 # --- Re-exports from the split modules (historical public surface) ---------
 # Order matters only for readability; all names are importable from
 # deepseaport.server exactly as before the split.
-from .completion_service import (
+from .core.openai import _openai_response
+from .providers.deepseek.completion_service import (
     _AttemptOutcome,
     _LOGIN_FAIL_UNTIL,
     _TOKEN_REFRESH_BAN_HINT,
@@ -64,7 +65,6 @@ from .completion_service import (
     _is_transient_overload,
     _login_backoff_set,
     _login_backoff_skip,
-    _openai_response,
     _probe_ban,
     _refresh_token_via_obscura,
     _refresh_waf_without_account_lock,
@@ -95,12 +95,28 @@ from .server_routes import _check_auth, _pool, _prepare, register_routes
 logger = logging.getLogger("deepseaport.server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-MODELS = {
-    "deepseek-flash": (False, False, "default"),
-    "deepseek-flash-reasoner": (True, False, "default"),
-    "deepseek-flash-search": (False, True, "default"),
-    "deepseek-flash-reasoner-search": (True, True, "default"),
-}
+# Derived from the DeepSeek provider catalogue, kept as a plain dict for
+# backwards compatibility (tests assert exact tuple values and iteration).
+MODELS = {mid: (s.thinking, s.search, s.model_type)
+          for mid, s in MODELS_SPEC.items()}
+
+
+def active_models(settings=None) -> dict[str, tuple[bool, bool, str]]:
+    """Return the MODELS-shaped catalogue for the given settings.
+
+    Union of ``tuple_spec()`` for ``resolved_ids(active_provider_ids(...))``,
+    falling back to ``dict(MODELS)`` when empty or settings is None.
+    """
+    from .core import pools, registry
+    if settings is None:
+        return dict(MODELS)
+    out: dict[str, tuple[bool, bool, str]] = {}
+    for pid in registry.resolved_ids(pools.active_provider_ids(settings)):
+        provider = registry.get(pid)
+        if provider is None:
+            continue
+        out.update(provider.tuple_spec())
+    return out or dict(MODELS)
 
 
 def _run_completion(app: FastAPI, item: PooledAccount, prep: dict,

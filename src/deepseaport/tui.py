@@ -351,17 +351,157 @@ def _edit_obscura_bin(settings: Settings) -> None:
 
 
 def _edit_chat_model(settings: Settings) -> None:
-    """Pick chat_model from server MODELS (fallback to known four)."""
+    """Pick chat_model from the active providers' models (fallback to known four)."""
+    options: tuple[str, ...] = ()
     try:
-        from .server import MODELS as _MODELS
+        from .core import pools as _pools
+        from .core import registry as _reg
 
-        options = tuple(sorted(_MODELS)) if isinstance(_MODELS, dict) else ()
+        ids = _pools.active_provider_ids(settings)
+        found: list[str] = []
+        for _pid in ids:
+            _p = _reg.get(_pid)
+            if _p is None:
+                continue
+            try:
+                found.extend(list(_p.models().keys()))
+            except Exception:
+                continue
+        if found:
+            options = tuple(sorted(set(found)))
     except Exception:
         options = ()
     if not options:
+        try:
+            from .server import MODELS as _MODELS
+
+            options = tuple(sorted(_MODELS)) if isinstance(_MODELS, dict) else ()
+        except Exception:
+            options = ()
+    if not options:
         options = ("deepseek-flash", "deepseek-flash-reasoner",
                    "deepseek-flash-search", "deepseek-flash-reasoner-search")
+    else:
+        # Registry unavailable (or active provider unknown): keep the current
+        # value selectable alongside the known four.
+        try:
+            cur = str(getattr(settings, "chat_model", "") or "").strip()
+        except Exception:
+            cur = ""
+        if cur and cur not in options:
+            options = tuple(sorted(set(options) | {cur}))
     _edit_choice(settings, "chat_model", "Chat model", options)
+
+
+def _select_provider(settings: Settings) -> None:
+    """Shared provider-selection loop used by the serve gate and settings item 19.
+
+    Never raises on bad input; EOF/KeyboardInterrupt keeps the current
+    selection and returns.
+    """
+    from .core import registry as _reg
+
+    try:
+        from .core import pools as _pools
+    except Exception:
+        _pools = None  # type: ignore
+    while True:
+        try:
+            providers = _reg.registered()
+        except Exception:
+            providers = {}
+        ids = list(providers.keys())
+        _header("Provider")
+        try:
+            active = list(_pools.active_provider_ids(settings)) if _pools else [
+                (getattr(settings, "provider", "") or "deepseek").strip().lower()]
+            multi = len(active) > 1
+        except Exception:
+            active = [(getattr(settings, "provider", "") or "deepseek").strip().lower()]
+            multi = False
+        if multi:
+            _info("Mode: multi (one server will expose all listed providers' models)")
+        else:
+            _info(f"Mode: single (current: {active[0] if active else 'deepseek'})")
+        print()
+        if not ids:
+            _err("No providers registered.")
+            print()
+            print("  q. Back")
+            print()
+            try:
+                choice = input("Select: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if choice in ("q", "quit", "b", "back", ""):
+                return
+            _err("Unknown option.")
+            continue
+        for i, pid in enumerate(ids, 1):
+            try:
+                prov = providers[pid]
+                name = str(getattr(prov, "display_name", "") or pid)
+                nmodels = len(prov.models())
+            except Exception:
+                name, nmodels = pid, 0
+            try:
+                accts = _pools.accounts_for_provider(settings, pid) if _pools else []
+            except Exception:
+                accts = []
+            ntok = sum(1 for a in accts if (getattr(a, "token", "") or "").strip())
+            mark = " * CURRENT" if (pid in active) else ""
+            print(f"  {i}. {name} ({pid}) — {nmodels} models, "
+                  f"{len(accts)} accounts ({ntok} with token){mark}")
+        print()
+        print("  m. Multi (all providers, one server exposes every model)")
+        print("  q. Back (keep current)")
+        print()
+        try:
+            choice = input("Select: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if choice in ("q", "quit", "b", "back", ""):
+            return
+        if choice in ("m", "multi"):
+            settings.providers = list(ids)
+            settings.provider = ids[0] if ids else "deepseek"
+            try:
+                settings.save()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            _ok(f"Provider mode -> multi ({', '.join(ids)}) (saved)")
+            _info("One server will expose all listed providers' models.")
+            continue
+        picked = ""
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(ids):
+                picked = ids[idx]
+        elif choice:
+            for pid in ids:
+                if pid.strip().lower() == choice:
+                    picked = pid
+                    break
+        if not picked:
+            _err("Unknown option. Type a number, a provider id, m, or q.")
+            continue
+        settings.provider = picked
+        settings.providers = []
+        try:
+            settings.save()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        _ok(f"Provider -> {picked} (saved)")
+
+
+def provider_menu(settings: Settings) -> None:
+    """First-run provider gate for `serve`. Always returns (never exits)."""
+    _clear_screen()
+    _select_provider(settings)
 
 
 def _preview_append(value: str, width: int = 30) -> str:
@@ -1201,18 +1341,21 @@ def settings_menu(settings: Settings) -> None:
         _setting_line(18, "More forgiving toolcalls",
                       _on_off(getattr(settings, "forgiving_toolcalls", False)))
 
+        _section("Provider")
+        _setting_line(19, "Provider...", str(getattr(settings, "provider", "deepseek") or "deepseek"))
+
         print()
-        print("  19. Back (q)")
+        print("  20. Back (q)")
         print()
         try:
             choice = input("Select: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return
-        if choice in ("19", "b", "back", "q", "quit", ""):
+        if choice in ("20", "b", "back", "q", "quit", ""):
             return
-        if choice not in {str(i) for i in range(1, 19)}:
-            _err("Unknown option: type 1-18, or q.")
+        if choice not in {str(i) for i in range(1, 20)}:
+            _err("Unknown option: type 1-19, or q.")
             continue
         # Clear the menu before prompting so repeated edits do not stack
         # multiple copies of the settings screen in the terminal.
@@ -1261,6 +1404,8 @@ def settings_menu(settings: Settings) -> None:
             elif choice == "18":
                 _toggle_bool(settings, "forgiving_toolcalls",
                              "More forgiving toolcalls")
+            elif choice == "19":
+                _select_provider(settings)
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -1369,12 +1514,25 @@ def accounts_menu(settings: Settings) -> None:
             _P = None  # type: ignore
         _header(f"Accounts ({len(settings.accounts)})")
         _info(f"Current: [{current or 'ALL (auto-failover)'}]")
+        try:
+            from .core import pools as _pools
+
+            _scope = _pools.selected_provider(settings)
+        except Exception:
+            _scope = (getattr(settings, "provider", "") or "deepseek")
+        _info(f"Provider scope: {_scope}")
         print()
         if rows:
             id_width = max([len("Identifier")] + [len(r["identifier"]) for r in rows])
             id_width = min(id_width, 32)
             print(f"    {'#':<2} {'Identifier':<{id_width}}  {'Uses':<4} {'Token':<7} {'Busy':<4} {'Cool':<6} {'Cur'}")
             print(f"    {'--':<2} {'-' * id_width}  {'----':<4} {'-----':<7} {'----':<4} {'----':<6} {'---'}")
+            try:
+                from .core.pools import _provider_of as _prov_of
+
+                _row_provs = [_prov_of(a) for a in settings.accounts]
+            except Exception:
+                _row_provs = []
             for i, row in enumerate(rows, 1):
                 mark = "*" if row.get("current") else ""
                 has = _has_token(settings, row["identifier"])
@@ -1398,8 +1556,9 @@ def accounts_menu(settings: Settings) -> None:
                         ban_suffix = " (BANNED)"
                 except Exception:
                     ban_suffix = ""
+                _prov = _row_provs[i - 1] if 0 < i <= len(_row_provs) else "deepseek"
                 print(f"    {i:<2} {ident:<{id_width}}  {row['uses']:<4} "
-                      f"{'yes' if has else 'missing':<7} {busy:<4} {cool_s:<6} {mark}{ban_suffix}")
+                      f"{'yes' if has else 'missing':<7} {busy:<4} {cool_s:<6} {mark}{ban_suffix} [{_prov}]")
         else:
             _info("(no accounts yet -- use 'a' to add one)")
         print()
@@ -1446,6 +1605,12 @@ def accounts_menu(settings: Settings) -> None:
             else:
                 token = extract_token(raw_token)
             cfg = AccountConfig(email=email, password=password, token=token)
+            try:
+                from .core import pools as _pools
+
+                cfg.provider = _pools.selected_provider(settings)
+            except Exception:
+                pass
             try:
                 from .accounts import add_account as _add
                 _add(settings, pool, cfg)
@@ -1550,11 +1715,18 @@ def _preflight_reason(settings: Settings) -> str:
 
     Empty pool -> 503 on first request; accounts without any token ->
     401/failover on first request. Caller jumps to the Accounts menu so
-    the fix is one step away.
+    the fix is one step away. Scoped to the active provider(s)' accounts.
     """
-    if not settings.accounts:
+    try:
+        from .core import pools as _pools
+
+        _ids = _pools.active_provider_ids(settings)
+        _accts = [a for _pid in _ids for a in _pools.accounts_for_provider(settings, _pid)]
+    except Exception:
+        _accts = settings.accounts
+    if not _accts:
         return "No accounts yet. Add one first."
-    for a in settings.accounts:
+    for a in _accts:
         if (a.token or "").strip():
             return ""
     return "Accounts have no token. Add one (y = auto-token) first."
@@ -1589,6 +1761,15 @@ def main_menu(settings: Settings, serve_fn: Callable[[Settings], int],
               f"  |  Failover: {_on_off(getattr(settings, 'use_multiple_accounts', True))}")
         cur = (settings.active_account or "").strip() or "ALL"
         _info(f"Accounts : {len(settings.accounts)}  |  Current: [{cur}]")
+        try:
+            from .core import pools as _pools
+
+            _active = list(_pools.active_provider_ids(settings))
+            _display = (" + ".join(_active) + " (multi)") if len(_active) > 1 else (
+                _active[0] if _active else "deepseek")
+        except Exception:
+            _display = (getattr(settings, "provider", "") or "deepseek")
+        _info(f"Provider  : {_display}")
         has_token = any((getattr(a, "token", "") or "").strip()
                         for a in settings.accounts)
         if not settings.accounts:

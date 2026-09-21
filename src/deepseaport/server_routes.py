@@ -13,6 +13,7 @@ Handlers look up the completion/stream entry points through a deferred
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 
@@ -20,21 +21,25 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from .accounts import AccountPool
-from .completion_service import clear_login_backoff
+from .providers.deepseek.completion_service import clear_login_backoff
 from .config import AccountConfig, Settings
-from .obscura_bridge import ObscuraBridge
+from .core import pools
+from .core.obscura_bridge import ObscuraBridge
 from .server_concurrency import (
     _StreamCancelled,
     _acquire_slot_or_499,
     _watch_disconnect,
 )
-from .tools_support import render_prompt, tool_reminder_prompt, tool_system_prompt
+from .core.tools import render_prompt, tool_reminder_prompt, tool_system_prompt
 
 
 def _server():
     """Late-bound deepseaport.server module for monkeypatch-compatible lookups."""
     from . import server as _s
     return _s
+
+
+logger = logging.getLogger("deepseaport.server")
 
 
 def register_routes(app: FastAPI) -> None:
@@ -87,13 +92,22 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/v1/models")
     async def list_models():
         now = int(time.time())
-        return {
-            "object": "list",
-            "data": [
-                {"id": m, "object": "model", "created": now, "owned_by": "deepseek"}
-                for m in _server().MODELS
-            ],
-        }
+        from .core import registry as _registry
+        settings: Settings = app.state.settings
+        catalogue = _server().active_models(settings)
+        if not catalogue:
+            catalogue = {mid: tuple(spec) for mid, spec in _server().MODELS.items()}
+        resolved = _registry.resolved_ids(pools.active_provider_ids(settings))
+        data = []
+        for mid in catalogue:
+            owner = None
+            found = _registry.resolve_model(mid, provider_ids=resolved)
+            if found is not None:
+                provider, spec = found
+                owner = spec.owned_by or provider.id
+            data.append({"id": mid, "object": "model", "created": now,
+                         "owned_by": owner or "deepseek"})
+        return {"object": "list", "data": data}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: dict, request: Request,
@@ -101,7 +115,9 @@ def register_routes(app: FastAPI) -> None:
         settings: Settings = app.state.settings
         _check_auth(settings, authorization)
         prep = _prepare(body, settings)  # raises 400/404 fast, before touching accounts
-        pool = _server()._pool(app)
+        from .core import registry as _registry
+        provider = _registry.get(prep.get("provider")) or _registry.default()
+        pool = _pool_for(app, prep.get("provider"))
         # Async poll (no executor thread held): blocking acquire would
         # occupy default-executor threads and starve other to_thread work.
         # use_multiple_accounts=False pins to CURRENT (queue on its lock);
@@ -122,7 +138,7 @@ def register_routes(app: FastAPI) -> None:
             finally:
                 watcher.cancel()
             return StreamingResponse(
-                _server()._stream_completion(app, pool, item, prep),
+                provider.stream_response(app, pool, item, prep),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -145,7 +161,7 @@ def register_routes(app: FastAPI) -> None:
                 raise HTTPException(status_code=499, detail="client disconnected")
             try:
                 result = await asyncio.to_thread(
-                    _server()._complete_with_failover_sync, app, pool, prep, item, cancel_event)
+                    provider.complete_request, app, pool, prep, item, cancel_event)
             except _StreamCancelled:
                 raise HTTPException(status_code=499, detail="client disconnected")
         finally:
@@ -153,10 +169,11 @@ def register_routes(app: FastAPI) -> None:
         return _server()._openai_response(prep, result)
 
     @app.get("/v1/accounts")
-    async def list_accounts(authorization: str = Header(default="")):
+    async def list_accounts(provider: str = "", authorization: str = Header(default="")):
         settings: Settings = app.state.settings
         _check_auth(settings, authorization)
-        pool = _server()._pool(app)
+        pid = (provider or "").strip()
+        pool = _pool_for(app, pid) if (pid and pools.is_multi(settings)) else _server()._pool(app)
         data = await asyncio.to_thread(pool.status)
         return {"object": "list", "current": pool.current or None, "data": data}
 
@@ -180,10 +197,11 @@ def register_routes(app: FastAPI) -> None:
         return {"ok": True, "current": pool.current}
 
     @app.post("/v1/accounts", status_code=201)
-    async def add_account(body: dict, authorization: str = Header(default="")):
+    async def add_account(body: dict, provider: str = "", authorization: str = Header(default="")):
         from .accounts import TOKEN_HELP, extract_token
         settings: Settings = app.state.settings
         _check_auth(settings, authorization)
+        pid = str((body.get("provider") if isinstance(body, dict) else "") or provider or "").strip()
         cfg = AccountConfig(email=str(body.get("email") or ""),
                             mobile=str(body.get("mobile") or ""),
                             password=str(body.get("password") or ""),
@@ -191,7 +209,11 @@ def register_routes(app: FastAPI) -> None:
         if not (cfg.email or cfg.mobile or cfg.token):
             raise HTTPException(status_code=400,
                                 detail="email, mobile, or token required. " + TOKEN_HELP)
-        pool = _server()._pool(app)
+        if pid:
+            cfg.provider = pid
+        else:
+            cfg.provider = pools.selected_provider(settings)
+        pool = _pool_for(app, pid) if (pid and pools.is_multi(settings)) else _server()._pool(app)
         try:
             from .accounts import add_account as _add
             item = await asyncio.to_thread(_add, settings, pool, cfg)
@@ -205,7 +227,7 @@ def register_routes(app: FastAPI) -> None:
         return resp
 
     @app.put("/v1/accounts/{identifier}/token")
-    async def set_account_token(identifier: str, body: dict,
+    async def set_account_token(identifier: str, body: dict, provider: str = "",
                                 authorization: str = Header(default="")):
         from .accounts import TOKEN_HELP, extract_token, set_account_token
         settings: Settings = app.state.settings
@@ -214,7 +236,8 @@ def register_routes(app: FastAPI) -> None:
         if not token:
             raise HTTPException(status_code=400,
                                 detail="token required (raw value or full JSON). " + TOKEN_HELP)
-        pool = _server()._pool(app)
+        pid = str((body.get("provider") if isinstance(body, dict) else "") or provider or "").strip()
+        pool = _pool_for(app, pid) if (pid and pools.is_multi(settings)) else _server()._pool(app)
         item = await asyncio.to_thread(pool.get, identifier)
         if item is None:
             raise HTTPException(status_code=404, detail=f"account not found: {identifier}")
@@ -230,11 +253,12 @@ def register_routes(app: FastAPI) -> None:
         return {"ok": True, "account": item.status()}
 
     @app.delete("/v1/accounts/{identifier}")
-    async def delete_account(identifier: str, authorization: str = Header(default="")):
+    async def delete_account(identifier: str, provider: str = "", authorization: str = Header(default="")):
         from .accounts import remove_account
         settings: Settings = app.state.settings
         _check_auth(settings, authorization)
-        pool = _server()._pool(app)
+        pid = (provider or "").strip()
+        pool = _pool_for(app, pid) if (pid and pools.is_multi(settings)) else _server()._pool(app)
         removed = await asyncio.to_thread(pool.remove, identifier)
         if not removed:
             raise HTTPException(status_code=404, detail=f"account not found: {identifier}")
@@ -243,12 +267,13 @@ def register_routes(app: FastAPI) -> None:
         return {"ok": True, "removed": identifier, "current": pool.current or None}
 
     @app.post("/v1/accounts/unblock")
-    async def unblock_accounts(body: dict | None = None,
+    async def unblock_accounts(body: dict | None = None, provider: str = "",
                               authorization: str = Header(default="")):
         settings: Settings = app.state.settings
         _check_auth(settings, authorization)
         identifier = (body or {}).get("identifier") if isinstance(body, dict) else None
-        pool = _server()._pool(app)
+        pid = str((body.get("provider") if isinstance(body, dict) else "") or provider or "").strip()
+        pool = _pool_for(app, pid) if (pid and pools.is_multi(settings)) else _server()._pool(app)
         cleared = await asyncio.to_thread(pool.clear_cooldown, identifier)
         await asyncio.to_thread(clear_login_backoff, identifier)
         # Persist the ban-flag clear so labels survive the next restart too.
@@ -264,12 +289,45 @@ def _check_auth(settings: Settings, authorization: str) -> None:
         raise HTTPException(status_code=401, detail="invalid API key")
 
 
+def _pool_for(app: FastAPI, provider_id) -> AccountPool:
+    """Return the account pool for ``provider_id``.
+
+    Single-provider mode (or an unknown provider id) delegates to the
+    historical ``_server()._pool(app)`` so tests patching
+    ``deepseaport.server._pool`` keep their monkeypatch seam. Multi mode
+    lazily builds ``app.state.pools`` keyed by provider id.
+    """
+    settings = app.state.settings
+    pid = str(provider_id or "").strip().lower()
+    if not pools.is_multi(settings) or not pid:
+        return _server()._pool(app)
+    if pid not in pools.active_provider_ids(settings):
+        # Unknown provider: fall back to the primary pool.
+        return _server()._pool(app)
+    cache = getattr(app.state, "pools", None)
+    if cache is None:
+        cache = {}
+        app.state.pools = cache
+    if pid not in cache:
+        cache[pid] = pools.make_pool(settings, pid, current=pools.current_for(settings, pid))
+    return cache[pid]
+
+
 def _pool(app: FastAPI) -> AccountPool:
-    from .accounts import sync_current_from_settings
+    from .accounts import _matches, sync_current_from_settings
+    from .core import registry as _registry
+    settings = app.state.settings
+    selected = pools.selected_provider(settings)
     if app.state.pool is None:
-        app.state.pool = AccountPool(app.state.settings.accounts,
-                                     current=getattr(app.state.settings,
-                                                     "active_account", ""))
+        accounts = pools.accounts_for_provider(settings, selected)
+        if not accounts and getattr(settings, "accounts", []):
+            if _registry.get(selected) is None:
+                logger.warning("provider '%s' not registered; using all accounts", selected)
+                accounts = list(settings.accounts)
+        current = getattr(settings, "active_account", "")
+        if current and not any(_matches(a, current) for a in accounts):
+            current = ""
+        app.state.pool = AccountPool(accounts, current=current)
     else:
         # Settings may change via API (add/remove/select): keep pool in sync.
         # Pool holds refs to same AccountConfig objects when created via API,
@@ -287,7 +345,7 @@ def _pool(app: FastAPI) -> AccountPool:
 
 
 def _prepare(body: dict, settings: Settings | None = None) -> dict:
-    from .server import MODELS
+    from .core import registry
     model = str(body.get("model") or "deepseek-flash")
     messages = body.get("messages", [])
     if not messages:
@@ -300,10 +358,14 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
             raise HTTPException(
                 status_code=400,
                 detail=f"messages[{idx}] must be an object with a 'role' field")
-    spec = MODELS.get(model.lower())
-    if spec is None:
+    resolved = registry.resolve_model(
+        model,
+        provider_ids=(registry.resolved_ids(pools.active_provider_ids(settings))
+                      if settings is not None else None))
+    if resolved is None:
         raise HTTPException(status_code=404, detail=f"model '{model}' not available")
-    thinking, search, model_type = spec
+    provider, spec = resolved
+    thinking, search, model_type = spec.thinking, spec.search, spec.model_type
     tools = body.get("tools") or []
     use_tools = bool(tools) and body.get("tool_choice", "auto") != "none"
     if settings is not None and not getattr(settings, "enable_tools", True):
@@ -357,4 +419,5 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
         "tool_args_max_chars": tool_args_max_chars,
         "forgiving_toolcalls": forgiving_toolcalls,
         "thinking": thinking, "search": search, "model_type": model_type,
+        "provider": provider.id,
     }

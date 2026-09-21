@@ -14,9 +14,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator
 
-from . import protocol as P
+from .providers.deepseek import protocol as P
 from .config import AccountConfig
-from .tokens import extract_token
+from .core.tokens import extract_token
 
 logger = logging.getLogger("deepseaport.accounts")
 
@@ -64,6 +64,11 @@ def _matches(cfg: AccountConfig, identifier: str) -> bool:
 
 
 def _is_duplicate(a: AccountConfig, b: AccountConfig) -> bool:
+    # Same email/mobile/token in different providers is a distinct account.
+    a_provider = (getattr(a, "provider", "deepseek") or "deepseek").strip().lower()
+    b_provider = (getattr(b, "provider", "deepseek") or "deepseek").strip().lower()
+    if a_provider != b_provider:
+        return False
     if a.email and b.email and _norm(a.email) == _norm(b.email):
         return True
     if a.mobile and b.mobile and a.mobile.strip() == b.mobile.strip():
@@ -179,6 +184,8 @@ def account_has_token(settings, identifier: str) -> bool:
 
 def add_account(settings, pool: "AccountPool", cfg: AccountConfig) -> PooledAccount:
     """Add cfg to pool + settings and make it CURRENT. Raises ValueError on dup."""
+    if not getattr(cfg, "provider", ""):
+        cfg.provider = getattr(settings, "provider", "deepseek") or "deepseek"
     item = pool.add(cfg)
     settings.accounts.append(cfg)
     # New account becomes CURRENT (default) immediately.
@@ -489,6 +496,9 @@ class AccountPool:
 def check_ban_for_token(token: str, timeout: int = BAN_CHECK_TIMEOUT) -> tuple[bool, float | None]:
     """Best-effort ban probe for one token. Never raises; (False, None) on skip/fail.
 
+    Ban probing is DeepSeek-shaped (users/current); new providers should
+    expose their own probe while ``Provider.probe_ban`` is the canonical hook.
+
     Skips empty/short (test) tokens without network. Otherwise GETs
     users/current and returns (is_banned, mute_until).
     """
@@ -497,7 +507,7 @@ def check_ban_for_token(token: str, timeout: int = BAN_CHECK_TIMEOUT) -> tuple[b
         return False, None
     try:
         # Local import: client pulls curl session, not needed at module import.
-        from . import client as _DS
+        from .providers.deepseek import client as _DS
 
         headers = P.bridge_headers(bearer=tok)
         return _DS.check_ban(headers, timeout=timeout)

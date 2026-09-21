@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .tokens import extract_token
+from .core.tokens import extract_token
 
 logger = logging.getLogger("deepseaport.config")
 
@@ -51,6 +51,9 @@ class AccountConfig:
     # accounts whose token is missing. ``banned_until`` is 0 when unknown.
     banned: bool = False
     banned_until: float = 0.0
+    # Owning provider id. Accounts with no provider in config migrate to
+    # "deepseek" so existing deployments keep their single-provider behaviour.
+    provider: str = "deepseek"
 
     def __setattr__(self, name, value):
         # Normalize at every assignment, not just construction. Runtime token
@@ -138,6 +141,10 @@ class Settings:
     # (raw body + formatted prompt). False -> slim metadata-only response;
     # the full dump still prints on the server terminal.
     send_dry_run_to_frontend: bool = True
+    # Selected provider id (single-provider mode) and optional multi-provider
+    # list (empty = use ``provider`` only).
+    provider: str = "deepseek"
+    providers: list[str] = field(default_factory=list)
 
     def save(self) -> None:
         if not self.config_path:
@@ -148,7 +155,8 @@ class Settings:
                 {"email": a.email, "mobile": a.mobile, "password": a.password,
                  "token": extract_token(a.token),
                  "banned": bool(getattr(a, "banned", False)),
-                 "banned_until": float(getattr(a, "banned_until", 0.0) or 0.0)}
+                 "banned_until": float(getattr(a, "banned_until", 0.0) or 0.0),
+                 "provider": getattr(a, "provider", "deepseek") or "deepseek"}
                 for a in self.accounts
             ],
             "active_account": self.active_account,
@@ -173,6 +181,8 @@ class Settings:
             "append_top": self.append_top,
             "append_bottom": self.append_bottom,
             "send_dry_run_to_frontend": self.send_dry_run_to_frontend,
+            "provider": self.provider,
+            "providers": list(self.providers),
         }
         data = json.dumps(payload, ensure_ascii=False, indent=2)
         target = Path(self.config_path)
@@ -273,6 +283,7 @@ def load_settings(path: str | None = None) -> Settings:
                 password=a.get("password", ""), token=a.get("token", ""),
                 banned=bool(a.get("banned", False)),
                 banned_until=a.get("banned_until", 0.0),
+                provider=a.get("provider", "deepseek") or "deepseek",
             ))
     # Single-account env: replaces placeholder config, otherwise appends as an
     # extra failover account (DEEPSEAPORT_KEYS replaces keys; TOKEN appends).
@@ -280,7 +291,10 @@ def load_settings(path: str | None = None) -> Settings:
     env_email = os.environ.get("DEEPSEAPORT_EMAIL") or os.environ.get("DEEPSEEK_EMAIL")
     env_password = os.environ.get("DEEPSEAPORT_PASSWORD") or os.environ.get("DEEPSEEK_PASSWORD")
     if env_token or (env_email and env_password):
-        env_acc = AccountConfig(email=env_email or "", password=env_password or "", token=env_token or "")
+        env_provider = (os.environ.get("DEEPSEAPORT_PROVIDER")
+                        or raw.get("provider", "deepseek") or "deepseek")
+        env_acc = AccountConfig(email=env_email or "", password=env_password or "",
+                                token=env_token or "", provider=env_provider)
         if not accounts or not (accounts[0].token or accounts[0].email):
             accounts = [env_acc]
         else:
@@ -367,4 +381,21 @@ def load_settings(path: str | None = None) -> Settings:
         append_bottom=_text("DEEPSEAPORT_APPEND_BOTTOM", "append_bottom"),
         send_dry_run_to_frontend=_bool(
             "DEEPSEAPORT_SEND_DRY_RUN_TO_FRONTEND", "send_dry_run_to_frontend", True),
+        provider=_str("DEEPSEAPORT_PROVIDER", "provider", "deepseek"),
+        providers=_providers_list(raw),
     )
+
+
+def _providers_list(raw: dict) -> list[str]:
+    """Parse the multi-provider selection (env comma-list, else config list)."""
+    if "DEEPSEAPORT_PROVIDERS" in os.environ:
+        raw_val = os.environ["DEEPSEAPORT_PROVIDERS"]
+    else:
+        raw_val = raw.get("providers", [])
+    if isinstance(raw_val, str):
+        parts = raw_val.split(",")
+    elif isinstance(raw_val, (list, tuple)):
+        parts = [str(x) for x in raw_val]
+    else:
+        parts = []
+    return [p.strip() for p in parts if p and str(p).strip()]

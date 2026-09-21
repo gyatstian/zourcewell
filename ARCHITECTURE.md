@@ -218,3 +218,32 @@ variants under old names, `deepseek-vision`.
 - Live verification scripts used during development live in the temp dir, not
   the repo: `verify_live2.py` (session→PoW→completion), `verify_tools.py`
   (tool loop), `verify_http.py` (HTTP stream/tools/reasoner), `verify_models.py`.
+
+## Provider architecture (multi-provider refactor)
+
+- Folder layout: `core/` holds provider-neutral code (provider ABC, registry,
+  pools, tools, transport, `openai` response shim, tokens); each upstream
+  lives in `providers/<name>/` (`protocol`, `client`, `sse_parser`, `pow`,
+  `auth`, `models`, `provider`); the completion engine stays DeepSeek-specific
+  in `providers/deepseek/completion_service.py`.
+- Registry (`core/registry.py`): lazy discovery via `_BUILTIN_MODULES`
+  (deepseek only) + `create_provider()` factories; failures log and never
+  raise; never imports `deepseaport.server` (no cycle).
+- Provider-scoped pools (`core/pools.py`): `active_provider_ids`,
+  `accounts_for_provider`, `make_pool` build one `AccountPool` per active
+  provider; failover stays within provider.
+- Account binding: `AccountConfig.provider` pins an account to one upstream
+  (default `deepseek`); TUI/CLI `accounts add` binds the selected provider.
+- Selection: first-menu provider gate + `--provider`/`--providers` flags over
+  `Settings.provider`/`providers` (`config.json`, `DEEPSEAPORT_PROVIDER(S)`).
+- Multi mode: 2+ ids in `Settings.providers`; `/v1/models` serves the union
+  catalogue; each provider keeps independent auto-failover (no shared CURRENT).
+- Shared shim: `core/openai._openai_response` shapes OpenAI replies for all
+  providers; tool parsing resolves through `deepseaport.server.parse_tool_calls`
+  at call time so test monkeypatches keep working.
+- Templates: `providers/glm|qwen|kimi/` are import-safe stubs (empty models,
+  `NotImplementedError` login/complete) activated by filling `models.py`,
+  implementing protocol/client + `complete()`, then adding one line to
+  `_BUILTIN_MODULES`. See `PROVIDERS.md`.
+- Back-compat: old module paths (`deepseaport.server`, `completion_service`,
+  `client`, ...) remain as alias shims; all monkeypatch seams preserved.

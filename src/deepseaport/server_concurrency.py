@@ -17,9 +17,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 
-from . import pow as PoW
+from .providers.deepseek import pow as PoW
 from .config import Settings
-from .obscura_bridge import ObscuraBridge, register_default_bridge
+from .core.obscura_bridge import ObscuraBridge, register_default_bridge
 
 logger = logging.getLogger("deepseaport.server")
 
@@ -155,18 +155,39 @@ async def lifespan(app: FastAPI):
     app.state.bridge = bridge
     register_default_bridge(bridge)
     if getattr(settings, "warmup_on_startup", True):
-        threading.Thread(target=_startup_warm, args=(bridge,), daemon=True).start()
+        threading.Thread(target=_startup_warm, args=(bridge, settings),
+                         daemon=True).start()
     yield
     # NOTE: module-level executors intentionally NOT shut down here: lifespan
     # can run multiple times per process (tests, reload) and a shutdown
     # executor raises RuntimeError on submit. Threads exit at process end.
 
 
-def _startup_warm(bridge: ObscuraBridge) -> None:
+def _startup_warm(bridge: ObscuraBridge, settings=None) -> None:
     try:
         bridge.warmup()
     except Exception as exc:
         logger.warning("startup WAF warmup failed: %s", exc)
+    # Provider-driven warmup: warm every active provider (deepseek only in
+    # single mode). Fall back to the historical inline PoW path if the
+    # registry/provider warmup is unavailable.
+    try:
+        from .core import pools, registry
+        if settings is not None:
+            provider_ids = pools.active_provider_ids(settings)
+        else:
+            provider_ids = [registry.default().id]
+        warmed = False
+        for pid in provider_ids:
+            provider = registry.get(pid)
+            if provider is None:
+                continue
+            provider.warmup(bridge)
+            warmed = True
+        if warmed:
+            return
+    except Exception as exc:
+        logger.debug("provider warmup unavailable, using inline PoW: %s", exc)
     try:
         PoW.ensure_wasm(cookies=bridge.cookie_header(), user_agent=bridge.state.user_agent)
     except Exception as exc:

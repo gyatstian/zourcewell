@@ -7,6 +7,7 @@
       "email": "",
       "password": "",
       "token": "",
+      "provider": "deepseek",
       "banned": false,
       "banned_until": 0.0
     }
@@ -29,6 +30,8 @@
   "log_level": "INFO",
   "stream_mode": "live",
   "chat_model": "deepseek-flash",
+  "provider": "deepseek",
+  "providers": [],
   "enable_append": true,
   "append_top": "",
   "append_bottom": "",

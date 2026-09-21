@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 
 from . import server_runner as _runner
@@ -38,6 +39,57 @@ def _run_server(settings, args) -> int:
     return _runner._run_server(settings, args, ensure_free=_ensure_free_port)
 
 
+def _valid_provider_id(raw) -> str:
+    """Permissive provider-id check for account binding (lowercase alnum/dash)."""
+    s = str(raw or "").strip().lower()
+    if not s:
+        return ""
+    if re.match(r"^[a-z0-9-]+$", s):
+        return s
+    return ""
+
+
+def _apply_serve_provider_flags(settings, args) -> int | None:
+    """Apply --provider/--providers to settings. None = ok, int = exit code."""
+    from .core import registry as _reg
+
+    single = getattr(args, "provider", None)
+    multi = getattr(args, "providers", None)
+    if single:
+        pid = str(single).strip().lower()
+        if _reg.get(pid) is None:
+            print(f"unknown provider: {single}")
+            print("available: " + ", ".join(sorted(_reg.registered().keys())))
+            return 2
+        settings.provider = pid
+        settings.providers = []
+        settings.save()
+        return None
+    if multi:
+        ids: list[str] = []
+        for part in str(multi).split(","):
+            key = part.strip().lower()
+            if key and key not in ids:
+                ids.append(key)
+        if not ids:
+            return None
+        available = _reg.registered()
+        for pid in ids:
+            if _reg.get(pid) is None:
+                print(f"unknown provider: {pid}")
+                print("available: " + ", ".join(sorted(available.keys())))
+                return 2
+        if len(ids) == 1:
+            settings.provider = ids[0]
+            settings.providers = []
+        else:
+            settings.providers = ids
+            settings.provider = ids[0]
+        settings.save()
+        return None
+    return None
+
+
 def cmd_serve(args) -> int:
     from .config import load_settings
 
@@ -45,9 +97,17 @@ def cmd_serve(args) -> int:
     if args.port:
         settings.port = args.port
 
+    flagged = _apply_serve_provider_flags(settings, args)
+    if flagged is not None:
+        return flagged
+    explicit = bool(getattr(args, "provider", None) or getattr(args, "providers", None))
+
     no_tui = bool(getattr(args, "no_tui", False))
     if not no_tui and sys.stdin.isatty():
-        from .tui import main_menu
+        from .tui import main_menu, provider_menu
+
+        if not explicit:
+            provider_menu(settings)
 
         def serve_fn(current_settings) -> int:
             return _run_server(current_settings, args)
@@ -86,6 +146,21 @@ def cmd_waf(args) -> int:
 def cmd_models(args) -> int:
     from .server import MODELS
 
+    flag = getattr(args, "provider", None)
+    if flag:
+        from .core import registry as _reg
+
+        prov = _reg.get(str(flag).strip().lower())
+        if prov is None:
+            print(f"unknown provider: {flag}")
+            print("available: " + ", ".join(sorted(_reg.registered().keys())))
+            return 2
+        try:
+            ids = sorted(prov.models().keys())
+        except Exception:
+            ids = []
+        print(json.dumps(ids, indent=2, ensure_ascii=False))
+        return 0
     print(json.dumps(sorted(MODELS), indent=2, ensure_ascii=False))
     return 0
 
@@ -163,6 +238,16 @@ def cmd_accounts(args) -> int:
             print("need --email, --mobile, or --token")
             print(TOKEN_HELP)
             return 2
+        _flag = _valid_provider_id(getattr(args, "provider", None))
+        if _flag:
+            cfg.provider = _flag
+        else:
+            try:
+                from .core import pools as _pools
+
+                cfg.provider = _pools.selected_provider(settings)
+            except Exception:
+                pass
         pool = AccountPool(settings.accounts, current=settings.active_account)
         try:
             from .accounts import add_account as _add
@@ -238,7 +323,8 @@ def _account_has_token(settings, identifier: str) -> bool:
     return account_has_token(settings, identifier)
 
 
-def _upsert_account(settings, email: str, password: str, token: str):
+def _upsert_account(settings, email: str, password: str, token: str,
+                    provider: str | None = None):
     """Append or update account by email. Preserves pool, fixes wipe bug."""
     from .accounts import _matches as _m, extract_token
     from .config import AccountConfig
@@ -251,6 +337,16 @@ def _upsert_account(settings, email: str, password: str, token: str):
                 a.password = password
             return a
     cfg = AccountConfig(email=email, password=password, token=token)
+    try:
+        from .core import pools as _pools
+
+        cfg.provider = (str(provider).strip().lower() if provider
+                        else _pools.selected_provider(settings))
+    except Exception:
+        if provider:
+            cfg.provider = str(provider).strip().lower()
+    if not (cfg.provider or "").strip():
+        cfg.provider = "deepseek"
     settings.accounts.append(cfg)
     # New account becomes CURRENT (default) immediately.
     settings.active_account = cfg.identifier
@@ -288,7 +384,8 @@ def cmd_login(args) -> int:
                 print(f"Evidence: {ban_detail[:300]}")
         return 3
 
-    acc = _upsert_account(settings, email, password, token)
+    _prov = _valid_provider_id(getattr(args, "provider", None)) or None
+    acc = _upsert_account(settings, email, password, token, provider=_prov)
     if login_banned:
         # A suspended account can still complete login and expose a token.
         # Keep that token (so the Accounts list can probe/display the ban) and
@@ -329,6 +426,17 @@ def cmd_chat(args) -> int:
     from .server import _complete_with_failover_sync, _prepare, create_app
 
     settings = load_settings(args.config)
+    _chat_prov = getattr(args, "provider", None)
+    if _chat_prov:
+        from .core import registry as _reg
+
+        _pid = str(_chat_prov).strip().lower()
+        if _reg.get(_pid) is None:
+            print(f"unknown provider: {_chat_prov}")
+            print("available: " + ", ".join(sorted(_reg.registered().keys())))
+            return 2
+        settings.provider = _pid
+        settings.providers = []
     app = create_app(settings)
     from .obscura_bridge import register_default_bridge
 
@@ -338,7 +446,18 @@ def cmd_chat(args) -> int:
     register_default_bridge(app.state.bridge)
     app.state.bridge.warmup()
     prep = _prepare({"model": args.model, "messages": [{"role": "user", "content": args.prompt}]}, settings)
-    pool = AccountPool(settings.accounts, current=settings.active_account)
+    try:
+        from .core import pools as _pools
+
+        _prov_accts = _pools.accounts_for_provider(settings, prep.get("provider", ""))
+        try:
+            _current = _pools.current_for(settings, prep.get("provider", ""))
+        except Exception:
+            _current = getattr(settings, "active_account", "")
+    except Exception:
+        _prov_accts = settings.accounts
+        _current = getattr(settings, "active_account", "")
+    pool = AccountPool(_prov_accts, current=_current)
     item = pool.acquire(timeout=30,
                         allow_failover=bool(getattr(settings, "use_multiple_accounts", True)))
     # Same-request ban failover as the server endpoint: a banned CURRENT
@@ -359,8 +478,14 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--workers", type=int, default=1)
     serve.add_argument("--no-tui", action="store_true",
                        help="skip the main-page TUI and start the server directly")
+    serve.add_argument("--provider", default=None,
+                       help="serve a single provider (id from registry)")
+    serve.add_argument("--providers", default=None,
+                       help="comma-separated provider ids for multi-provider mode")
     sub.add_parser("waf")
-    sub.add_parser("models")
+    models_p = sub.add_parser("models")
+    models_p.add_argument("--provider", default=None,
+                          help="print model ids for one provider only")
     acc = sub.add_parser("accounts", help="list/add/remove pooled accounts")
     acc_sub = acc.add_subparsers(dest="accounts_action", required=True)
     acc_sub.add_parser("list", help="show pooled accounts + token status")
@@ -375,6 +500,8 @@ def main(argv: list[str] | None = None) -> int:
     acc_add.add_argument("--password", default="", help="required for browser auto-refresh on 40003 (direct API login fails)")
     acc_add.add_argument("--token", default="",
                          help="userToken value from chat.deepseek.com localStorage (raw or JSON)")
+    acc_add.add_argument("--provider", default=None,
+                         help="bind the new account to a provider id (default: selected provider)")
     acc_st = acc_sub.add_parser("set-token", help="paste/refresh userToken for existing account")
     acc_st.add_argument("identifier", help="email/mobile/identifier")
     acc_st.add_argument("--token", default="", required=True,
@@ -387,14 +514,19 @@ def main(argv: list[str] | None = None) -> int:
     login = sub.add_parser("login")
     login.add_argument("--email", default="")
     login.add_argument("--password", default="")
+    login.add_argument("--provider", default=None,
+                       help="bind the logged-in account to a provider id")
     chat = sub.add_parser("chat")
     chat.add_argument("--prompt", required=True)
     chat.add_argument("--model", default="deepseek-flash")
+    chat.add_argument("--provider", default=None,
+                      help="chat against one provider's accounts")
     args = parser.parse_args(argv)
     if args.cmd is None:
         # No subcommand (e.g. double-clicked exe) -> start the server.
         args = argparse.Namespace(config=args.config, host="", port=0,
-                                  workers=1, no_tui=False, cmd="serve")
+                                  workers=1, no_tui=False, cmd="serve",
+                                  provider=None, providers=None)
     if args.cmd == "serve":
         return cmd_serve(args)
     if args.cmd == "waf":
