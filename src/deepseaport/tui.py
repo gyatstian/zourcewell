@@ -592,6 +592,30 @@ def settings_menu(settings: Settings) -> None:
     1-5 predate the dry-run toggle (6); toggles save immediately and
     multi-value options prompt for a new value.
     """
+    # Descriptor table: menu number -> zero-arg action. Numbers are stable
+    # API (tests drive "1".."19"); edit actions here, not the chain below.
+    def _actions() -> dict[str, Callable[[], None]]:
+        return {
+            "1": lambda: _toggle_bool(settings, "enable_tools", "Tool calling"),
+            "2": lambda: _toggle_bool(settings, "warmup_on_startup", "WAF warmup at startup"),
+            "3": lambda: _toggle_bool(settings, "auto_delete_session", "Delete session after reply"),
+            "4": lambda: _edit_retries(settings),
+            "5": lambda: _toggle_bool(settings, "parallel_challenge_fetch", "Parallel setup requests"),
+            "6": lambda: _toggle_bool(settings, "send_dry_run_to_frontend", "Send dry run to frontend"),
+            "7": lambda: _edit_choice(settings, "log_level", "Log level", VALID_LOG_LEVELS),
+            "8": lambda: _toggle_stream(settings),
+            "9": lambda: _toggle_bool(settings, "listen", "Allow LAN access"),
+            "10": lambda: _edit_port(settings),
+            "11": lambda: _edit_keys(settings),
+            "12": lambda: _edit_obscura_bin(settings),
+            "13": lambda: _edit_chat_model(settings),
+            "14": lambda: _toggle_bool(settings, "use_multiple_accounts", "Account failover"),
+            "15": lambda: _toggle_bool(settings, "enable_append", "Enable append"),
+            "16": lambda: _edit_append_text(settings, "append_top", "Append at top"),
+            "17": lambda: _edit_append_text(settings, "append_bottom", "Append at bottom"),
+            "18": lambda: _toggle_bool(settings, "forgiving_toolcalls", "More forgiving toolcalls"),
+            "19": lambda: _select_provider(settings),
+        }
     _clear_screen()
     while True:
         _header(f"Settings ({settings.config_path or 'unsaved'})")
@@ -662,51 +686,7 @@ def settings_menu(settings: Settings) -> None:
         # multiple copies of the settings screen in the terminal.
         _clear_screen()
         try:
-            if choice == "1":
-                _toggle_bool(settings, "enable_tools", "Tool calling")
-            elif choice == "2":
-                _toggle_bool(settings, "warmup_on_startup",
-                             "WAF warmup at startup")
-            elif choice == "3":
-                _toggle_bool(settings, "auto_delete_session",
-                             "Delete session after reply")
-            elif choice == "4":
-                _edit_retries(settings)
-            elif choice == "5":
-                _toggle_bool(settings, "parallel_challenge_fetch",
-                             "Parallel setup requests")
-            elif choice == "6":
-                _toggle_bool(settings, "send_dry_run_to_frontend",
-                             "Send dry run to frontend")
-            elif choice == "7":
-                _edit_choice(settings, "log_level", "Log level", VALID_LOG_LEVELS)
-            elif choice == "8":
-                _toggle_stream(settings)
-            elif choice == "9":
-                _toggle_bool(settings, "listen", "Allow LAN access")
-            elif choice == "10":
-                _edit_port(settings)
-            elif choice == "11":
-                _edit_keys(settings)
-            elif choice == "12":
-                _edit_obscura_bin(settings)
-            elif choice == "13":
-                _edit_chat_model(settings)
-            elif choice == "14":
-                _toggle_bool(settings, "use_multiple_accounts",
-                             "Account failover")
-            elif choice == "15":
-                _toggle_bool(settings, "enable_append",
-                             "Enable append")
-            elif choice == "16":
-                _edit_append_text(settings, "append_top", "Append at top")
-            elif choice == "17":
-                _edit_append_text(settings, "append_bottom", "Append at bottom")
-            elif choice == "18":
-                _toggle_bool(settings, "forgiving_toolcalls",
-                             "More forgiving toolcalls")
-            elif choice == "19":
-                _select_provider(settings)
+            _actions()[choice]()
         except (EOFError, KeyboardInterrupt):
             print()
             return

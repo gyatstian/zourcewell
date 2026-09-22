@@ -344,11 +344,13 @@ def _normalize_calls(
     dropped: list[int] = []
     for i, call in enumerate(raw_calls):
         if not isinstance(call, dict):
+            logger.debug("dropping tool call %d: not an object", i)
             dropped.append(i)
             continue
         fn = call.get("function", call if "name" in call else {})
         name = fn.get("name") if isinstance(fn, dict) else None
         if not isinstance(name, str) or not name:
+            logger.debug("dropping tool call %d: missing name", i)
             dropped.append(i)
             continue
         canonical = name
@@ -358,6 +360,9 @@ def _normalize_calls(
             elif name.lower() in lower_map:
                 canonical = lower_map[name.lower()]
             else:
+                # Surfaced (was silent): unknown tool names are dropped so
+                # the harness never executes a call the model hallucinated.
+                logger.debug("dropping tool call %d: unknown tool %r", i, name)
                 dropped.append(i)
                 continue
         args = fn.get("arguments", "{}") if isinstance(fn, dict) else "{}"

@@ -21,6 +21,10 @@ logger = logging.getLogger("deepseaport.accounts")
 
 COOLDOWN_SECONDS = 120
 _POLL_INTERVAL = 0.05
+# Event-driven wake for acquire(): release() notifies so waiters wake
+# immediately instead of sleeping the full 50ms poll. Wait timeout stays
+# _POLL_INTERVAL so cooldown/ban expiry behaviour is unchanged.
+_SLOT_COND = threading.Condition()
 # Ban check skips obviously-fake tokens (unit tests use "t1", "tok-...").
 # Real userToken values are 64-char; short ones would only waste a request.
 MIN_TOKEN_LEN_FOR_BAN_CHECK = 20
@@ -509,7 +513,11 @@ class AccountPool:
                 return got
             if time.monotonic() >= deadline:
                 raise TimeoutError("no DeepSeek account free (busy or cooldown)")
-            time.sleep(min(_POLL_INTERVAL, max(0.001, deadline - time.monotonic())))
+            # Event-driven: wake immediately on release(), else re-poll after
+            # _POLL_INTERVAL (same timeout/behavior as the old time.sleep).
+            remaining = max(0.001, deadline - time.monotonic())
+            with _SLOT_COND:
+                _SLOT_COND.wait(timeout=min(_POLL_INTERVAL, remaining))
 
     async def aacquire(self, timeout: float = 60, allow_failover: bool = True) -> PooledAccount:
         """Async acquire: same rotation/skip semantics, no worker thread held.
@@ -520,6 +528,9 @@ class AccountPool:
         allow_failover=False pins to CURRENT (see acquire()).
         """
         deadline = time.monotonic() + max(0.0, timeout)
+        # ponytail: async side keeps plain asyncio.sleep polling; only the
+        # sync acquire() path uses the _SLOT_COND wake (mixing a threading
+        # Condition into the event loop needs a real bridge, deferred).
         while True:
             got = self._try_acquire_once(*self._next_ordered(allow_failover))
             if got is not None:
@@ -539,11 +550,20 @@ class AccountPool:
 
     @staticmethod
     def release(item: PooledAccount) -> None:
+        # ponytail: uses increment is intentionally unlocked (stats counter
+        # only, read in status()); taking item.lock here would deadlock the
+        # normal held-lock path (Lock is not reentrant).
         item.uses += 1
         try:
             item.lock.release()
         except RuntimeError:
             pass  # already released / never acquired
+        finally:
+            try:
+                with _SLOT_COND:
+                    _SLOT_COND.notify_all()
+            except Exception:
+                pass
 
     @staticmethod
     def mark_bad(item: PooledAccount, seconds: float = COOLDOWN_SECONDS) -> None:

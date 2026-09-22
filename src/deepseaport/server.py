@@ -135,4 +135,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
-app = create_app()
+def __getattr__(name: str):
+    # Lazy `deepseaport.server.app`: importing this module used to build a
+    # FastAPI app + load_settings() (disk I/O) as a side effect, slowing
+    # every `import` (cli, tests, tools) and surprising embedders. Resolve
+    # on first attribute access so `server:app` / `from .server import app`
+    # keep working (PEP 562) with no import-time cost.
+    if name == "app":
+        _app = create_app()
+        globals()["app"] = _app
+        return _app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -61,6 +61,10 @@ class AccountConfig:
         # must never leak the full JSON wrapper into an Authorization header.
         if name == "token":
             value = extract_token(value)
+        if name == "provider":
+            # Hand-edited config.json can hold a non-str provider (e.g. 123);
+            # without this, pools._provider_of crashes on .strip().
+            value = str(value or "deepseek").strip().lower() or "deepseek"
         super().__setattr__(name, value)
 
     def __post_init__(self) -> None:
@@ -83,6 +87,20 @@ class AccountConfig:
 
 VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 VALID_STREAM_MODES = ("buffered", "live")
+
+# Single source of truth for Settings.save(): every persistable scalar/list
+# field. ``accounts`` (custom shape) and ``config_path`` (never persisted)
+# are excluded. Adding a dataclass field without adding it here means it
+# silently stops persisting, so keep this beside the dataclass.
+_SETTINGS_SAVE_FIELDS = (
+    "keys", "active_account", "obscura_bin", "obscura_profile",
+    "browser_bin", "browser_headless", "port", "listen",
+    "enable_tools", "warmup_on_startup", "auto_delete_session",
+    "max_retries", "parallel_challenge_fetch", "tool_args_max_chars",
+    "forgiving_toolcalls", "use_multiple_accounts", "log_level",
+    "stream_mode", "chat_model", "enable_append", "append_top",
+    "append_bottom", "send_dry_run_to_frontend", "provider", "providers",
+)
 
 
 @dataclass
@@ -149,41 +167,33 @@ class Settings:
     def save(self) -> None:
         if not self.config_path:
             return
-        payload = {
-            "keys": self.keys,
-            "accounts": [
-                {"email": a.email, "mobile": a.mobile, "password": a.password,
-                 "token": extract_token(a.token),
-                 "banned": bool(getattr(a, "banned", False)),
-                 "banned_until": float(getattr(a, "banned_until", 0.0) or 0.0),
-                 "provider": getattr(a, "provider", "deepseek") or "deepseek"}
-                for a in self.accounts
-            ],
-            "active_account": self.active_account,
-            "obscura_bin": self.obscura_bin,
-            "obscura_profile": self.obscura_profile,
-            "browser_bin": self.browser_bin,
-            "browser_headless": self.browser_headless,
-            "port": self.port,
-            "listen": self.listen,
-            "enable_tools": self.enable_tools,
-            "warmup_on_startup": self.warmup_on_startup,
-            "auto_delete_session": self.auto_delete_session,
-            "max_retries": self.max_retries,
-            "parallel_challenge_fetch": self.parallel_challenge_fetch,
-            "tool_args_max_chars": self.tool_args_max_chars,
-            "forgiving_toolcalls": self.forgiving_toolcalls,
-            "use_multiple_accounts": self.use_multiple_accounts,
-            "log_level": self.log_level,
-            "stream_mode": self.stream_mode,
-            "chat_model": self.chat_model,
-            "enable_append": self.enable_append,
-            "append_top": self.append_top,
-            "append_bottom": self.append_bottom,
-            "send_dry_run_to_frontend": self.send_dry_run_to_frontend,
-            "provider": self.provider,
-            "providers": list(self.providers),
-        }
+        # Mirror guard: a new dataclass field without a _SETTINGS_SAVE_FIELDS
+        # entry silently stops persisting. Loud warning, not an exception
+        # (endpoints must not 500 on a field addition).
+        try:
+            _known = set(_SETTINGS_SAVE_FIELDS) | {"accounts", "config_path"}
+            _missing = [n for n in self.__dataclass_fields__ if n not in _known]
+            if _missing:
+                logger.warning("Settings field(s) not persisted (add to "
+                               "_SETTINGS_SAVE_FIELDS): %s", sorted(_missing))
+        except Exception:
+            pass
+        # Payload order mirrors the historical hand-built dict (keys,
+        # accounts, then scalars) so on-disk JSON stays diff-stable.
+        payload: dict = {"keys": self.keys}
+        payload["accounts"] = [
+            {"email": a.email, "mobile": a.mobile, "password": a.password,
+             "token": extract_token(a.token),
+             "banned": bool(getattr(a, "banned", False)),
+             "banned_until": float(getattr(a, "banned_until", 0.0) or 0.0),
+             "provider": getattr(a, "provider", "deepseek") or "deepseek"}
+            for a in self.accounts
+        ]
+        for _key in _SETTINGS_SAVE_FIELDS:
+            if _key == "keys":
+                continue  # already first, keeps historical order
+            _val = getattr(self, _key)
+            payload[_key] = list(_val) if isinstance(_val, list) else _val
         data = json.dumps(payload, ensure_ascii=False, indent=2)
         target = Path(self.config_path)
         # Atomic write: unique temp file in the same dir, then os.replace.
@@ -199,6 +209,11 @@ class Settings:
                     fh.write(data)
                     fh.flush()
                     os.fsync(fh.fileno())
+                try:
+                    # Tokens + passwords live here: owner-only on POSIX.
+                    os.chmod(tmp_name, 0o600)
+                except OSError:
+                    pass
                 # Transient AV/indexer locks block rename for ~ms: retry so the
                 # atomic path still wins instead of degrading to in-place.
                 replaced = False
@@ -235,6 +250,10 @@ class Settings:
                             os.fsync(fh.fileno())
                         except OSError:
                             pass
+                    try:
+                        os.chmod(target, 0o600)
+                    except OSError:
+                        pass
             finally:
                 if tmp_name:
                     try:

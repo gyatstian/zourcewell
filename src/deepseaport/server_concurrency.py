@@ -115,12 +115,15 @@ async def _acquire_slot_or_499(pool, request: Request,
 def _await_cancelable(fut, cancel_event: threading.Event | None):
     """Wait for a challenge-executor future, aborting promptly on disconnect.
 
-    Polls with a short timeout so a client disconnect (cancel_event set by
+    No cancel token: plain blocking wait (no 50ms poll). With a token:
+    polls with a short timeout so a client disconnect (cancel_event set by
     the Request watcher) raises _StreamCancelled instead of holding the
     account slot through the full session→PoW setup.
     """
     import concurrent.futures as _fut
 
+    if cancel_event is None:
+        return fut.result()
     while True:
         if cancel_event is not None and cancel_event.is_set():
             try:

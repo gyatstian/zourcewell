@@ -59,13 +59,7 @@ def _biz_error(data: dict) -> tuple[str, str] | None:
         return None
     code_s, msg_s = str(code), str(msg or "")
     # Attach ban expiry when present (completion ban carries it here).
-    try:
-        if P.is_ban_payload(data):
-            ts = P.extract_ban_timestamp(data)
-            if ts is not None:
-                msg_s = f"{msg_s} (suspended until {P.format_ban_datetime(ts)})".strip()
-    except Exception:
-        pass
+    msg_s = P.with_ban_expiry(msg_s, data)
     return code_s, msg_s
 
 
@@ -87,23 +81,11 @@ def check_ban(headers: dict, timeout: int = 20) -> tuple[bool, float | None]:
         if not isinstance(data, dict):
             return False, None
         # Invalid/expired token is not a ban — just unauthenticated.
-        code = data.get("code")
-        inner = data.get("data")
-        if code in (40003, "40003"):
+        if P.is_invalid_token_payload(data):
             return False, None
-        if isinstance(inner, dict) and inner.get("biz_code") in (40003, "40003"):
-            return False, None
-        if P.is_ban_payload(data):
-            return True, P.extract_ban_timestamp(data)
-        # Explicit non-muted chat shape also means not banned.
-        try:
-            biz = (inner or {}).get("biz_data", {}) if isinstance(inner, dict) else {}
-            chat = biz.get("chat") if isinstance(biz, dict) else None
-            if isinstance(chat, dict) and "is_muted" in chat:
-                return bool(chat.get("is_muted") in (1, True, "1")), P.extract_ban_timestamp(data)
-        except Exception:
-            pass
-        return False, None
+        # Single verdict: detect_ban pairs is_ban_payload + timestamp, so an
+        # explicit non-muted chat shape also lands here as (False, None).
+        return P.detect_ban(data)
     except Exception as exc:
         logger.debug("check_ban ignored: %s", exc)
         return False, None
@@ -175,13 +157,12 @@ def _ban_stream_event(data) -> P.StreamEvent | None:
     """
     if not isinstance(data, dict):
         return None
+    banned, ts = P.detect_ban(data)
     err = _biz_error(data)
     if err:
-        ban_ts = P.extract_ban_timestamp(data) if P.is_ban_payload(data) else None
         return P.StreamEvent(kind="error", code=err[0], message=err[1],
-                             ban_until=ban_ts)
-    if P.is_ban_payload(data):
-        ts = P.extract_ban_timestamp(data)
+                             ban_until=ts if banned else None)
+    if banned:
         return P.StreamEvent(kind="error", code="5",
                              message=P.ban_message(ts), ban_until=ts)
     return None

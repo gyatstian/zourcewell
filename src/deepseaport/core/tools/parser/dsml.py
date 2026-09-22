@@ -369,7 +369,8 @@ def _dsml_spans(text: str, forgiving: bool = False,
     return spans
 
 
-def try_parse_dsml(text, valid_or_none, limit_args, forgiving_on, tools):
+def try_parse_dsml(text, valid_or_none, limit_args, forgiving_on, tools,
+                 diagnostics=None):
     """Gate on invoke/DSML marker, then scan. Returns (calls, rest) or (None, None)."""
     low = text.lower()
     if ("dsml" in low or "<invoke" in low
@@ -377,6 +378,10 @@ def try_parse_dsml(text, valid_or_none, limit_args, forgiving_on, tools):
         dsml_raw = _parse_dsml_calls(text, forgiving=forgiving_on, tools=tools)
         if dsml_raw:
             calls, dropped = _normalize_calls(dsml_raw, valid_or_none, limit_args)
+            if diagnostics is not None:
+                diagnostics.append({"format": "dsml", "matched": bool(calls),
+                                    "kept": len(calls), "dropped": list(dropped),
+                                    "raw": len(dsml_raw)})
             if calls:
                 # Strip on normalized text then map back by length-stable replace:
                 # fullwidth->ASCII is length-stable (1 char -> 1 char), so spans align.

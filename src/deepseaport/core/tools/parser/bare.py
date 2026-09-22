@@ -71,11 +71,16 @@ def _parse_bare_name_objects(
     return raw, spans
 
 
-def try_parse_bare(text, valid, valid_or_none, limit_args, limit_bare, forgiving_on):
+def try_parse_bare(text, valid, valid_or_none, limit_args, limit_bare, forgiving_on,
+                   diagnostics=None):
     if valid:
         bare_raw, bare_spans = _parse_bare_name_objects(text, valid, limit_bare)
         if bare_raw:
-            calls, _ = _normalize_calls(bare_raw, valid_or_none, limit_args)
+            calls, dropped = _normalize_calls(bare_raw, valid_or_none, limit_args)
+            if diagnostics is not None:
+                diagnostics.append({"format": "bare", "matched": bool(calls),
+                                    "kept": len(calls), "dropped": list(dropped),
+                                    "raw": len(bare_raw)})
             if calls:
                 # Strip only the spans that survived normalization.
                 rest = _clean_rest(_strip_spans(text, bare_spans), forgiving_on)

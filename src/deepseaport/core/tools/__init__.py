@@ -59,7 +59,7 @@ from .common import (
     _valid_names,
     looks_truncated_tool_attempt,
 )
-from .parser import parse_tool_calls
+from .parser import PARSE_CHAIN, ParseResult, parse_tool_calls, parse_tool_calls_ex
 from .parser.bare import _parse_bare_name_objects
 from .parser.dsml import (
     _DS,
@@ -117,7 +117,9 @@ __all__ = [
     "_message_text",
     "render_prompt",
     "_balanced_json",
-    "_LOOSE_JSON_MISS",
+    # _LOOSE_JSON_MISS stays importable (parser submodules + compat) but is
+    # intentionally absent from __all__: star-imports should not get the
+    # miss sentinel; explicit imports keep working.
     "_escape_control_chars_in_strings",
     "_remove_trailing_commas",
     "_quote_unquoted_keys",
@@ -157,6 +159,9 @@ __all__ = [
     "_dsml_spans",
     "_parse_bare_name_objects",
     "_strip_spans",
+    "PARSE_CHAIN",
+    "ParseResult",
+    "parse_tool_calls_ex",
     "_looks_like_tool_attempt",
     "looks_truncated_tool_attempt",
     "_FENCED_BLOCK_RE",

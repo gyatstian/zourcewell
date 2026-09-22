@@ -61,11 +61,14 @@ def drain_lines(resp: Any, cap: int) -> list[str]:
     20k/4k bounds from client.stream_completion.
     """
     out: list[str] = []
+    total = 0
     for raw in resp.iter_lines():
         if not raw:
             continue
-        out.append(decode_line(raw))
-        if sum(len(c) for c in out) > cap:
+        s = decode_line(raw)
+        out.append(s)
+        total += len(s)
+        if total > cap:
             break
     return out
 

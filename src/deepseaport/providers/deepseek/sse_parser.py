@@ -39,12 +39,7 @@ class StreamParser:
         # Deferred import: protocol.py re-exports this module at top level,
         # so a top-level import would cycle. Resolved at call time when both
         # modules are fully loaded; behavior identical to direct globals.
-        from .protocol import (
-            ban_message,
-            extract_ban_timestamp,
-            format_ban_datetime,
-            is_ban_payload,
-        )
+        from .protocol import ban_message, detect_ban, is_ban_payload, with_ban_expiry
 
         line = line.strip()
         if not line or not line.startswith("data:"):
@@ -79,11 +74,10 @@ class StreamParser:
                 msg = str(chunk.get("msg") or (biz or {}).get("biz_msg") or "")
                 ban_ts: float | None = None
                 try:
-                    if is_ban_payload(chunk):
-                        ts = extract_ban_timestamp(chunk)
+                    banned, ts = detect_ban(chunk)
+                    if banned:
                         ban_ts = ts
-                        if ts is not None:
-                            msg = f"{msg} (suspended until {format_ban_datetime(ts)})".strip()
+                        msg = with_ban_expiry(msg, chunk)
                         if not msg:
                             msg = ban_message(ts)
                         code = str(code) if code not in (0, "0", None, "") else "5"

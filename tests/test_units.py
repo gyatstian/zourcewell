@@ -328,20 +328,23 @@ def test_mcp_tool_iserror_becomes_exception():
 
 
 def test_parse_ban_until_from_human_login_text():
+    import datetime as _dt
     import time as _time
 
     from deepseaport import protocol as P
     from deepseaport.auth import parse_ban_until
 
+    # ponytail: year is always relative (now+2) so this never rots like the old hardcoded 2026 date did.
+    year = _dt.datetime.now().year + 2
     until = parse_ban_until(
         "Due to violation of user policies, your account has been suspended "
-        "until 16 September 2026 12:49. If you have any questions, please contact us.")
+        f"until 16 September {year} 12:49. If you have any questions, please contact us.")
     assert until is not None and until > _time.time()
-    assert P.format_ban_datetime(until) == "16 September 2026 12:49"
+    assert P.format_ban_datetime(until) == f"16 September {year} 12:49"
     until_pl = parse_ban_until(
-        "Twoje konto zostało zawieszone do września 16, 2026 21:18.")
+        f"Twoje konto zostało zawieszone do września 16, {year} 21:18.")
     assert until_pl is not None
-    assert P.format_ban_datetime(until_pl) == "16 September 2026 21:18"
+    assert P.format_ban_datetime(until_pl) == f"16 September {year} 21:18"
 
 
 def test_persisted_banned_account_label_needs_no_token():

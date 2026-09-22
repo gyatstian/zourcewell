@@ -69,7 +69,9 @@ def ensure_wasm(cookies: str = "", user_agent: str = "") -> Path:
         raise RuntimeError(
             f"PoW wasm download is not a wasm module "
             f"(magic={content[:4]!r}, {len(content)} bytes)")
-    path.write_bytes(content)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(content)
+    os.replace(tmp, path)
     logger.info("downloaded PoW wasm (%d bytes)", len(content))
     return path
 
@@ -130,27 +132,44 @@ def solve(algorithm: str, challenge: str, salt: str, difficulty: int | float, ex
     linker = _LINKER
     instance = linker.instantiate(store, module)
     exports = instance.exports(store)
-    memory = exports["memory"]
-    add_to_stack = exports["__wbindgen_add_to_stack_pointer"]
-    alloc = exports["__wbindgen_export_0"]
-    wasm_solve = exports["wasm_solve"]
+    try:
+        memory = exports["memory"]
+        add_to_stack = exports["__wbindgen_add_to_stack_pointer"]
+        alloc = exports["__wbindgen_export_0"]
+        wasm_solve = exports["wasm_solve"]
+    except KeyError as exc:
+        raise RuntimeError(f"PoW wasm missing expected export: {exc}")
 
-    base = ctypes.cast(memory.data_ptr(store), ctypes.c_void_p).value
+    def _base() -> int:
+        # Re-read per access: alloc/wasm_solve may grow memory, which can
+        # relocate the buffer and stale a cached pointer.
+        return ctypes.cast(memory.data_ptr(store), ctypes.c_void_p).value
+
+    def _check(offset: int, size: int) -> None:
+        if offset < 0 or size < 0 or offset + size > memory.data_len(store):
+            raise RuntimeError(
+                f"PoW wasm memory access out of bounds "
+                f"(offset={offset}, size={size}, mem={memory.data_len(store)})")
 
     def write(offset: int, data: bytes) -> None:
-        ctypes.memmove(base + offset, data, len(data))
+        _check(offset, len(data))
+        ctypes.memmove(_base() + offset, data, len(data))
 
     def read(offset: int, size: int) -> bytes:
-        return ctypes.string_at(base + offset, size)
+        _check(offset, size)
+        return ctypes.string_at(_base() + offset, size)
+
+    def _to_int(value) -> int:
+        return int(value.value) if hasattr(value, "value") else int(value)
 
     def encode(text: str) -> tuple[int, int]:
         data = text.encode("utf-8")
-        ptr = alloc(store, len(data), 1)
-        ptr = int(ptr.value) if hasattr(ptr, "value") else int(ptr)
+        ptr = _to_int(alloc(store, len(data), 1))
         write(ptr, data)
         return ptr, len(data)
 
-    retptr = add_to_stack(store, -16)
+    retptr = _to_int(add_to_stack(store, -16))
+    _check(retptr, 16)
     ptr_c, len_c = encode(challenge)
     ptr_p, len_p = encode(prefix)
     try:

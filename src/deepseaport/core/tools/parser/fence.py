@@ -16,7 +16,8 @@ from ..common import (
 logger = logging.getLogger("deepseaport.tools")
 
 
-def try_parse_fence(text, valid_or_none, limit_args, forgiving_on):
+def try_parse_fence(text, valid_or_none, limit_args, forgiving_on,
+                    diagnostics=None):
     # Balanced scan inside each fence so nested arguments survive
     # (non-greedy \{.*?\} stopped at the first inner "}").
     for m in _FENCED_BLOCK_RE.finditer(text):
@@ -42,7 +43,11 @@ def try_parse_fence(text, valid_or_none, limit_args, forgiving_on):
             elif isinstance(obj, dict) and isinstance(obj.get("function"), dict):
                 raw = [obj]
             if raw:
-                calls, _ = _normalize_calls(raw, valid_or_none, limit_args)
+                calls, dropped = _normalize_calls(raw, valid_or_none, limit_args)
+                if diagnostics is not None:
+                    diagnostics.append({"format": "fence", "matched": bool(calls),
+                                        "kept": len(calls), "dropped": list(dropped),
+                                        "raw": len(raw)})
                 if calls:
                     rest = _clean_rest(text[:m.start()] + text[m.end():], forgiving_on)
                     return calls, rest

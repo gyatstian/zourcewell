@@ -40,7 +40,9 @@ verdict helper stays a ``(kind, phrase)`` tuple to preserve current callers.
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
+import re
 
 SIGN_IN_URL = "https://chat.deepseek.com/sign_in"
 
@@ -263,6 +265,77 @@ def snapshot_verdict(snapshot: dict | None) -> tuple[str, str]:
         )
     except Exception:
         return "", ""
+
+
+_MONTH_NUMBERS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
+    "june": 6, "july": 7, "august": 8, "september": 9, "october": 10,
+    "november": 11, "december": 12,
+    # Polish web UI often shows "wrzesień 16, 2026 21:18".
+    "styczen": 1, "stycznia": 1, "luty": 2, "lutego": 2,
+    "marzec": 3, "marca": 3, "kwiecien": 4, "kwietnia": 4,
+    "maj": 5, "maja": 5, "czerwiec": 6, "czerwca": 6,
+    "lipiec": 7, "lipca": 7, "sierpien": 8, "sierpnia": 8,
+    "wrzesien": 9, "wrzesnia": 9, "pazdziernik": 10,
+    "pazdziernika": 10, "listopad": 11, "listopada": 11,
+    "grudzien": 12, "grudnia": 12,
+    "stycze\u0144": 1, "kwiecie\u0144": 4,
+    "sierpie\u0144": 8, "wrzesie\u0144": 9, "wrze\u015bnia": 9,
+    "pa\u017adziernik": 10, "pa\u017adziernika": 10,
+    "grudzie\u0144": 12, "grudnia": 12,
+}
+_MONTH_RE = "|".join(sorted((re.escape(k) for k in _MONTH_NUMBERS), key=len, reverse=True))
+
+
+def parse_ban_until(text: str) -> float | None:
+    """Best-effort parse of a human ban expiry from a login/page message.
+
+    Supports English ``16 September 2026 12:49`` and Polish
+    ``wrzesie\u0144 16, 2026 21:18``. The exact API ``mute_until`` is preferred,
+    but this keeps a human-readable date when the browser page is the only
+    source of truth (for example a suspended account that still logs in).
+    Shared by both login drivers via ``auth.parse_ban_until`` (re-export).
+    """
+    try:
+        low = (text or "").lower()
+        day = month = year = None
+        hour = minute = 0
+        # English / most locales: day month [year] [HH:MM]
+        m = re.search(
+            rf"(\d{{1,2}})\s+({_MONTH_RE})(?:\s+(\d{{4}}))?"
+            r"(?:\s+(\d{1,2}):(\d{2}))?",
+            low,
+        )
+        if m:
+            day = int(m.group(1))
+            month = _MONTH_NUMBERS.get(m.group(2))
+            year = int(m.group(3)) if m.group(3) else None
+            hour = int(m.group(4) or 0)
+            minute = int(m.group(5) or 0)
+        if month is None:
+            # Polish-ish: month day, year [HH:MM]
+            m = re.search(
+                rf"({_MONTH_RE})\s+(\d{{1,2}})(?:,)?(?:\s+(\d{{4}}))?"
+                r"(?:\s+(\d{1,2}):(\d{2}))?",
+                low,
+            )
+            if m:
+                month = _MONTH_NUMBERS.get(m.group(1))
+                day = int(m.group(2))
+                year = int(m.group(3)) if m.group(3) else None
+                hour = int(m.group(4) or 0)
+                minute = int(m.group(5) or 0)
+        if not day or not month:
+            return None
+        now = _dt.datetime.now()
+        year = year or now.year
+        dt = _dt.datetime(year, month, day, hour, minute)
+        # No explicit year and the date has already passed: assume next year.
+        if not m.group(3) and dt <= now:
+            dt = dt.replace(year=year + 1)
+        return dt.timestamp()
+    except Exception:
+        return None
 
 
 class LoginPagePolicy:

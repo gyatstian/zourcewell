@@ -293,6 +293,23 @@ def _check_auth(settings: Settings, authorization: str) -> None:
         raise HTTPException(status_code=401, detail="invalid API key")
 
 
+def _sync_pool_current(pool: AccountPool, settings) -> None:
+    """Single sync path: pool CURRENT <-> settings.active_account + save.
+
+    Replaces the inline sync_current_from_settings + settings.save() copies
+    below. Signatures/persistence unchanged.
+    """
+    from .accounts import sync_current_from_settings
+    try:
+        if sync_current_from_settings(pool, settings):
+            try:
+                settings.save()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _pool_cache(app: FastAPI) -> dict:
     """Return the single provider->pool registry, creating it on demand.
 
@@ -336,7 +353,7 @@ def _pool(app: FastAPI) -> AccountPool:
     and multi mode never keep two divergent stores. An explicitly injected
     ``app.state.pool`` (tests/embedding) still wins for backward compat.
     """
-    from .accounts import _matches, sync_current_from_settings
+    from .accounts import _matches
     from .core import registry as _registry
     settings = app.state.settings
 
@@ -346,14 +363,7 @@ def _pool(app: FastAPI) -> AccountPool:
         # Pool holds refs to same AccountConfig objects when created via API,
         # but CLI/TUI edits replace settings.accounts list: rebind not needed
         # for in-memory pool except CURRENT selection.
-        try:
-            if sync_current_from_settings(injected, settings):
-                try:
-                    settings.save()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        _sync_pool_current(injected, settings)
         return injected
 
     selected = pools.selected_provider(settings)
@@ -374,14 +384,7 @@ def _pool(app: FastAPI) -> AccountPool:
     elif not pools.is_multi(settings):
         # Single provider follows settings.active_account; multi keeps each
         # provider on independent auto-failover (see core.pools.current_for).
-        try:
-            if sync_current_from_settings(pool, settings):
-                try:
-                    settings.save()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        _sync_pool_current(pool, settings)
     return pool
 
 

@@ -27,7 +27,7 @@ from . import pow as PoW
 from . import protocol as P
 from ...accounts import AccountPool, PooledAccount
 from ...config import Settings, load_settings
-from ...core.engine import ProducerBridge, drive_retries, run_with_failover
+from ...core.engine import drive_retries, run_with_failover
 from ...core.obscura_bridge import ObscuraBridge
 # Shared implementation: _openai_response lives in core.openai so every
 # web2api provider reuses one response shim (re-exported here for compat).
@@ -168,6 +168,13 @@ def _is_upstream_invalid_error(error: str | None) -> bool:
     """True for upstream payload rejections (422/400 family)."""
     low = (error or "").lower()
     return "http_422" in low or "unprocessable" in low or "http_400" in low
+
+
+def _error_text(code: str | None, message: str | None) -> str:
+    """Single "CODE: message" formatter (the string classify_error parses)."""
+    code = (code or "").strip()
+    message = (message or "").strip()
+    return f"{code}: {message}" if code else message
 
 
 def classify_error(error: str | None) -> RetryKind | None:
@@ -317,32 +324,33 @@ def _refresh_token_via_obscura(app: FastAPI, item: PooledAccount,
         except Exception:
             banned, detail = False, ""
         return (fresh or None), banned, detail
-    banned = False
-    detail = ""
     # Backoff: a recent no-token login (captcha/credential) means the login
     # page is challenging this profile right now. Spawning the browser on
     # every 40003 flags it further — skip fast with the previous evidence.
+    # NOTE: the backoff check must precede the singleflight leave below:
+    # a skipped run still wakes followers (they read the ban hint + token).
     skip_reason = item.login_backoff_skip()
     if skip_reason:
         msg = (f"browser login skipped for {key} ({skip_reason}; "
                f"manual set-token bypasses this)")
         logger.info(msg)
+        _leave_token_refresh(key, inflight, banned=False, detail=msg)
         return None, False, msg
     try:
-        from .auth import obscura_login_token as _login_token
-        from .auth import unpack_login_result as _unpack_login
-        try:
-            raw = _login_token(cfg.email or cfg.mobile,
-                               cfg.password, settings)
-            new_token, banned, detail = _unpack_login(raw)
-            try:
-                from ...accounts import extract_token as _extract_token
-                new_token = _extract_token(new_token) or None
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.warning("token refresh via Obscura failed for %s: %s", key, exc)
-            new_token, banned, detail = None, False, ""
+        # The browser run (profile-lock wait up to 180s + LOGIN_TIMEOUT 90s)
+        # is global work: release the per-account slot while it runs so other
+        # requests can fail over to healthy accounts instead of queueing
+        # behind a minute-long login (same pattern as the WAF refresh below).
+        # Another request may meanwhile run an attempt on this account with
+        # the stale token; it 40003s and joins this run as a follower —
+        # strictly better than parking behind the leader's slot.
+        with _slot_releaser(item, cancel_event):
+            if cancel_event is not None and cancel_event.is_set():
+                raise _StreamCancelled()
+            new_token, banned, detail = _run_obscura_login(
+                app, item, settings, key)
+        if cancel_event is not None and cancel_event.is_set():
+            raise _StreamCancelled()
         try:
             with _TOKEN_REFRESH_LOCK:
                 _TOKEN_REFRESH_BAN_HINT[key] = (bool(banned), str(detail or ""))
@@ -352,6 +360,9 @@ def _refresh_token_via_obscura(app: FastAPI, item: PooledAccount,
             logger.warning("Obscura login page shows account %s BANNED: %s",
                            key, (detail or "")[:200])
             item.clear_login_backoff()
+            _leave_token_refresh(key, inflight, banned=True,
+                                 detail=str(detail or ""))
+            return None, True, str(detail or "")
         if new_token:
             from ...accounts import set_account_token
             item.cfg.token = new_token
@@ -360,30 +371,37 @@ def _refresh_token_via_obscura(app: FastAPI, item: PooledAccount,
                 settings.save()
             except Exception as exc:
                 logger.warning("token refresh save failed for %s: %s", key, exc)
-            if not banned:
-                logger.info("token refreshed via Obscura for %s", key)
-                item.clear_login_backoff()
-            return new_token, bool(banned), str(detail or "")
-        if not banned:
-            # No token, no ban page: back off the browser so repeated 40003s
-            # don't hammer the challenge endpoint. Manual set-token clears it.
-            low = (detail or "").lower()
-            if "captcha" in low:
-                item.set_login_backoff("captcha-challenge", 180)
-            elif "credential" in low or "incorrect" in low or "wrong password" in low:
-                item.set_login_backoff("credential-error", 600)
-            elif "form interaction failed" in low:
-                item.set_login_backoff("login-form-changed", 600)
-            else:
-                item.set_login_backoff("no-token", 120)
-        return None, bool(banned), str(detail or "")
-    finally:
-        with _TOKEN_REFRESH_LOCK:
-            _TOKEN_REFRESH_INFLIGHT.pop(key, None)
-            try:
-                inflight.set()
-            except Exception:
-                pass
+            logger.info("token refreshed via Obscura for %s", key)
+            item.clear_login_backoff()
+            _leave_token_refresh(key, inflight)
+            return new_token, False, ""
+        # No token, no ban page: back off the browser so repeated 40003s
+        # don't hammer the challenge endpoint. Manual set-token clears it.
+        if detail:
+            login_note = str(detail)[:500]
+            logger.warning("Obscura login for %s produced no usable token: %s",
+                           item.cfg.identifier, login_note[:300])
+        else:
+            login_note = ""
+        low = (detail or "").lower()
+        if "captcha" in low:
+            item.set_login_backoff("captcha-challenge", 180)
+        elif ("credential" in low or "incorrect" in low
+                or "wrong password" in low):
+            item.set_login_backoff("credential-error", 600)
+        elif "form interaction failed" in low:
+            item.set_login_backoff("login-form-changed", 600)
+        else:
+            item.set_login_backoff("no-token", 120)
+        _leave_token_refresh(key, inflight, banned=False, detail=login_note)
+        return None, False, login_note
+    except _StreamCancelled:
+        # Slot already released by _slot_releaser; just wake followers.
+        _leave_token_refresh(key, inflight)
+        raise
+    except Exception:
+        _leave_token_refresh(key, inflight)
+        raise
 
 
 def _solve(app: FastAPI, token: str) -> dict[str, str]:
@@ -495,6 +513,78 @@ def _app_settings(app: FastAPI) -> Settings:
     return settings
 
 
+from contextlib import contextmanager
+
+
+@contextmanager
+def _slot_releaser(item: PooledAccount,
+                   cancel_event: threading.Event | None = None):
+    """Release the per-account slot during global (browser/WAF) waits.
+
+    Releases ``item.lock`` on entry (no-op when not held, e.g. unit tests
+    calling the engine with a fresh account), reacquires on exit. The
+    reacquire polls so a disconnect aborts promptly instead of blocking
+    indefinitely under contention (raises ``_StreamCancelled``). Leaving
+    the slot released on cancel is safe: the outer ``run_with_failover``
+    release is ``RuntimeError``-safe.
+    """
+    released = False
+    try:
+        item.lock.release()
+        released = True
+    except RuntimeError:
+        released = False
+    except Exception:
+        released = False
+    try:
+        yield released
+    finally:
+        if released:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise _StreamCancelled()
+                try:
+                    if item.lock.acquire(timeout=0.5):
+                        break
+                except Exception:
+                    break
+
+
+def _leave_token_refresh(key: str, inflight: threading.Event,
+                       banned: bool = False, detail: str = "") -> None:
+    """Wake singleflight followers: record the ban hint, pop, set."""
+    try:
+        with _TOKEN_REFRESH_LOCK:
+            _TOKEN_REFRESH_BAN_HINT[key] = (bool(banned), str(detail or ""))
+            _TOKEN_REFRESH_INFLIGHT.pop(key, None)
+            try:
+                inflight.set()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _run_obscura_login(app: FastAPI, item: PooledAccount,
+                       settings, key: str) -> tuple[str | None, bool, str]:
+    """One Obscura browser login; returns (token_or_None, banned, detail)."""
+    cfg = item.cfg
+    from .auth import obscura_login_token as _login_token
+    from .auth import unpack_login_result as _unpack_login
+    try:
+        raw = _login_token(cfg.email or cfg.mobile, cfg.password, settings)
+        new_token, banned, detail = _unpack_login(raw)
+        try:
+            from ...accounts import extract_token as _extract_token
+            new_token = _extract_token(new_token) or None
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning("token refresh via Obscura failed for %s: %s", key, exc)
+        new_token, banned, detail = None, False, ""
+    return new_token, bool(banned), str(detail or "")
+
+
 def _refresh_waf_without_account_lock(app: FastAPI, item: PooledAccount,
                                         cancel_event: threading.Event | None = None) -> None:
     """Global WAF refresh without wasting the per-account slot.
@@ -507,35 +597,13 @@ def _refresh_waf_without_account_lock(app: FastAPI, item: PooledAccount,
     Reacquire polls so a disconnected client aborts instead of blocking
     indefinitely under contention (raises _StreamCancelled).
     """
-    released = False
-    try:
-        item.lock.release()
-        released = True
-    except RuntimeError:
-        released = False
-    except Exception:
-        released = False
-    try:
+    with _slot_releaser(item, cancel_event):
         try:
             bridge = getattr(app.state, "bridge", None)
             if bridge is not None:
                 bridge.warmup()
         except Exception as exc:
             logger.warning("WAF warmup failed: %s", exc)
-    finally:
-        if released:
-            # Cancelable reacquire: unbounded acquire() would pin an orphaned
-            # producer indefinitely when another request holds the slot.
-            # AccountPool.release() swallows RuntimeError, so leaving the
-            # slot released on cancel is safe (outer release becomes no-op).
-            while True:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise _StreamCancelled()
-                try:
-                    if item.lock.acquire(timeout=0.5):
-                        break
-                except Exception:
-                    break
 
 
 def _is_ban_http_exception(exc: BaseException) -> bool:
@@ -644,6 +712,28 @@ def _complete_with_failover_sync(app: FastAPI, pool: AccountPool, prep: dict,
     return result
 
 
+def _invalid_token_401_detail(identifier: str, error: str,
+                             login_note: str, refreshed: bool) -> str:
+    """One 401 message for both invalid-token sites (session + terminal).
+
+    Two code paths raise "token invalid" 401s (``_open_session`` after a
+    failed refresh, ``_terminal_invalid_token`` after a mid-stream 40003);
+    one helper keeps the wording — and the BANNED-vs-stale distinction —
+    identical. (Smallest risk-reducing step toward typed errors; the full
+    ``RetryKind``-carrying error-type refactor stays deferred.)
+    """
+    note = f" Browser login note: {login_note[:300]}." if login_note else ""
+    if refreshed:
+        return (f"Authorization Failed: token invalid for {identifier} "
+                f"even after browser refresh ({error[:200]}).{note} "
+                f"Re-login the account. If the web UI shows "
+                f"suspension/violation, treat it as BANNED.")
+    return (f"Authorization Failed: token invalid for {identifier} "
+            f"and could not be refreshed ({error[:200]}).{note} "
+            f"Re-login the account. If the web UI shows "
+            f"suspension/violation, treat it as BANNED.")
+
+
 def _terminal_invalid_token(app: FastAPI, item: PooledAccount, prep: dict,
                             token: str | None, error: str, login_note: str,
                             stream_ban_until: float | None) -> None:
@@ -653,13 +743,10 @@ def _terminal_invalid_token(app: FastAPI, item: PooledAccount, prep: dict,
     _banned, _ban_until = _probe_ban(app, token)
     if _banned:
         raise _ban_403_for_item(app, item, _ban_until, error)
-    _note = f" Browser login note: {login_note[:300]}." if login_note else ""
     raise HTTPException(
         status_code=401,
-        detail=f"Authorization Failed: token invalid for "
-               f"{item.cfg.identifier} even after browser refresh "
-               f"({error[:200]}).{_note} Re-login the account. If the web "
-               f"UI shows suspension/violation, treat it as BANNED.")
+        detail=_invalid_token_401_detail(
+            item.cfg.identifier, error, login_note, refreshed=True))
 
 
 def _terminal_ban(app: FastAPI, item: PooledAccount, prep: dict,
@@ -752,6 +839,19 @@ def _raise_for_terminal_error(app: FastAPI, item: PooledAccount, prep: dict,
     kind = classify_error(error)
     _TERMINAL_HANDLERS.get(kind, _terminal_upstream)(
         app, item, prep, token, error, login_note, stream_ban_until)
+
+
+def _ensure_wasm_cached(app: FastAPI) -> None:
+    """Best-effort PoW wasm prefetch; skips when already cached. Never raises."""
+    # Fast path: skip cookie-header builds when wasm already cached.
+    try:
+        wp = PoW.wasm_path()
+        if not (wp.exists() and wp.stat().st_size > 1000):
+            _bridge = getattr(app.state, "bridge", None)
+            PoW.ensure_wasm(cookies=_bridge.cookie_header() if _bridge else "",
+                            user_agent=_bridge.state.user_agent if _bridge else "")
+    except Exception as exc:
+        logger.warning("wasm ensure failed: %s", exc)
 
 
 def _run_completion_core(
@@ -912,26 +1012,15 @@ def _run_completion_core(
                         provider=(getattr(item.cfg, "provider", "deepseek") or "deepseek"))
                     if banned:
                         raise _ban_403_for_item(app, item, ban_until, exc_s)
-                    note = f" Browser login note: {login_note[:300]}." if login_note else ""
                     raise HTTPException(
                         status_code=401,
-                        detail=f"Authorization Failed: token invalid for "
-                               f"{item.cfg.identifier} and could not be "
-                               f"refreshed ({exc_s[:200]}).{note} Re-login the account. "
-                               f"If the web UI shows suspension/violation, "
-                               f"treat it as BANNED.")
+                        detail=_invalid_token_401_detail(
+                            item.cfg.identifier, exc_s, login_note,
+                            refreshed=False))
                 raise
         raise last_exc if last_exc else RuntimeError("session setup failed")
 
-    # Fast path: skip cookie-header builds when wasm already cached.
-    try:
-        wp = PoW.wasm_path()
-        if not (wp.exists() and wp.stat().st_size > 1000):
-            _bridge = getattr(app.state, "bridge", None)
-            PoW.ensure_wasm(cookies=_bridge.cookie_header() if _bridge else "",
-                            user_agent=_bridge.state.user_agent if _bridge else "")
-    except Exception as exc:
-        logger.warning("wasm ensure failed: %s", exc)
+    _ensure_wasm_cached(app)
     # Session creation + PoW solve sit inside the try so a solver failure
     # (answer None -> RuntimeError) still runs the finally cleanup below.
     try:
@@ -955,25 +1044,23 @@ def _run_completion_core(
         # when output already left the server.
         emitted_live = False
 
-        def _wrapped_content(t: str) -> None:
-            nonlocal emitted_live
-            if t:
-                emitted_live = True
-            if on_content is not None:
-                try:
-                    on_content(t)
-                except Exception:
-                    pass
+        def _tracked(cb) -> Callable[[str], None]:
+            """Wrap a live callback to also flag partial emits (overload guard)."""
 
-        def _wrapped_thinking(t: str) -> None:
-            nonlocal emitted_live
-            if t:
-                emitted_live = True
-            if on_thinking is not None:
-                try:
-                    on_thinking(t)
-                except Exception:
-                    pass
+            def _emit_tracked(t: str) -> None:
+                nonlocal emitted_live
+                if t:
+                    emitted_live = True
+                if cb is not None:
+                    try:
+                        cb(t)
+                    except Exception:
+                        pass
+
+            return _emit_tracked
+
+        _wrapped_content = _tracked(on_content)
+        _wrapped_thinking = _tracked(on_thinking)
 
         def _do_attempt(h: dict, p: dict) -> None:
             nonlocal content, think, error, usage_total, stream_ban_until
@@ -1180,7 +1267,7 @@ def _attempt(headers: dict, payload: dict, on_content=None, on_thinking=None,
                 except ValueError:
                     pass
             elif event.kind == "error":
-                error = f"{event.code}: {event.message}"
+                error = _error_text(event.code, event.message)
                 try:
                     ban_until = getattr(event, "ban_until", None)
                 except Exception:
@@ -1218,11 +1305,12 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
     # async reader times out while the producer is still working on a valid long
     # reply. Derive it so the two can never drift apart.
     consumer_timeout = float(DS.DEFAULT_TIMEOUT) + _CONSUMER_GRACE_SECONDS
-    # The engine owns the producer bridge's cancel flag: the client-disconnect
-    # event is set on generator close, the producer checks it between SSE
-    # events, and the account lock is released promptly.
-    bridge = ProducerBridge(_STREAM_EXECUTOR)
-    cancel_event = bridge.cancel_event
+    # The producer bridge's cancel flag: the client-disconnect event is set
+    # on generator close, the producer checks it between SSE events, and
+    # the account lock is released promptly. (Plain Event: ProducerBridge
+    # adds an unused queue indirection here — one producer, one consumer,
+    # finite events — so direct call_soon_threadsafe emit is enough.)
+    cancel_event = threading.Event()
 
     def _emit(item: tuple) -> None:
         # call_soon_threadsafe raises RuntimeError once the loop is closed
@@ -1236,13 +1324,25 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
         if text:
             _emit((kind, text))
 
-    def produce_buffered():
-        # Ban failover lives in the helper (owns item's lock): a banned
-        # account retries on the next unbanned one inside the same request.
-        # Ban errors carry no content prefix, so nothing partial leaks.
+    def _produce(*, live: bool) -> None:
+        # Single publisher: buffered and live differ only in callbacks.
+        # Thinking always streams live (never tool JSON); content streams
+        # live only when no tools requested, else buffered so a tool_calls
+        # reply is not also emitted as user-visible text.
         try:
-            result = _complete_with_failover_sync(
-                app, pool, prep, item, cancel_event=cancel_event)
+            if live:
+                result = _complete_with_failover_sync(
+                    app, pool, prep, item,
+                    on_content=(None if prep.get("tools") else lambda t: _put("content", t)),
+                    on_thinking=lambda t: _put("thinking", t),
+                    cancel_event=cancel_event,
+                )
+            else:
+                # Ban failover lives in the helper (owns item's lock): a banned
+                # account retries on the next unbanned one inside the same request.
+                # Ban errors carry no content prefix, so nothing partial leaks.
+                result = _complete_with_failover_sync(
+                    app, pool, prep, item, cancel_event=cancel_event)
             _emit(("done", result))
         except _StreamCancelled:
             pass
@@ -1251,25 +1351,11 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
         except Exception as exc:  # noqa: BLE001
             _emit(("error", str(exc)))
 
+    def produce_buffered():
+        _produce(live=False)
+
     def produce_live():
-        # Thinking always streams live (never contains tool JSON).
-        # Content streams live only when no tools requested; with tools the
-        # content is buffered so a tool_calls reply is not also emitted as
-        # user-visible text.
-        try:
-            result = _complete_with_failover_sync(
-                app, pool, prep, item,
-                on_content=(None if prep.get("tools") else lambda t: _put("content", t)),
-                on_thinking=lambda t: _put("thinking", t),
-                cancel_event=cancel_event,
-            )
-            _emit(("done", result))
-        except _StreamCancelled:
-            pass
-        except HTTPException as exc:
-            _emit(("http_error", exc))
-        except Exception as exc:  # noqa: BLE001
-            _emit(("error", str(exc)))
+        _produce(live=True)
 
     def chunk(delta: dict, finish: str | None = None) -> bytes:
         return ("data: " + json.dumps(
@@ -1322,18 +1408,30 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
         threading.Thread(target=produce_live if live else produce_buffered, daemon=True).start()
     try:
         yield chunk({"role": "assistant"})
-        if not live:
-            # Buffered: producer sends one reply per request; emit thinking+content
-            # once the reply lands, then tool deltas. First-byte ~= model latency.
-            while True:
-                try:
-                    kind, payload = await asyncio.wait_for(out.get(), timeout=consumer_timeout)
-                except asyncio.TimeoutError:
-                    yield ("data: " + json.dumps({"error": {"message": "upstream timed out"}},
-                                                ensure_ascii=False) + "\n\n").encode()
-                    yield b"data: [DONE]\n\n"
-                    return
-                if kind == "done":
+        # One shared consumer: buffered and live differ only in how a
+        # (kind, payload) item becomes chunks. Buffered emits thinking +
+        # content once the whole reply lands; live already forwarded the
+        # deltas and only needs the close/tool tail. Error/timeout handling
+        # is identical, so it lives here once.
+        while True:
+            try:
+                kind, payload = await asyncio.wait_for(
+                    out.get(), timeout=consumer_timeout)
+            except asyncio.TimeoutError:
+                yield ("data: " + json.dumps({"error": {"message": "upstream timed out"}},
+                                            ensure_ascii=False) + "\n\n").encode()
+                yield b"data: [DONE]\n\n"
+                return
+            if kind == "thinking":
+                # Live-only: buffered never emits partial deltas.
+                yield chunk({"reasoning_content": payload})
+                continue
+            if kind == "content":
+                # Live-only: buffered content arrives via "done".
+                yield chunk({"content": payload})
+                continue
+            if kind == "done":
+                if not live:
                     thinking, content = payload["thinking"], payload["content"]
                     truncated = False
                     if prep["tools"]:
@@ -1346,37 +1444,9 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
                         yield chunk({"content": remaining})
                     for piece in _tool_finish_chunks(calls, truncated):
                         yield piece
-                    yield b"data: [DONE]\n\n"
-                    return
-                if kind == "http_error":
-                    err = payload
-                    yield ("data: " + json.dumps({"error": {"message": err.detail, "code": err.status_code}},
-                                                ensure_ascii=False) + "\n\n").encode()
-                    yield b"data: [DONE]\n\n"
-                    return
-                yield ("data: " + json.dumps({"error": {"message": str(payload)}},
-                                            ensure_ascii=False) + "\n\n").encode()
-                yield b"data: [DONE]\n\n"
-                return
-        # Live: forward thinking/content deltas as they arrive from DeepSeek.
-        while True:
-            try:
-                kind, payload = await asyncio.wait_for(out.get(), timeout=consumer_timeout)
-            except asyncio.TimeoutError:
-                yield ("data: " + json.dumps({"error": {"message": "upstream timed out"}},
-                                            ensure_ascii=False) + "\n\n").encode()
-                yield b"data: [DONE]\n\n"
-                return
-            if kind == "thinking":
-                yield chunk({"reasoning_content": payload})
-                continue
-            if kind == "content":
-                yield chunk({"content": payload})
-                continue
-            if kind == "done":
-                content = payload["content"]
-                if prep.get("tools"):
-                    calls, remaining, truncated = await _parse_stream_calls(content)
+                elif prep.get("tools"):
+                    calls, remaining, truncated = await _parse_stream_calls(
+                        payload["content"])
                     # Thinking already streamed live; emit only the remainder.
                     if remaining:
                         yield chunk({"content": remaining})

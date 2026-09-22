@@ -15,7 +15,8 @@ from ..common import (
 logger = logging.getLogger("deepseaport.tools")
 
 
-def try_parse_tags(text, valid_or_none, limit_args, forgiving_on):
+def try_parse_tags(text, valid_or_none, limit_args, forgiving_on,
+                   diagnostics=None):
     tag_pat = re.compile(
         r"<(?:tool_call|function_call|invoke)>(.*?)</(?:tool_call|function_call|invoke)>",
         re.DOTALL | re.IGNORECASE,
@@ -30,7 +31,11 @@ def try_parse_tags(text, valid_or_none, limit_args, forgiving_on):
         elif isinstance(obj, dict) and isinstance(obj.get("function"), dict):
             tagged.append(obj)
     if tagged:
-        calls, _ = _normalize_calls(tagged, valid_or_none, limit_args)
+        calls, dropped = _normalize_calls(tagged, valid_or_none, limit_args)
+        if diagnostics is not None:
+            diagnostics.append({"format": "tags", "matched": bool(calls),
+                                "kept": len(calls), "dropped": list(dropped),
+                                "raw": len(tagged)})
         if calls:
             rest = _clean_rest(tag_pat.sub("", text), forgiving_on)
             return calls, rest

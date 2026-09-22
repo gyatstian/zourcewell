@@ -30,6 +30,9 @@ __all__ = [
     "format_ban_datetime",
     "format_ban_label",
     "ban_message",
+    "with_ban_expiry",
+    "detect_ban",
+    "is_invalid_token_payload",
 ]
 
 # Browser fingerprint used for every curl_cffi request (shared session).
@@ -157,6 +160,45 @@ def is_ban_error_text(text: str) -> bool:
     return _has_ban_word(text or "")
 
 
+# Invalid/expired token signal (biz 40003 "Authorization Failed"): not a
+# ban, just unauthenticated. Banned accounts can still surface as 40003 on
+# session/create, which is why the engine probes users/current before
+# concluding "invalid" — but the probe itself treats 40003 as not-banned.
+INVALID_TOKEN_CODES = {"40003"}
+
+
+def is_invalid_token_payload(data: dict) -> bool:
+    """True when the envelope is an invalid/expired token (biz 40003)."""
+    try:
+        if not isinstance(data, dict):
+            return False
+        if str(data.get("code", "") or "") in INVALID_TOKEN_CODES:
+            return True
+        inner = data.get("data")
+        if isinstance(inner, dict) and str(inner.get("biz_code", "") or "") in INVALID_TOKEN_CODES:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def detect_ban(data: dict) -> tuple[bool, float | None]:
+    """Single ban-verdict authority: (banned, mute_until-or-None).
+
+    Thin over is_ban_payload + extract_ban_timestamp so every caller shares
+    one verdict instead of re-pairing the two helpers (check_ban,
+    _ban_stream_event, and the SSE feed each had their own variant).
+    40003 precedence stays with the caller (check_ban guards invalid-token
+    first); detect_ban itself is a pure payload verdict.
+    """
+    try:
+        if is_ban_payload(data):
+            return True, extract_ban_timestamp(data)
+        return False, None
+    except Exception:
+        return False, None
+
+
 def _ban_dt(mute_until: float):
     import datetime as _dt
 
@@ -189,6 +231,18 @@ def ban_message(mute_until: float | None, *, prefix: str = "") -> str:
         return f"{base} (expiry unknown). If you have any questions, please contact us."
     return (f"{base} until {format_ban_datetime(mute_until)}. "
             "If you have any questions, please contact us.")
+
+
+def with_ban_expiry(msg: str, data: dict) -> str:
+    """Append the ban expiry suffix when the envelope carries a ban."""
+    try:
+        if is_ban_payload(data):
+            ts = extract_ban_timestamp(data)
+            if ts is not None:
+                return f"{msg} (suspended until {format_ban_datetime(ts)})".strip()
+    except Exception:
+        pass
+    return msg
 
 
 def parse_json(resp) -> dict:

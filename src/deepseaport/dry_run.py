@@ -144,18 +144,44 @@ def create_dry_app(settings: Settings | None = None) -> FastAPI:
     async def list_models():
         import time
 
-        try:
-            from .server import MODELS as _MODELS
-        except Exception:
-            _MODELS = {"deepseek-flash": (False, False, "default")}
         now = int(time.time())
-        return {
-            "object": "list",
-            "data": [
-                {"id": m, "object": "model", "created": now, "owned_by": "deepseek"}
-                for m in _MODELS
-            ],
-        }
+        # Parity with live server_routes.list_models: union catalogue for
+        # the active provider(s) with per-model owned_by (was hardcoded
+        # "deepseek" over the single-provider MODELS dict).
+        try:
+            from .core import pools as _pools
+            from .core import registry as _reg
+            from .server import MODELS as _MODELS
+            from .server import active_models as _active
+
+            settings_ = app.state.settings
+            catalogue = _active(settings_) or dict(_MODELS)
+            resolved = _reg.resolved_ids(_pools.active_provider_ids(settings_))
+            data = []
+            for m in catalogue:
+                owner = None
+                try:
+                    found = _reg.resolve_model(m, provider_ids=resolved)
+                except Exception:
+                    found = None
+                if found is not None:
+                    _prov, _spec = found
+                    owner = getattr(_spec, "owned_by", "") or getattr(_prov, "id", "")
+                data.append({"id": m, "object": "model", "created": now,
+                             "owned_by": owner or "deepseek"})
+            return {"object": "list", "data": data}
+        except Exception:
+            try:
+                from .server import MODELS as _MODELS
+            except Exception:
+                _MODELS = {"deepseek-flash": (False, False, "default")}
+            return {
+                "object": "list",
+                "data": [
+                    {"id": m, "object": "model", "created": now, "owned_by": "deepseek"}
+                    for m in _MODELS
+                ],
+            }
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: dict, request: Request,

@@ -899,3 +899,56 @@ def test_token_refresh_normalizes_json_wrapper(monkeypatch):
     assert item.cfg.token == "x" * 64
     assert banned is False
     assert detail == ""
+
+
+def test_token_refresh_releases_slot_during_browser_run(monkeypatch):
+    """Finding 1: leader browser run must not pin the per-account slot.
+
+    The account lock is held by run_with_failover during the whole attempt;
+    the browser login (profile-lock + LOGIN_TIMEOUT) is global work, so the
+    leader releases the slot while it runs and reacquires before returning.
+    """
+    import threading as _threading
+
+    from deepseaport.server import _refresh_token_via_obscura
+
+    settings = _settings(accounts=[AccountConfig(email="a@x.com", password="pw",
+                                                 token="stale-token-1234567890")],
+                         config_path="")
+    app = _app_with_bridge(settings)
+    item = PooledAccount(cfg=settings.accounts[0])
+    item.lock.acquire()  # as run_with_failover holds it during the attempt
+    seen_free = []
+
+    def fake_login(email, password, settings_):
+        # Another request must be able to take the slot mid-browser-run.
+        seen_free.append(item.lock.acquire(blocking=False))
+        if seen_free[-1]:
+            item.lock.release()
+        return "fresh-token-1234567890"
+
+    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
+                        fake_login)
+
+    token, banned, detail = _refresh_token_via_obscura(app, item)
+
+    assert token == "fresh-token-1234567890"
+    assert seen_free == [True], "slot still held during browser run"
+    assert item.lock.locked(), "slot not reacquired after browser run"
+
+
+def test_invalid_token_401_detail_shared(monkeypatch):
+    """Finding 2 (partial): both invalid-token 401s share one message."""
+    from deepseaport.providers.deepseek.completion_service import (
+        _invalid_token_401_detail,
+    )
+
+    refreshed = _invalid_token_401_detail("a@x.com", "40003: stale", "", True)
+    unrefreshed = _invalid_token_401_detail("a@x.com", "40003: stale",
+                                             "captcha seen", False)
+    assert "even after browser refresh" in refreshed
+    assert "could not be" in unrefreshed
+    assert "captcha seen" in unrefreshed
+    for msg in (refreshed, unrefreshed):
+        assert "a@x.com" in msg
+        assert "BANNED" in msg

@@ -15,7 +15,8 @@ from ..common import (
 logger = logging.getLogger("deepseaport.tools")
 
 
-def try_parse_json_array(text, valid_or_none, limit_args, forgiving_on):
+def try_parse_json_array(text, valid_or_none, limit_args, forgiving_on,
+                         diagnostics=None):
     """First match wins: single left-to-right balanced scan (linear)."""
     pos = 0
     n = len(text)
@@ -36,7 +37,11 @@ def try_parse_json_array(text, valid_or_none, limit_args, forgiving_on):
             continue
         raw = obj.get("tool_calls") if isinstance(obj, dict) else None
         if isinstance(raw, list) and raw:
-            calls, _ = _normalize_calls(raw, valid_or_none, limit_args)
+            calls, dropped = _normalize_calls(raw, valid_or_none, limit_args)
+            if diagnostics is not None:
+                diagnostics.append({"format": "json_array", "matched": bool(calls),
+                                    "kept": len(calls), "dropped": list(dropped),
+                                    "raw": len(raw)})
             if calls:
                 rest = _clean_rest(text[:start] + text[start + len(obj_text):], forgiving_on)
                 return calls, rest

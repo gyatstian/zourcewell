@@ -15,10 +15,8 @@ semantics plus a temporary marker on the actual "Log in" button.
 
 from __future__ import annotations
 
-import datetime as _dt
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass
 
@@ -46,6 +44,7 @@ from .login_policy import (
     _POLL_START,
     classify_page_state,
     collapse_text as _collapse,
+    parse_ban_until,
 )
 from ...core.obscura_bridge import ObscuraBridge, profile_lock
 from ...core.tokens import extract_token
@@ -63,79 +62,9 @@ logger = logging.getLogger("deepseaport.auth")
 # phrases are matched only against a visible-text projection plus an explicit
 # visibility check for the challenge overlay (see ``login_policy``).
 
-_MONTH_NUMBERS = {
-    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
-    "june": 6, "july": 7, "august": 8, "september": 9, "october": 10,
-    "november": 11, "december": 12,
-    # Polish web UI often shows "wrzesień 16, 2026 21:18".
-    "styczen": 1, "stycznia": 1, "luty": 2, "lutego": 2,
-    "marzec": 3, "marca": 3, "kwiecien": 4, "kwietnia": 4,
-    "maj": 5, "maja": 5, "czerwiec": 6, "czerwca": 6,
-    "lipiec": 7, "lipca": 7, "sierpien": 8, "sierpnia": 8,
-    "wrzesien": 9, "wrzesnia": 9, "pazdziernik": 10,
-    "pazdziernika": 10, "listopad": 11, "listopada": 11,
-    "grudzien": 12, "grudnia": 12,
-    "styczeń": 1, "stycznia": 1, "luty": 2, "lutego": 2,
-    "marzec": 3, "marca": 3, "kwiecień": 4, "kwietnia": 4,
-    "maj": 5, "maja": 5, "czerwiec": 6, "czerwca": 6,
-    "lipiec": 7, "lipca": 7, "sierpień": 8, "sierpnia": 8,
-    "wrzesień": 9, "września": 9, "październik": 10,
-    "października": 10, "listopad": 11, "listopada": 11,
-    "grudzień": 12, "grudnia": 12,
-}
-_MONTH_RE = "|".join(sorted((re.escape(k) for k in _MONTH_NUMBERS), key=len, reverse=True))
-
-
-def parse_ban_until(text: str) -> float | None:
-    """Best-effort parse of a human ban expiry from a login/page message.
-
-    Supports English ``16 September 2026 12:49`` and Polish
-    ``wrzesień 16, 2026 21:18``.  The exact API ``mute_until`` is preferred,
-    but this keeps a human-readable date when the browser page is the only
-    source of truth (for example a suspended account that still logs in).
-    """
-    try:
-        low = (text or "").lower()
-        day = month = year = None
-        hour = minute = 0
-        # English / most locales: day month [year] [HH:MM]
-        m = re.search(
-            rf"(\d{{1,2}})\s+({_MONTH_RE})(?:\s+(\d{{4}}))?"
-            r"(?:\s+(\d{1,2}):(\d{2}))?",
-            low,
-        )
-        if m:
-            day = int(m.group(1))
-            month = _MONTH_NUMBERS.get(m.group(2))
-            year = int(m.group(3)) if m.group(3) else None
-            hour = int(m.group(4) or 0)
-            minute = int(m.group(5) or 0)
-        if month is None:
-            # Polish-ish: month day, year [HH:MM]
-            m = re.search(
-                rf"({_MONTH_RE})\s+(\d{{1,2}})(?:,)?(?:\s+(\d{{4}}))?"
-                r"(?:\s+(\d{1,2}):(\d{2}))?",
-                low,
-            )
-            if m:
-                month = _MONTH_NUMBERS.get(m.group(1))
-                day = int(m.group(2))
-                year = int(m.group(3)) if m.group(3) else None
-                hour = int(m.group(4) or 0)
-                minute = int(m.group(5) or 0)
-        if not day or not month:
-            return None
-        now = _dt.datetime.now()
-        year = year or now.year
-        dt = _dt.datetime(year, month, day, hour, minute)
-        # No explicit year and the date has already passed: assume next year.
-        if not m.group(3) and dt <= now:
-            dt = dt.replace(year=year + 1)
-        return dt.timestamp()
-    except Exception:
-        return None
-
-
+# ``parse_ban_until`` lives in ``login_policy`` (shared by both login
+# drivers); it is re-exported here so ``auth.parse_ban_until`` keeps working
+# for CLI/TUI/completion_service callers.
 
 
 @dataclass(frozen=True)
