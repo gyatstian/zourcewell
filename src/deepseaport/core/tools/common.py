@@ -360,9 +360,11 @@ def _normalize_calls(
             elif name.lower() in lower_map:
                 canonical = lower_map[name.lower()]
             else:
-                # Surfaced (was silent): unknown tool names are dropped so
-                # the harness never executes a call the model hallucinated.
-                logger.debug("dropping tool call %d: unknown tool %r", i, name)
+                # Unknown tool names are dropped so the harness never
+                # executes a hallucinated call — warning (not debug) so a
+                # miss surfaces as unknown-name vs oversize vs format drift.
+                logger.warning("dropping tool call %d: unknown tool %r "
+                               "(valid=%s)", i, name, sorted(valid_names))
                 dropped.append(i)
                 continue
         args = fn.get("arguments", "{}") if isinstance(fn, dict) else "{}"

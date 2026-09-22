@@ -457,6 +457,43 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
             status_code=400,
             detail="messages must produce a non-empty prompt "
                    "(upstream rejects empty prompts with 422)")
+    # OpenAI params the web upstreams cannot honor: preserve for
+    # observability but warn once per request instead of silently dropping.
+    # Upstream payloads (DeepSeek/Qwen completion_payload) carry only
+    # prompt + thinking/search/model — no temperature/top_p/stop/n/
+    # penalties/response_format. stream_options is honored locally: when
+    # include_usage is true the streamer emits a final usage chunk.
+    unsupported: dict = {}
+    if body.get("temperature") is not None:
+        unsupported["temperature"] = body.get("temperature")
+    if body.get("top_p") is not None:
+        unsupported["top_p"] = body.get("top_p")
+    _max_tok = body.get("max_tokens", body.get("max_completion_tokens", None))
+    if _max_tok is not None:
+        unsupported["max_tokens"] = _max_tok
+    if body.get("stop") not in (None, "", []):
+        unsupported["stop"] = body.get("stop")
+    try:
+        _n = int(body.get("n", 1) or 1)
+    except (TypeError, ValueError):
+        _n = 1
+    if _n != 1:
+        unsupported["n"] = body.get("n")
+    if body.get("presence_penalty") not in (None, 0, 0.0):
+        unsupported["presence_penalty"] = body.get("presence_penalty")
+    if body.get("frequency_penalty") not in (None, 0, 0.0):
+        unsupported["frequency_penalty"] = body.get("frequency_penalty")
+    _rf = body.get("response_format", None)
+    if _rf not in (None, {}, {"type": "text"}):
+        unsupported["response_format"] = _rf
+    stream_options = body.get("stream_options") or {}
+    if not isinstance(stream_options, dict):
+        stream_options = {}
+    if unsupported:
+        logger.warning(
+            "ignoring unsupported OpenAI params for web upstream "
+            "model=%s params=%s (upstream accepts prompt/thinking/search only)",
+            model, sorted(unsupported))
     return {
         "model": model, "stream": bool(body.get("stream", False)),
         "tools": tools if use_tools else [], "prompt": prompt,
@@ -464,4 +501,14 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
         "forgiving_toolcalls": forgiving_toolcalls,
         "thinking": thinking, "search": search, "model_type": model_type,
         "provider": provider.id,
+        "temperature": body.get("temperature"),
+        "top_p": body.get("top_p"),
+        "max_tokens": _max_tok,
+        "stop": body.get("stop"),
+        "n": _n,
+        "presence_penalty": body.get("presence_penalty"),
+        "frequency_penalty": body.get("frequency_penalty"),
+        "response_format": _rf,
+        "stream_options": stream_options,
+        "unsupported_params": unsupported,
     }

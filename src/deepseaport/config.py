@@ -47,6 +47,11 @@ class AccountConfig:
     mobile: str = ""
     password: str = ""
     token: str = ""
+    # Qwen signin returns ``expires_at`` (unix ts) alongside the JWT. Persist
+    # it so the engine can pre-check expiry and auto re-login via the cheap
+    # direct POST instead of surfacing 401s. 0.0 = unknown (e.g. pasted
+    # tokens, DeepSeek accounts); never blocks, only enables proactivity.
+    token_expires_at: float = 0.0
     # Persisted ban marker so CLI/TUI labels survive process restarts and
     # accounts whose token is missing. ``banned_until`` is 0 when unknown.
     banned: bool = False
@@ -71,6 +76,10 @@ class AccountConfig:
         # Normalize pasted JSON shapes (including {"value":null}) at the
         # boundary so the rest of the app only ever sees a raw token or "".
         self.token = extract_token(self.token)
+        try:
+            self.token_expires_at = max(0.0, float(self.token_expires_at or 0.0))
+        except (TypeError, ValueError):
+            self.token_expires_at = 0.0
         try:
             self.banned_until = max(0.0, float(self.banned_until or 0.0))
         except (TypeError, ValueError):
@@ -184,6 +193,7 @@ class Settings:
         payload["accounts"] = [
             {"email": a.email, "mobile": a.mobile, "password": a.password,
              "token": extract_token(a.token),
+             "token_expires_at": float(getattr(a, "token_expires_at", 0.0) or 0.0),
              "banned": bool(getattr(a, "banned", False)),
              "banned_until": float(getattr(a, "banned_until", 0.0) or 0.0),
              "provider": getattr(a, "provider", "deepseek") or "deepseek"}
@@ -300,6 +310,7 @@ def load_settings(path: str | None = None) -> Settings:
             accounts.append(AccountConfig(
                 email=a.get("email", ""), mobile=a.get("mobile", ""),
                 password=a.get("password", ""), token=a.get("token", ""),
+                token_expires_at=a.get("token_expires_at", 0.0),
                 banned=bool(a.get("banned", False)),
                 banned_until=a.get("banned_until", 0.0),
                 provider=a.get("provider", "deepseek") or "deepseek",

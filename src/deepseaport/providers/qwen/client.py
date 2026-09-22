@@ -569,11 +569,14 @@ def check_ban(headers: dict, timeout: int = 20) -> tuple[bool, float | None]:
     Uses GET /api/v2/auths/ (read endpoint, NOT challenge-gated): a valid
     session returns success:true. When the headers carry an Authorization
     bearer, merge it into the Cookie ``token`` as well so the probe works
-    with a real token (completions require the cookie). Invalid/unauth and
-    HTML challenge reads return (False, None) — an invalid token is not a
-    ban, and no verified Qwen ban envelope carries mute_until.
-    # TODO(unverified): no verified ban envelope shape — never claim banned
-    # until a real suspended-account payload is captured.
+    with a real token (completions require the cookie). ``success:false``
+    runs the shared ``detect_ban`` verdict: explicit mute/ban flags or ban
+    wording -> (True, mute_until-or-None) so banned accounts cool down and
+    fail over; plain ``Unauthorized``/``401`` (invalid token) and HTML
+    challenge reads stay (False, None) — an invalid token is not a ban.
+    # TODO(unverified): no verified Qwen ban envelope yet — the verdict is
+    # best-effort (flags + generic wording) until a real suspended-account
+    # payload is captured.
     """
     try:
         hdrs = dict(headers or {})
@@ -584,11 +587,23 @@ def check_ban(headers: dict, timeout: int = 20) -> tuple[bool, float | None]:
                 str(hdrs.get("Cookie") or ""), jwt)
         resp = _SESSION.get(P.AUTH_URL, headers=hdrs,
                             impersonate=IMPERSONATE, timeout=timeout)
-        if resp.status_code == 200 and not P.is_waf_challenge(resp):
-            data = _json(resp)
-            if isinstance(data, dict) and data.get("success") is True:
+        try:
+            if P.is_waf_challenge(resp):
                 return False, None
-        return False, None
+            data = _json(resp)
+            if isinstance(data, dict):
+                if data.get("success") is True:
+                    return False, None
+                try:
+                    return P.detect_ban(data)
+                except Exception:
+                    return False, None
+            return False, None
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
     except Exception as exc:
         logger.debug("check_ban ignored: %s", exc)
         return False, None
@@ -605,9 +620,9 @@ def stream_completion(headers: dict, payload: dict,
     """POST /api/v2/chat/completions?chat_id=<id> and yield parsed events.
 
     Caller must close on break. Maps: 200+HTML challenge -> WAF_CHALLENGE
-    error event; 200+JSON biz error -> envelope error; non-200 ->
-    build_http_error_event; else SSE parse via QwenStreamParser. No inline
-    raw-JSON ban handling (qwen has no verified inline ban envelope).
+    error event; 200+JSON biz error -> envelope error (with ban_until from
+    the shared detect_ban verdict when the envelope carries a ban signal);
+    non-200 -> build_http_error_event; else SSE parse via QwenStreamParser.
     """
     _ensure_token_cookie(headers)
     resp = _SESSION.post(_with_chat_id(P.CHAT_COMPLETIONS_URL, payload),
@@ -642,8 +657,16 @@ def stream_completion(headers: dict, payload: dict,
                 code = str(inner.get("code") or data.get("code") or "UPSTREAM_ERROR")
                 msg = str(inner.get("details") or inner.get("message")
                           or data.get("message") or body)
+                ban_until: float | None = None
+                try:
+                    banned, ban_until = P.detect_ban(data)
+                    if not banned:
+                        ban_until = None
+                except Exception:
+                    ban_until = None
                 yield StreamEvent(kind="error", code=code,
-                                  message=T.truncate_message(msg))
+                                  message=T.truncate_message(msg),
+                                  ban_until=ban_until)
                 return
             if body:
                 resp.close()

@@ -43,6 +43,8 @@ Direct-API login works — no browser, no captcha needed.
 - 200 + text/html = Aliyun WAF challenge page (see "WAF challenge detection").
 - `provider.login()` / `.auth.login()` delegates to this signin flow and
   returns a plain `(token, banned, detail)` tuple, never raising.
+  `.auth.login_with_expiry()` additionally returns `expires_at` (JWT `exp`
+  fallback) for `AccountConfig.token_expires_at` persistence.
 
 ## Auth token
 
@@ -186,18 +188,35 @@ qwen (never plants qwen cookies, WinError5 noise on Windows).
 | String family | Kind | Retry | Terminal HTTP |
 |---|---|---|---|
 | `WAF` / `403` / `challenge` | WAF | qwen-host solved fetch + fresh chat (DeepSeek `warmup` skipped) | 502 |
-| `401` / `unauthorized` / `invalid` / `authorization` | INVALID_TOKEN | recreate chat once (same token) | 401 |
+| `401` / `unauthorized` / `invalid` / `authorization` | INVALID_TOKEN | ban-probe, then one direct re-signin (stored password) + fresh chat | 401 |
 | `overload` / `server busy` / `try again` / `timeout` / `502` / `bad gateway` | OVERLOAD | retry (skipped after partial live emit) | 503 |
 | `rate_limit` / `quota` (`quota_limit`) / `429` / `too many` | RATE_LIMIT | no | 429 |
 | `http_422` / `http_400` / `unprocessable` | UPSTREAM_INVALID | no | 502 |
 | generic ban words (`P.is_ban_error_text`) / `restricted` | BAN | no (failover) | 403 + mark banned |
 | anything else | UPSTREAM | no | 502 |
 
-Ban envelope shape is **UNVERIFIED**: `extract_ban_timestamp` always returns
-`None`, `check_ban` never claims a ban (invalid token ≠ ban, and no verified
-payload carries `mute_until`). Bans surface only via generic wording.
+Ban envelope shape is **UNVERIFIED**: no suspended-account payload has been
+captured, so the verdict is best-effort — explicit mute/ban flags plus generic
+wording across message/details/code fields (`detect_ban`), with a timestamp
+only when a numeric `mute_until`-style key parses (`extract_ban_timestamp`).
+`check_ban` claims banned only on such a signal; plain `Unauthorized`/`401`
+(invalid token) stays not-banned. Ban timestamps ride `StreamEvent.ban_until`
+so 403s cool down precisely instead of the default 120s.
 Stream error envelope message key is `details`
 (`{"error":{"code":"quota_limit","details":"..."}}`).
+
+## Token lifecycle
+
+- Signin `expires_at` (unix ts, JWT `exp` fallback) persists per account as
+  `token_expires_at` in config.json (`0` = unknown: pasted tokens, old
+  configs, DeepSeek accounts — never blocks).
+- The engine pre-checks expiry before chat-create and re-signs in proactively
+  when a password is stored (one cheap direct POST, no browser/captcha,
+  max once per request).
+- On 401 it probes `GET /api/v2/auths/` first (a ban masquerading as 401
+  becomes 403 + cooldown for failover), then re-signs in once with the
+  stored password and retries with the fresh token. No password (or failed
+  re-signin) → terminal 401 + cross-account failover.
 
 ## Ops traps (live 2026-09-22)
 
@@ -211,11 +230,9 @@ Stream error envelope message key is `details`
 
 ## UNVERIFIED / TODO
 
-- Real Qwen ban envelope (wording + `mute_until`); `extract_ban_timestamp`
-  always returns `None`, `check_ban` never claims banned until a real
-  suspended-account payload is captured.
+- Real Qwen ban envelope (wording + `mute_until`); the current verdict is
+  best-effort (flags + generic wording) until a real suspended-account
+  payload is captured and the timestamp keys are confirmed.
 - Stream resume endpoint (`GET /api/v2/chat/completions?...`) — not implemented.
 - Guest/anonymous flow (`enable_anonymous:true`, `/c/guest`,
   `permissions.chat.temporary:true`) — minting a guest token UNVERIFIED.
-- Token `expires_at` / refresh policy (signin returns `expires_at` unix ts;
-  no verified refresh flow yet).

@@ -111,7 +111,7 @@ def run_multi_chat_servers(settings, args=None, count: int | None = None) -> int
     instances = [_build_instance_settings(settings, acc, spares, port)
                  for acc, port in zip(picked, ports)]
 
-    from .server import MODELS, create_app
+    from .server import MODELS, active_models, create_app
 
     saved_logs = _silence_chat_logs()
     servers: list = []
@@ -144,7 +144,18 @@ def run_multi_chat_servers(settings, args=None, count: int | None = None) -> int
         api_key = _first_api_key(settings)
     except Exception:
         api_key = ""
-    models = _model_list(MODELS)
+    try:
+        _catalogue: dict = {}
+        for _inst in instances:
+            try:
+                _catalogue.update(active_models(_inst) or {})
+            except Exception:
+                pass
+        if not _catalogue:
+            _catalogue = active_models(settings) or dict(MODELS)
+    except Exception:
+        _catalogue = dict(MODELS)
+    models = _model_list(_catalogue or MODELS)
     model = _initial_chat_model(settings, models)
     history: list[dict] = []
 
@@ -201,7 +212,7 @@ def run_chat_server(settings, args=None) -> int:
     became ready. Ctrl+C also stops and returns.
     """
     from .cli import _ensure_free_port
-    from .server import MODELS, create_app
+    from .server import MODELS, active_models, create_app
 
     if args is not None and int(getattr(args, "workers", 1) or 1) != 1:
         print("  note: chat mode uses 1 worker (ignoring --workers).")
@@ -243,7 +254,11 @@ def run_chat_server(settings, args=None) -> int:
         print(f"  ! server slow to respond, continuing anyway ({client_base}).")
 
     api_key = _first_api_key(settings)
-    models = _model_list(MODELS)
+    try:
+        _catalogue = active_models(settings) or dict(MODELS)
+    except Exception:
+        _catalogue = dict(MODELS)
+    models = _model_list(_catalogue or MODELS)
     model = _initial_chat_model(settings, models)
     history: list[dict] = []
 

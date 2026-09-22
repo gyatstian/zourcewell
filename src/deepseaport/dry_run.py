@@ -109,7 +109,8 @@ def _openai_dry_response(cid: str, created: int, prep: dict, content: str) -> di
     }
 
 
-def _openai_dry_sse(cid: str, created: int, model: str, content: str):
+def _openai_dry_sse(cid: str, created: int, model: str, content: str,
+                    prep: dict | None = None):
     """SSE chunk stream carrying the same content for stream:true clients."""
     def _chunk(delta: dict, finish: str | None = None) -> bytes:
         return ("data: " + json.dumps(
@@ -124,6 +125,18 @@ def _openai_dry_sse(cid: str, created: int, model: str, content: str):
         for i in range(0, len(content), 2000):
             yield _chunk({"content": content[i:i + 2000]})
         yield _chunk({}, "stop")
+        try:
+            opts = ((prep or {}).get("stream_options") or {})
+            if isinstance(opts, dict) and opts.get("include_usage"):
+                from .core.openai import build_usage as _build_usage
+                usage = _build_usage(prep or {}, content, "", None)
+                yield ("data: " + json.dumps(
+                    {"id": cid, "object": "chat.completion.chunk",
+                     "created": created, "model": model, "dry_run": True,
+                     "choices": [], "usage": usage},
+                    ensure_ascii=False) + "\n\n").encode("utf-8")
+        except Exception:
+            pass
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(_gen(), media_type="text/event-stream",
@@ -199,7 +212,7 @@ def create_dry_app(settings: Settings | None = None) -> FastAPI:
         cid = f"dryrun-{num:04d}"
         created = int(time.time())
         if prep.get("stream"):
-            return _openai_dry_sse(cid, created, str(prep.get("model")), content)
+            return _openai_dry_sse(cid, created, str(prep.get("model")), content, prep)
         return _openai_dry_response(cid, created, prep, content)
 
     return app

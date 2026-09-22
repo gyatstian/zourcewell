@@ -213,10 +213,16 @@ def test_is_waf_body():
     assert QP.is_waf_body("plain json") is False
 
 
-def test_extract_ban_timestamp_always_none():
+def test_extract_ban_timestamp_best_effort():
     assert QP.extract_ban_timestamp({}) is None
     assert QP.extract_ban_timestamp(None) is None
-    assert QP.extract_ban_timestamp({"mute_until": 123, "is_muted": 1}) is None
+    # Numeric mute_until-style keys parse (s or ms); unknown shapes stay None.
+    assert QP.extract_ban_timestamp({"mute_until": 123, "is_muted": 1}) == 123.0
+    assert QP.extract_ban_timestamp({"data": {"ban_until": 1789555791}}) == 1789555791.0
+    assert QP.extract_ban_timestamp({"data": {"mute_until": 1789555791000}}) == 1789555791.0
+    assert QP.extract_ban_timestamp({"expires_at": 123}) is None  # token expiry, not a ban
+    assert QP.extract_ban_timestamp({"mute_until": "soon"}) is None
+    assert QP.extract_ban_timestamp({"mute_until": 0}) is None
 
 
 def test_ban_error_text():
@@ -229,6 +235,13 @@ def test_detect_ban():
     assert QP.detect_ban({}) == (False, None)
     assert QP.detect_ban({"message": "ok"}) == (False, None)
     assert QP.detect_ban({"message": "user is muted"}) == (True, None)
+    # Explicit flags count even without wording; Unauthorized stays clean.
+    assert QP.detect_ban({"is_muted": 1}) == (True, None)
+    assert QP.detect_ban({"data": {"code": "Unauthorized",
+                                   "details": "401 Unauthorized"}}) == (False, None)
+    assert QP.detect_ban({"message": "suspended",
+                          "data": {"mute_until": 999}}) == (True, 999.0)
+    assert QP.detect_ban(None) == (False, None)
 
 
 def test_parse_json_ok():
@@ -1150,3 +1163,238 @@ def test_stream_headers_carry_x_accel(monkeypatch):
     headers = {"Authorization": "Bearer j", "Cookie": "token=j"}
     list(QC.stream_completion(headers, {"prompt": "hi"}))
     assert seen.get("X-Accel-Buffering") == "no"
+
+
+# auth lifecycle: expires_at capture + expiry pre-check -----------------------
+
+
+def _jwt(exp: int) -> str:
+    import base64
+    import json as _j
+
+    def _b64(obj: dict) -> str:
+        return base64.urlsafe_b64encode(
+            _j.dumps(obj).encode()).decode().rstrip("=")
+
+    return f"{_b64({'alg': 'none'})}.{_b64({'exp': exp})}.sig"
+
+
+def test_login_with_expiry_captures_expires_at(monkeypatch):
+    monkeypatch.setattr(QC, "signin",
+                        lambda *a, **k: {"id": "u", "token": "jwt",
+                                         "token_type": "Bearer",
+                                         "expires_at": 1789555791})
+    token, exp, banned, detail = QA.login_with_expiry("e@x.com", "pw")
+    assert (token, exp, banned, detail) == ("jwt", 1789555791.0, False, "")
+
+
+def test_login_with_expiry_jwt_fallback(monkeypatch):
+    tok = _jwt(1789555791)
+    monkeypatch.setattr(QC, "signin",
+                        lambda *a, **k: {"id": "u", "token": tok})
+    token, exp, banned, detail = QA.login_with_expiry("e@x.com", "pw")
+    assert token == tok
+    assert exp == 1789555791.0
+    assert (banned, detail) == (False, "")
+
+
+def test_login_stays_3_tuple(monkeypatch):
+    monkeypatch.setattr(QC, "signin",
+                        lambda *a, **k: {"id": "u", "token": "jwt",
+                                         "expires_at": 123})
+    assert QA.login("e@x.com", "pw") == ("jwt", False, "")
+
+
+def test_token_expired_persisted_and_jwt():
+    import time as _t
+    from deepseaport.config import AccountConfig
+
+    now = _t.time()
+    assert QA.token_expired(AccountConfig(token="x", token_expires_at=now - 10)) is True
+    assert QA.token_expired(AccountConfig(token="x",
+                                          token_expires_at=now + 3600)) is False
+    # Unknown persisted expiry falls back to the JWT exp claim.
+    assert QA.token_expired(AccountConfig(token=_jwt(int(now - 10)))) is True
+    assert QA.token_expired(AccountConfig(token=_jwt(int(now + 3600)))) is False
+    assert QA.token_expired(AccountConfig(token="short")) is False
+    # Leeway: an expiry inside the window already counts as expired.
+    assert QA.is_expired(now + 60, now=now) is True
+    assert QA.is_expired(now + 3600, now=now) is False
+
+
+def test_unpack_login_result_ex_roundtrip():
+    assert QA.unpack_login_result_ex(("tok", 999.0, False, "")) == ("tok", 999.0, False, "")
+    assert QA.unpack_login_result(("tok", 999.0, False, "")) == ("tok", False, "")
+    assert QA.unpack_login_result_ex(("tok", False, "")) == ("tok", None, False, "")
+
+
+# ban probe: check_ban verdict -------------------------------------------------
+
+
+def test_check_ban_claims_ban_with_timestamp(monkeypatch):
+    data = {"success": False, "data": {"is_muted": 1, "mute_until": 1789555791,
+                                       "details": "user is muted"}}
+    _sess(monkeypatch, get=_FakeResp(200, json_data=data))
+    assert QC.check_ban({"h": "1"}) == (True, 1789555791.0)
+
+
+def test_check_ban_unauthorized_not_banned(monkeypatch):
+    data = {"success": False, "data": {"code": "Unauthorized",
+                                       "details": "401 Unauthorized"}}
+    _sess(monkeypatch, get=_FakeResp(200, json_data=data))
+    assert QC.check_ban({"h": "1"}) == (False, None)
+
+
+def test_stream_error_event_carries_ban_until():
+    evs = list(QSP.parse_sse_line(
+        'data: {"error":{"code":"muted","details":"user is muted"}}'))
+    assert len(evs) == 1 and evs[0].kind == "error"
+    assert evs[0].ban_until is None  # no timestamp key in the envelope
+    evs = list(QSP.parse_sse_line(
+        'data: {"error":{"code":"quota_limit","details":"busy"}}'))
+    assert evs[0].ban_until is None
+
+
+# completion auto re-login -----------------------------------------------------
+
+
+def _qwen_app():
+    class _FakeApp:
+        class state:
+            bridge = None
+            settings = None
+
+    return _FakeApp()
+
+
+def _qwen_prep():
+    return {"model": "qwen3.7-plus", "prompt": "hi",
+            "thinking": False, "search": False}
+
+
+def test_expired_token_proactive_relogin(monkeypatch):
+    import time as _t
+    from deepseaport.config import AccountConfig
+    from deepseaport.accounts import PooledAccount
+    from deepseaport.providers.qwen.sse_parser import StreamEvent
+
+    monkeypatch.setattr(QCS, "_headers",
+                        lambda app, token: {"Authorization": f"Bearer {token}",
+                                            "Cookie": f"token={token}"})
+    monkeypatch.setattr(QC, "create_chat", lambda h, m, **k: "chat-1")
+
+    def _fake_stream(h, p, **k):
+        assert "NEWJWT" in h.get("Cookie", "")
+        yield StreamEvent(kind="content", text="ok")
+        yield StreamEvent(kind="finished", text="")
+
+    monkeypatch.setattr(QC, "stream_completion", _fake_stream)
+    monkeypatch.setattr(QCS, "_delete_chat_bg", lambda *a, **k: None)
+    monkeypatch.setattr(QA, "login_with_expiry",
+                        lambda e, p, s=None: ("NEWJWT", _t.time() + 3600,
+                                             False, ""))
+
+    cfg = AccountConfig(email="e@x.com", password="pw", token="OLDJWT",
+                        token_expires_at=_t.time() - 10)
+    item = PooledAccount(cfg=cfg)
+    out = QCS._run_completion_core(_qwen_app(), item, _qwen_prep())
+    assert out["content"] == "ok"
+    assert item.cfg.token == "NEWJWT"
+    assert item.cfg.token_expires_at > _t.time()
+
+
+def test_401_recovers_via_relogin_once(monkeypatch):
+    import time as _t
+    from deepseaport.config import AccountConfig
+    from deepseaport.accounts import PooledAccount
+    from deepseaport.providers.qwen.sse_parser import StreamEvent
+
+    monkeypatch.setattr(QCS, "_headers",
+                        lambda app, token: {"Authorization": f"Bearer {token}",
+                                            "Cookie": f"token={token}"})
+    monkeypatch.setattr(QC, "create_chat", lambda h, m, **k: "chat-1")
+
+    seen = []
+
+    def _fake_stream(h, p, **k):
+        seen.append(h.get("Cookie", ""))
+        if len(seen) == 1:
+            yield StreamEvent(kind="error", code="Unauthorized",
+                              message="401 Unauthorized")
+            return
+        yield StreamEvent(kind="content", text="recovered")
+        yield StreamEvent(kind="finished", text="")
+
+    monkeypatch.setattr(QC, "stream_completion", _fake_stream)
+    monkeypatch.setattr(QCS, "_delete_chat_bg", lambda *a, **k: None)
+    monkeypatch.setattr(QC, "check_ban", lambda h, timeout=20: (False, None))
+    logins = []
+    def _fake_login(e, p, s=None):
+        logins.append((e, p))
+        return "FRESH", None, False, ""
+    monkeypatch.setattr(QA, "login_with_expiry", _fake_login)
+
+    cfg = AccountConfig(email="e@x.com", password="pw", token="STALE")
+    item = PooledAccount(cfg=cfg)
+    out = QCS._run_completion_core(_qwen_app(), item, _qwen_prep())
+    assert out["content"] == "recovered"
+    assert item.cfg.token == "FRESH"
+    assert "FRESH" in seen[-1]
+    assert logins == [("e@x.com", "pw")]
+
+
+def test_401_without_password_stays_401(monkeypatch):
+    from fastapi import HTTPException
+
+    from deepseaport.config import AccountConfig
+    from deepseaport.accounts import PooledAccount
+    from deepseaport.providers.qwen.sse_parser import StreamEvent
+
+    monkeypatch.setattr(QCS, "_headers",
+                        lambda app, token: {"Authorization": f"Bearer {token}",
+                                            "Cookie": f"token={token}"})
+    monkeypatch.setattr(QC, "create_chat", lambda h, m, **k: "chat-1")
+
+    def _fake_stream(h, p, **k):
+        yield StreamEvent(kind="error", code="Unauthorized",
+                          message="401 Unauthorized")
+
+    monkeypatch.setattr(QC, "stream_completion", _fake_stream)
+    monkeypatch.setattr(QCS, "_delete_chat_bg", lambda *a, **k: None)
+    monkeypatch.setattr(QC, "check_ban", lambda h, timeout=20: (False, None))
+
+    cfg = AccountConfig(email="e@x.com", password="", token="STALE")
+    item = PooledAccount(cfg=cfg)
+    with pytest.raises(HTTPException) as exc:
+        QCS._run_completion_core(_qwen_app(), item, _qwen_prep())
+    assert exc.value.status_code == 401
+    assert "No password stored" in str(exc.value.detail)
+
+
+def test_401_ban_probe_fails_over_with_403(monkeypatch):
+    from fastapi import HTTPException
+
+    from deepseaport.config import AccountConfig
+    from deepseaport.accounts import PooledAccount
+    from deepseaport.providers.qwen.sse_parser import StreamEvent
+
+    monkeypatch.setattr(QCS, "_headers",
+                        lambda app, token: {"Authorization": f"Bearer {token}",
+                                            "Cookie": f"token={token}"})
+    monkeypatch.setattr(QC, "create_chat", lambda h, m, **k: "chat-1")
+
+    def _fake_stream(h, p, **k):
+        yield StreamEvent(kind="error", code="Unauthorized",
+                          message="401 Unauthorized")
+
+    monkeypatch.setattr(QC, "stream_completion", _fake_stream)
+    monkeypatch.setattr(QCS, "_delete_chat_bg", lambda *a, **k: None)
+    # Banned account masquerading as 401: probe says banned.
+    monkeypatch.setattr(QC, "check_ban", lambda h, timeout=20: (True, None))
+
+    cfg = AccountConfig(email="e@x.com", password="pw", token="STALETOKEN1234567890")
+    item = PooledAccount(cfg=cfg)
+    with pytest.raises(HTTPException) as exc:
+        QCS._run_completion_core(_qwen_app(), item, _qwen_prep())
+    assert exc.value.status_code == 403
+    assert item.cfg.banned is True

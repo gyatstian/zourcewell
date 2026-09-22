@@ -95,7 +95,9 @@ def test_message_text_list_skips_non_text():
         {"type": "text"},
         {"type": "text", "text": "b"},
     ]
-    assert T._message_text(content) == "a\n\nb"
+    # Images are no longer silently dropped: they become a visible
+    # placeholder (web upstream is text-only) and input_text counts as text.
+    assert T._message_text(content) == "a\n[image: http://x]\nskip\nb"
 
 
 def test_message_text_non_str_fallback():

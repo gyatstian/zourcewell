@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from .common import MAX_ARGS_CHARS, _valid_names
+
+logger = logging.getLogger("deepseaport.tools")
 
 
 def _example_param_value(pinfo) -> str:
@@ -112,7 +116,49 @@ def _message_text(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "\n".join(str(p.get("text", "")) for p in content if isinstance(p, dict) and p.get("type") == "text")
+        parts: list[str] = []
+        dropped_images = 0
+        for p in content:
+            if not isinstance(p, dict):
+                # Historical behaviour: bare strings/None in a content list
+                # are skipped (content lists hold typed dicts).
+                continue
+            ptype = str(p.get("type", "") or "")
+            if ptype in ("text", "input_text", "output_text"):
+                parts.append(str(p.get("text", "") or ""))
+            elif ptype in ("image_url", "image", "input_image"):
+                dropped_images += 1
+                url = ""
+                try:
+                    img = p.get("image_url", {})
+                    if isinstance(img, dict):
+                        url = str(img.get("url", "") or "")
+                    elif isinstance(img, str):
+                        url = img
+                    if not url:
+                        url = str(p.get("url", "") or "")
+                except Exception:
+                    url = ""
+                # Web upstreams accept text prompts only: keep a visible
+                # marker (with URL when short) instead of silently dropping
+                # the image so the model knows an image was intended.
+                if url and len(url) <= 300:
+                    parts.append(f"[image: {url}]")
+                elif url:
+                    parts.append(f"[image: {url[:300]}... ({len(url)} chars total, omitted)]")
+                else:
+                    parts.append("[image input omitted: upstream accepts text only]")
+            elif ptype:
+                # Unknown typed blocks stay skipped (historical); images
+                # above are the only lossy case that now warns + marks.
+                continue
+            elif p.get("text"):
+                parts.append(str(p.get("text") or ""))
+        if dropped_images:
+            logger.warning(
+                "image content blocks (%d) reduced to text placeholders "
+                "(web upstream accepts text prompts only)", dropped_images)
+        return "\n".join(s for s in parts if s)
     return str(content or "")
 
 

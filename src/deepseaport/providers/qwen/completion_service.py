@@ -23,6 +23,7 @@ from collections.abc import Callable
 
 from fastapi import FastAPI, HTTPException
 
+from . import auth as QA
 from . import client as QC
 from . import protocol as P
 from ...accounts import AccountPool, PooledAccount
@@ -201,6 +202,113 @@ def _app_settings(app: FastAPI) -> Settings:
     return _engine.app_settings(app)
 
 
+# Backoff after a failed direct re-signin so agentic 401 loops don't hammer
+# /api/v1/auths/signin: WAF/challenge 60s, wrong-password 300s.
+_RELOGIN_WAF_BACKOFF_SECONDS = 60.0
+_RELOGIN_CRED_BACKOFF_SECONDS = 300.0
+# Short tokens are unit-test fakes; probing them wastes a request (mirrors
+# accounts.MIN_TOKEN_LEN_FOR_BAN_CHECK).
+_MIN_TOKEN_LEN_FOR_BAN_PROBE = 20
+
+
+def _probe_ban(app: FastAPI, token: str | None,
+               timeout: int = 12) -> tuple[bool, float | None]:
+    """Best-effort ban probe for one Qwen token. Never raises."""
+    try:
+        tok = (token or "").strip()
+        if len(tok) < _MIN_TOKEN_LEN_FOR_BAN_PROBE:
+            return False, None
+        try:
+            headers = _headers(app, tok)
+        except Exception:
+            headers = P.base_headers(bearer=tok)
+        return QC.check_ban(headers, timeout=timeout)
+    except Exception:
+        return False, None
+
+
+def _try_relogin(app: FastAPI, item: PooledAccount) -> str | None:
+    """Direct-API re-signin with the stored email/password.
+
+    Cheap POST, no browser/captcha. On success persists the fresh JWT +
+    ``token_expires_at`` on the account (settings saved best-effort, only
+    when the app carries real settings) and returns the new token. Returns
+    None when there are no stored credentials, a login backoff is active,
+    or signin failed (backoff set for WAF/challenge + wrong-password).
+    Raises the ban 403 when signin proves the account suspended, so the
+    failover helper moves to the next account.
+    """
+    try:
+        reason = item.login_backoff_skip()
+    except Exception:
+        reason = None
+    if reason:
+        logger.debug("qwen relogin backed off for %s: %s",
+                     item.cfg.identifier, reason)
+        return None
+    email = (getattr(item.cfg, "email", "") or "").strip()
+    password = getattr(item.cfg, "password", "") or ""
+    if not email or not password:
+        return None
+    logger.info("qwen token expired/invalid for %s, re-signing in via direct API",
+                item.cfg.identifier)
+    try:
+        new_token, expires_at, login_banned, detail = QA.login_with_expiry(
+            email, password)
+    except HTTPException:
+        raise
+    except _StreamCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        try:
+            item.set_login_backoff("re-signin error", _RELOGIN_WAF_BACKOFF_SECONDS)
+        except Exception:
+            pass
+        logger.warning("qwen re-signin error for %s: %s", item.cfg.identifier, exc)
+        return None
+    if login_banned:
+        # Ground truth from signin: suspended/violation wording. Probe for a
+        # precise mute_until, then mark + 403 for failover.
+        try:
+            _, ban_until = _probe_ban(app, new_token or item.cfg.token)
+        except Exception:
+            ban_until = None
+        raise _ban_403_for_item(app, item, ban_until, detail or "")
+    if not new_token:
+        low = (detail or "").lower()
+        try:
+            if "waf" in low or "challenge" in low or "captcha" in low:
+                item.set_login_backoff("waf-challenge", _RELOGIN_WAF_BACKOFF_SECONDS)
+            elif "invalid_cred" in low or "incorrect" in low or "not found" in low:
+                item.set_login_backoff("bad-credentials", _RELOGIN_CRED_BACKOFF_SECONDS)
+        except Exception:
+            pass
+        logger.warning("qwen re-signin failed for %s: %s",
+                       item.cfg.identifier, (detail or "")[:200])
+        return None
+    try:
+        item.cfg.token = new_token
+        try:
+            item.cfg.token_expires_at = float(expires_at or 0.0)
+        except (TypeError, ValueError):
+            item.cfg.token_expires_at = 0.0
+        item.clear_login_backoff()
+    except Exception:
+        pass
+    # Persist best-effort, but only when the app carries real settings:
+    # _app_settings() falls back to load_settings() for embedded/test apps,
+    # and saving that would write an unrelated config file.
+    try:
+        settings = getattr(getattr(app, "state", None), "settings", None)
+        if settings is not None:
+            settings.save()
+    except Exception:
+        pass
+    logger.info("qwen token refreshed via direct re-signin for %s",
+                item.cfg.identifier)
+    return new_token
+
+
 def _ban_message(mute_until: float | None) -> str:
     """Human 403 text for a marked ban (Qwen envelope unverified).
 
@@ -358,10 +466,23 @@ def _delete_chat_bg(headers: dict, chat_id: str | None, enabled: bool = True) ->
 def _terminal_invalid_token(app: FastAPI, item: PooledAccount, prep: dict,
                             token: str | None, error: str,
                             stream_ban_until: float | None) -> None:
-    # No browser refresh for Qwen: a 401 means the pasted token is stale.
+    # By terminal time a stored password has had one direct re-signin attempt
+    # (pre-check + 401 recover); a ban masquerading as 401 is probed there too.
+    # What reaches here is: no stored password, or re-signin failed.
+    try:
+        has_password = bool((getattr(item.cfg, "password", "") or "").strip())
+    except Exception:
+        has_password = False
+    if has_password:
+        hint = ("Automatic re-signin with the stored password failed — verify "
+                "the password, or paste a fresh token. ")
+    else:
+        hint = ("No password stored — set one for automatic re-signin, or paste "
+                "a fresh token. ")
     raise HTTPException(
         status_code=401,
         detail=(f"token invalid for {item.cfg.identifier} ({error[:200]}). "
+                + hint +
                 "Paste a fresh localStorage.token from https://chat.qwen.ai "
                 "(or the qwen_token/token cookies) and set-token the account. "
                 "If the web UI shows suspension/violation, treat it as BANNED."))
@@ -435,16 +556,40 @@ def _run_completion_core(
     on_content/on_thinking are called incrementally (producer thread) for the
     live stream mode. Overload retries are skipped once partial deltas were
     already emitted (re-stream would duplicate text). WAF retries refresh the
-    bridge and recreate the chat; INVALID_TOKEN retries recreate the chat once
-    with the same token. Buffered callers pass no callbacks and get identical
-    behaviour. Retry dispatch is table-driven through
-    ``core.engine.drive_retries`` with ``classify_error`` as the single source
-    of truth. cancel_event, when set, aborts at the next SSE event.
+    bridge and recreate the chat; INVALID_TOKEN retries probe for a ban, then
+    re-sign in once via the cheap direct API when a password is stored, and
+    recreate the chat with the fresh token. Buffered callers pass no
+    callbacks and get identical behaviour. Retry dispatch is table-driven
+    through ``core.engine.drive_retries`` with ``classify_error`` as the
+    single source of truth. cancel_event, when set, aborts at the next SSE
+    event.
     """
     settings = _app_settings(app)
     max_retries = max(0, int(getattr(settings, "max_retries", 1)))
     auto_delete = bool(getattr(settings, "auto_delete_session", True))
     token = _ensure_token(app, item)
+    token_refreshed = False
+    try:
+        # Proactive: a known-expired token + stored password re-signs in
+        # before burning chat creates on a dead session (cheap direct POST,
+        # no browser/captcha). No password -> fall through; the 401 path +
+        # cross-account failover handles it.
+        if QA.token_expired(item.cfg):
+            if ((getattr(item.cfg, "email", "") or "").strip()
+                    and (getattr(item.cfg, "password", "") or "")):
+                new = _try_relogin(app, item)
+                if new:
+                    token = new
+                    token_refreshed = True
+            else:
+                logger.debug("qwen token expired for %s with no stored password; "
+                             "proceeding to 401 + failover", item.cfg.identifier)
+    except HTTPException:
+        raise
+    except _StreamCancelled:
+        raise
+    except Exception:
+        pass
     chat_id: str | None = None
     headers: dict = {}
     payload: dict = {}
@@ -526,8 +671,38 @@ def _run_completion_core(
                 _do_attempt(headers, payload)
 
         def _recover_invalid_token() -> None:
-            """Mid-stream 401: recreate the chat once with the same token."""
-            logger.info("token invalid, recreating chat (retries left %s)", max_retries)
+            """401: ban-probe, then one direct re-signin, then recreate chat.
+
+            A banned account can masquerade as 401, so probe before spending
+            the single re-signin: a ban becomes 403 + cooldown (failover)
+            instead of a misleading 401 loop. ``token_refreshed`` guards the
+            re-signin to once per request (pre-check counts).
+            """
+            nonlocal token, token_refreshed
+            try:
+                banned, ban_until = _probe_ban(app, token)
+            except Exception:
+                banned, ban_until = False, None
+            if banned:
+                raise _ban_403_for_item(app, item, ban_until, error or "")
+            if not token_refreshed:
+                try:
+                    new = _try_relogin(app, item)
+                except HTTPException:
+                    raise
+                except _StreamCancelled:
+                    raise
+                except Exception:
+                    new = None
+                if new:
+                    token = new
+                    token_refreshed = True
+                else:
+                    logger.info("token invalid, recreating chat (retries left %s)",
+                                max_retries)
+            else:
+                logger.info("token invalid, recreating chat (retries left %s)",
+                            max_retries)
             if _prepare_chat():
                 _do_attempt(headers, payload)
 

@@ -144,7 +144,7 @@ def cmd_waf(args) -> int:
 
 
 def cmd_models(args) -> int:
-    from .server import MODELS
+    from .server import MODELS, active_models
 
     flag = getattr(args, "provider", None)
     if flag:
@@ -161,7 +161,14 @@ def cmd_models(args) -> int:
             ids = []
         print(json.dumps(ids, indent=2, ensure_ascii=False))
         return 0
-    print(json.dumps(sorted(MODELS), indent=2, ensure_ascii=False))
+    try:
+        from .config import load_settings as _load_settings
+
+        _settings = _load_settings(getattr(args, "config", None))
+        catalogue = active_models(_settings) or dict(MODELS)
+    except Exception:
+        catalogue = dict(MODELS)
+    print(json.dumps(sorted(catalogue), indent=2, ensure_ascii=False))
     return 0
 
 
@@ -324,17 +331,24 @@ def _account_has_token(settings, identifier: str) -> bool:
 
 
 def _upsert_account(settings, email: str, password: str, token: str,
-                    provider: str | None = None):
+                    provider: str | None = None,
+                    token_expires_at: float = 0.0):
     """Append or update account by email. Preserves pool, fixes wipe bug."""
     from .accounts import _matches as _m, extract_token
     from .config import AccountConfig
 
     token = extract_token(token)
+    try:
+        token_expires_at = max(0.0, float(token_expires_at or 0.0))
+    except (TypeError, ValueError):
+        token_expires_at = 0.0
     for a in settings.accounts:
         if a.email and _m(a, email):
             a.token = token
             if password:
                 a.password = password
+            if token_expires_at:
+                a.token_expires_at = token_expires_at
             return a
     cfg = AccountConfig(email=email, password=password, token=token)
     try:
@@ -418,7 +432,18 @@ def cmd_login(args) -> int:
         return 3
 
     _prov = _valid_provider_id(getattr(args, "provider", None)) or None
-    acc = _upsert_account(settings, email, password, token, provider=_prov)
+    _login_expires_at = 0.0
+    if _prov and _prov != "deepseek" and token:
+        # Qwen signin expiry is captured by providers.qwen.auth.login_with_expiry,
+        # but the registry login seam returns the legacy 3-tuple. Recover the
+        # JWT exp claim best-effort so the engine can pre-check expiry.
+        try:
+            from .providers.qwen.auth import jwt_exp as _qwen_jwt_exp
+            _login_expires_at = float(_qwen_jwt_exp(token) or 0.0)
+        except Exception:
+            _login_expires_at = 0.0
+    acc = _upsert_account(settings, email, password, token, provider=_prov,
+                          token_expires_at=_login_expires_at)
     if login_banned:
         # A suspended account can still complete login and expose a token.
         # Keep that token (so the Accounts list can probe/display the ban) and

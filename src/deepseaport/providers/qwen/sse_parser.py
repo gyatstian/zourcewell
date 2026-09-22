@@ -62,15 +62,41 @@ class QwenStreamParser:
 
     @staticmethod
     def _error_event(data: dict) -> StreamEvent | None:
+        # Local import: protocol.py imports this module at top level, so a
+        # top-level import here would cycle.
+        try:
+            from .protocol import detect_ban as _detect_ban
+        except Exception:
+            _detect_ban = None  # type: ignore[assignment]
         err = data.get("error")
         if isinstance(err, dict):
             # Live envelope: {"error":{"code":"quota_limit","details":"..."}}.
             # details is the verified message key; message is the fallback.
             code = str(err.get("code") or err.get("type") or "UPSTREAM_ERROR")
             message = str(err.get("details") or err.get("message") or "")
-            return StreamEvent(kind="error", code=code, message=message)
+            ban_until: float | None = None
+            try:
+                if _detect_ban is not None:
+                    banned, ban_until = _detect_ban(
+                        {"message": message, "code": code,
+                         "data": err if isinstance(err, dict) else {}})
+                    if not banned:
+                        ban_until = None
+            except Exception:
+                ban_until = None
+            return StreamEvent(kind="error", code=code, message=message,
+                               ban_until=ban_until)
         if isinstance(err, str):
-            return StreamEvent(kind="error", code="UPSTREAM_ERROR", message=err)
+            ban_until = None
+            try:
+                if _detect_ban is not None:
+                    banned, ban_until = _detect_ban({"message": err})
+                    if not banned:
+                        ban_until = None
+            except Exception:
+                ban_until = None
+            return StreamEvent(kind="error", code="UPSTREAM_ERROR", message=err,
+                               ban_until=ban_until)
         return None
 
 

@@ -125,21 +125,112 @@ def is_ban_error_text(text: str) -> bool:
     return _has_ban_word(text or "")
 
 
+def _coerce_ban_ts(value) -> float | None:
+    """Best-effort ban-expiry coercion: numeric str ok; ms -> s; <=0 -> None."""
+    try:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return None
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0:
+        return None
+    if ts >= 1e12:
+        ts = ts / 1000.0
+    return ts if ts > 0 else None
+
+
+# Timestamp keys scanned for a ban expiry. ``expires_at`` is deliberately
+# absent: it is the signin token expiry, not a suspension deadline.
+_BAN_TS_KEYS = ("mute_until", "ban_until", "banned_until", "unmute_at",
+                "suspension_until", "suspended_until", "until")
+
+
+def _ban_scopes(data: dict) -> list[dict]:
+    """Top-level envelope plus one nested ``data``/``error`` level to scan."""
+    scopes: list[dict] = []
+    try:
+        if isinstance(data, dict):
+            scopes.append(data)
+            for key in ("data", "error", "detail"):
+                inner = data.get(key)
+                if isinstance(inner, dict):
+                    scopes.append(inner)
+    except Exception:
+        pass
+    return scopes
+
+
 def extract_ban_timestamp(data: dict) -> float | None:
-    """Always None: no verified Qwen ban payload carries mute_until.
-    # TODO(unverified): reverse the real ban payload before returning a ts.
+    """Best-effort ban-expiry scan; None when no timestamp key parses.
+
+    No verified Qwen ban payload exists yet, so this never invents a shape:
+    it only reads numeric timestamp keys (``mute_until`` et al, s or ms)
+    wherever they appear. Stays None for unknown envelopes.
+    # TODO(unverified): confirm against a real suspended-account payload.
     """
+    try:
+        if not isinstance(data, dict):
+            return None
+        for scope in _ban_scopes(data):
+            for key in _BAN_TS_KEYS:
+                if key in scope:
+                    ts = _coerce_ban_ts(scope.get(key))
+                    if ts is not None:
+                        return ts
+    except Exception:
+        pass
     return None
 
 
+_BAN_FLAG_KEYS = ("is_muted", "muted", "is_banned", "banned", "suspended")
+
+
+def _has_ban_flag(data: dict) -> bool:
+    """True when an explicit mute/ban flag is truthy in any scanned scope."""
+    try:
+        for scope in _ban_scopes(data):
+            for key in _BAN_FLAG_KEYS:
+                if scope.get(key) in (1, True, "1", "true"):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _ban_text_fields(data: dict) -> str:
+    """Join the text fields a ban wording could hide in (never values)."""
+    parts: list[str] = []
+    try:
+        for scope in _ban_scopes(data):
+            for key in ("message", "details", "detail", "code", "type"):
+                val = scope.get(key)
+                if isinstance(val, str) and val:
+                    parts.append(val)
+    except Exception:
+        pass
+    return " ".join(parts)
+
+
 def detect_ban(data: dict) -> tuple[bool, float | None]:
-    """Generic best-effort (banned, mute_until). Always (False, None) until a
-    real envelope is captured; kept so engine/account seams share a verdict.
-    # TODO(unverified): Qwen ban envelope shape unknown.
+    """Best-effort (banned, mute_until). Flag or ban-wording -> banned.
+
+    Explicit mute/ban flags win; otherwise ban wording is matched across the
+    message/details/code fields (top level + one nested level). The timestamp
+    rides along when a timestamp key parses, else None. Invalid-token shapes
+    (``Unauthorized``/``401`` with no ban signal) stay (False, None).
+    # TODO(unverified): Qwen ban envelope shape unknown — verdict is
+    # best-effort until a real suspended-account payload is captured.
     """
     try:
-        if is_ban_error_text(str(data.get("message", ""))):
-            return True, None
+        if not isinstance(data, dict):
+            return False, None
+        if _has_ban_flag(data):
+            return True, extract_ban_timestamp(data)
+        if is_ban_error_text(_ban_text_fields(data)):
+            return True, extract_ban_timestamp(data)
     except Exception:
         pass
     return False, None

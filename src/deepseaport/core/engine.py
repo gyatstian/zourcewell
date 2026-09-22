@@ -649,23 +649,98 @@ def tool_finish_chunks(chunk_fn: Callable[..., bytes], calls,
         yield chunk_fn({}, "length" if truncated else "stop")
 
 
+def usage_chunk(cid: str, created: int, model: str, prep: dict,
+                content: str, thinking: str,
+                usage_total: int | None = None) -> bytes:
+    """Final OpenAI-style usage chunk (stream_options.include_usage).
+
+    Emitted with empty choices before [DONE] so cost-tracking harnesses see
+    the same prompt/completion totals as the non-stream response. Uses the
+    shared ``core.openai.build_usage`` estimate (upstream never reports
+    prompt tokens); ``usage_total`` wins for completion tokens when seen.
+    """
+    try:
+        from .openai import build_usage as _build_usage
+        usage = _build_usage(prep, content or "", thinking or "", usage_total)
+    except Exception:
+        try:
+            pt = max(1, len(str((prep or {}).get("prompt", "") or "")) // 4)
+            ct = max(1, (len(content or "") + len(thinking or "")) // 4)
+        except Exception:
+            pt, ct = 1, 1
+        usage = {"prompt_tokens": pt, "completion_tokens": ct,
+                 "total_tokens": pt + ct}
+    return ("data: " + json.dumps(
+        {"id": cid, "object": "chat.completion.chunk", "created": created,
+         "model": model, "choices": [], "usage": usage},
+        ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+def wants_usage(prep: dict) -> bool:
+    """True when the client passed stream_options.include_usage=true."""
+    try:
+        opts = (prep or {}).get("stream_options") or {}
+        return bool(isinstance(opts, dict) and opts.get("include_usage"))
+    except Exception:
+        return False
+
+
 async def parse_stream_calls(prep: dict, content: str,
                              parse_fn: Callable | None = None,
                              truncated_fn: Callable | None = None):
-    """Tool-parse buffered content (tools requested); log when none found."""
+    """Tool-parse buffered content (tools requested); log when none found.
+
+    Misses log at warning with the parse_tool_calls_ex diagnostics trail
+    (which format almost matched, unknown names, oversize drops) instead of
+    a bare debug preview — a stop-with-raw-markup reply is otherwise
+    indistinguishable from a plain refusal. The ``parse_fn`` seam stays for
+    tests; diagnostics always come from the real parser for logging only.
+    """
+    _real_parse = None
+    _real_ex = None
+    try:
+        from .tools import parse_tool_calls as _rp
+        from .tools.parser import parse_tool_calls_ex as _re
+        _real_parse, _real_ex = _rp, _re
+    except Exception:
+        pass
     if parse_fn is None:
-        from .tools import parse_tool_calls as parse_fn  # type: ignore[no-redef]
+        parse_fn = _real_parse
+        if parse_fn is None:
+            from .tools import parse_tool_calls as parse_fn  # type: ignore[no-redef]
     if truncated_fn is None:
         from .tools import looks_truncated_tool_attempt as truncated_fn  # type: ignore[no-redef]
     limit = prep.get("tool_args_max_chars")
     forgiving = bool(prep.get("forgiving_toolcalls", False))
-    if limit:
-        calls, remaining = await asyncio.to_thread(
-            parse_fn, content, prep["tools"],
-            max_args_chars=limit, forgiving=forgiving)
+    calls: list[dict] | None = None
+    remaining: str = content
+    dropped: list[int] | None = None
+    diagnostics: list[dict] | None = None
+    if parse_fn is _real_parse and _real_ex is not None:
+        kwargs: dict = {"forgiving": forgiving}
+        if limit:
+            kwargs["max_args_chars"] = limit
+        try:
+            res = await asyncio.to_thread(
+                _real_ex, content, prep["tools"], **kwargs)
+            calls, remaining = res.calls, res.rest
+            dropped, diagnostics = res.dropped, res.diagnostics
+        except Exception:
+            if limit:
+                calls, remaining = await asyncio.to_thread(
+                    parse_fn, content, prep["tools"],
+                    max_args_chars=limit, forgiving=forgiving)
+            else:
+                calls, remaining = await asyncio.to_thread(
+                    parse_fn, content, prep["tools"], forgiving=forgiving)
     else:
-        calls, remaining = await asyncio.to_thread(
-            parse_fn, content, prep["tools"], forgiving=forgiving)
+        if limit:
+            calls, remaining = await asyncio.to_thread(
+                parse_fn, content, prep["tools"],
+                max_args_chars=limit, forgiving=forgiving)
+        else:
+            calls, remaining = await asyncio.to_thread(
+                parse_fn, content, prep["tools"], forgiving=forgiving)
     truncated = False
     if not calls:
         try:
@@ -676,8 +751,74 @@ async def parse_stream_calls(prep: dict, content: str,
             logger.warning("stream tool call looks truncated model=%s preview=%.200s",
                            prep.get("model"), (content or "")[:200])
         else:
-            logger.debug("stream no tool call parsed model=%s preview=%.200s",
-                         prep.get("model"), (content or "")[:200])
+            # Rich miss log (same helper shape as core.openai): diagnostics
+            # say unknown-name vs oversize vs format drift.
+            try:
+                if diagnostics is None and _real_ex is not None:
+                    from .tools import _valid_names as _vn
+                    kwargs2: dict = {"forgiving": forgiving}
+                    if limit:
+                        kwargs2["max_args_chars"] = limit
+                    res2 = await asyncio.to_thread(
+                        _real_ex, content or "", prep.get("tools") or [],
+                        **kwargs2)
+                    diagnostics = res2.diagnostics
+                    try:
+                        valid = _vn(prep.get("tools"))
+                    except Exception:
+                        valid = None
+                    parts = []
+                    for d in diagnostics or []:
+                        try:
+                            parts.append(
+                                f"{d.get('format')}:matched="
+                                f"{int(bool(d.get('matched')))} "
+                                f"kept={d.get('kept', 0)} "
+                                f"dropped={list(d.get('dropped') or [])} "
+                                f"raw={d.get('raw', 0)}")
+                        except Exception:
+                            continue
+                    trail = "; ".join(parts) if parts else "no formats matched"
+                    if valid:
+                        trail += f" valid={sorted(valid)}"
+                else:
+                    trail = None
+                    if diagnostics is not None:
+                        try:
+                            from .tools import _valid_names as _vn2
+                            valid2 = _vn2(prep.get("tools"))
+                        except Exception:
+                            valid2 = None
+                        parts2 = []
+                        for d in diagnostics or []:
+                            try:
+                                parts2.append(
+                                    f"{d.get('format')}:matched="
+                                    f"{int(bool(d.get('matched')))} "
+                                    f"kept={d.get('kept', 0)} "
+                                    f"dropped={list(d.get('dropped') or [])} "
+                                    f"raw={d.get('raw', 0)}")
+                            except Exception:
+                                continue
+                        trail = ("; ".join(parts2) if parts2
+                                 else "no formats matched")
+                        if valid2:
+                            trail += f" valid={sorted(valid2)}"
+                if trail:
+                    logger.warning(
+                        "stream tool-call miss model=%s forgiving=%s %s "
+                        "preview=%.300s",
+                        prep.get("model"), forgiving, trail,
+                        (content or "")[:300])
+                else:
+                    logger.debug("stream no tool call parsed model=%s preview=%.200s",
+                                 prep.get("model"), (content or "")[:200])
+            except Exception:
+                logger.debug("stream no tool call parsed model=%s preview=%.200s",
+                             prep.get("model"), (content or "")[:200])
+    elif dropped:
+        logger.warning("stream tool-call partial drop model=%s dropped=%s",
+                       prep.get("model"), list(dropped))
     return calls, remaining, truncated
 
 
@@ -723,6 +864,13 @@ async def drain_stream_queue(out: asyncio.Queue, prep: dict, live: bool,
                     yield chunk({"content": remaining})
                 for piece in tool_finish_chunks(chunk, calls, truncated):
                     yield piece
+                if wants_usage(prep):
+                    try:
+                        _ut = payload.get("usage_total")
+                    except Exception:
+                        _ut = None
+                    yield usage_chunk(cid, created, model, prep,
+                                      content, thinking, _ut)
             elif prep.get("tools"):
                 calls, remaining, truncated = await parse_stream_calls(
                     prep, payload["content"], parse_fn, truncated_fn)
@@ -730,8 +878,24 @@ async def drain_stream_queue(out: asyncio.Queue, prep: dict, live: bool,
                     yield chunk({"content": remaining})
                 for piece in tool_finish_chunks(chunk, calls, truncated):
                     yield piece
+                if wants_usage(prep):
+                    try:
+                        _ut = payload.get("usage_total")
+                        _th = payload.get("thinking", "")
+                        _co = payload.get("content", "")
+                    except Exception:
+                        _ut, _th, _co = None, "", ""
+                    yield usage_chunk(cid, created, model, prep, _co, _th, _ut)
             else:
                 yield chunk({}, "stop")
+                if wants_usage(prep):
+                    try:
+                        _ut = payload.get("usage_total")
+                        _th = payload.get("thinking", "")
+                        _co = payload.get("content", "")
+                    except Exception:
+                        _ut, _th, _co = None, "", ""
+                    yield usage_chunk(cid, created, model, prep, _co, _th, _ut)
             yield b"data: [DONE]\n\n"
             return
         if kind == "http_error":
