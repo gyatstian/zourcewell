@@ -32,8 +32,14 @@ def test_glm_template():
     _check_template("deepseaport.providers.glm", "GlmProvider", "glm")
 
 
-def test_qwen_template():
-    _check_template("deepseaport.providers.qwen", "QwenProvider", "qwen")
+def test_qwen_provider_registered():
+    from deepseaport.core import registry
+
+    prov = registry.get("qwen")
+    assert prov is not None
+    assert prov.id == "qwen"
+    assert set(prov.models()) == {"qwen3.7-plus", "qwen3.8-max", "qwen3.8-omni-flash"}
+    assert prov.default_model() == "qwen3.7-plus"
 
 
 def test_kimi_template():
@@ -45,7 +51,6 @@ def test_templates_not_auto_registered():
 
     reg = registry.registered()
     assert "glm" not in reg
-    assert "qwen" not in reg
     assert "kimi" not in reg
 
 

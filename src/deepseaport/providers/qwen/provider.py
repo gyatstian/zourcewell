@@ -1,31 +1,58 @@
-"""Qwen provider template (import-safe: no network, no side effects)."""
+"""Qwen provider implementation.
+
+Every method delegates to the local Qwen engine (``.completion_service``),
+which is the canonical monkeypatch surface for tests; the provider does not
+import ``deepseaport.server`` (no cycle).
+"""
 
 from __future__ import annotations
 
 import logging
 
-from ...core.provider import Provider
+from ...core.provider import ModelSpec, Provider
+from .models import DEFAULT_MODEL, MODELS_SPEC
 
 logger = logging.getLogger("deepseaport.providers")
 
 
 class QwenProvider(Provider):
-    """Qwen web2api provider (template: implement protocol/client first)."""
+    """Qwen web2api provider (models, ban probe, login, WAF warmup).
+
+    Execution uses the local Qwen engine (``.completion_service``), the
+    canonical monkeypatch surface; the server module is never imported.
+    Login is direct-API POST /api/v1/auths/signin (no browser, no captcha);
+    tokens are JWTs that ride the ``token`` cookie on every hot path.
+    """
 
     id = "qwen"
     display_name = "Qwen"
 
-    def models(self) -> dict:
-        """Return this provider's model catalogue (TODO: fill models.py)."""
-        return {}
+    def models(self) -> dict[str, ModelSpec]:
+        """Return a copy of the Qwen model catalogue."""
+        return dict(MODELS_SPEC)
+
+    def default_model(self) -> str:
+        """Return the canonical Qwen default model id."""
+        return DEFAULT_MODEL
 
     def probe_ban(self, headers: dict, timeout: int = 20) -> tuple[bool, float | None]:
-        """Return (is_banned, mute_until) (TODO: reverse users/current probe)."""
-        return False, None
+        """Delegate to the Qwen client's auths/ probe (best-effort, never raises)."""
+        try:
+            from ...providers.qwen import client as QC
+            return QC.check_ban(headers, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("qwen probe_ban failed: %s", exc)
+            return False, None
 
     def login(self, email: str, password: str, settings) -> object:
-        """Authenticate via the Qwen web login (not reversed yet)."""
-        raise NotImplementedError("Qwen web login not implemented: reverse the web login first, see README")
+        """Direct-API signin; returns (token, banned, detail) tuple, never raises.
+
+        Delegates to ``.auth.login`` (POST /api/v1/auths/signin with a
+        SHA-256-hex password). The token is a JWT for AccountConfig.token;
+        it authenticates as the ``token`` cookie (Bearer alone is WAF-gated).
+        """
+        from . import auth
+        return auth.login(email, password, settings)
 
     def normalize_token(self, raw) -> str:
         """Normalize a pasted token via the shared extractor."""
@@ -33,31 +60,73 @@ class QwenProvider(Provider):
         return extract_token(raw)
 
     def warmup(self, bridge) -> None:
-        """No-op (override only if the provider needs WAF/PoW warmup like DeepSeek)."""
+        """Best-effort qwen edge priming: solved-jar + open GET models/.
+
+        Solved-jar fetch to chat.qwen.ai (existing / only) via obscura —
+        never the DeepSeek host — plants full acw_tc 64-char + x-ap/sca/cna/
+        tfstk/isg, then GET models/ (verified open, NOT WAF-gated) harvests
+        bare fallback. WinError5 graceful, names-only, never raises.
+        """
+        if bridge is None:
+            return None
+        try:
+            from . import client as QC
+            from . import protocol as P
+            try:
+                QC.prime_qwen_bridge(bridge)
+            except Exception:
+                pass
+            try:
+                ua = bridge.state.user_agent
+                cookies = bridge.cookie_header()
+            except OSError as exc:
+                if QC._is_winerror5(exc):
+                    try:
+                        desc = P.describe_cookies({})
+                        logger.warning(
+                            "qwen warmup WinError5 cookie_names=%s "
+                            "has_token=%s has_acw_tc=%s",
+                            desc["names"], desc["has_token"],
+                            desc["has_acw_tc"])
+                    except Exception:
+                        pass
+                ua, cookies = "", ""
+            except Exception:
+                ua, cookies = "", ""
+            try:
+                try:
+                    cookies = QC._merged_waf_cookies(cookies or "")
+                except Exception:
+                    pass
+                QC.fetch_models(
+                    P.base_headers(user_agent=ua, waf_cookies=cookies,
+                                   bearer=""),
+                    timeout=20)
+            except OSError as exc:
+                if QC._is_winerror5(exc):
+                    logger.warning("qwen warmup WinError5, continuing")
+                pass
+        except Exception:
+            pass
         return None
 
     def complete(self, app, pool, prep, first_item, cancel_event=None,
                  on_content=None, on_thinking=None) -> dict:
-        """Run one blocking completion (not implemented yet)."""
-        raise NotImplementedError(
-            "Qwen completion not implemented: override complete_request / "
-            "stream_response reusing core.tools, core.transport, "
-            "core.openai._openai_response and core.pools.make_pool "
-            "(deepseaport.accounts pool)")
+        """Run one completion via the local Qwen failover engine."""
+        from .completion_service import _complete_with_failover_sync
+        return _complete_with_failover_sync(
+            app, pool, prep, first_item,
+            cancel_event=cancel_event, on_content=on_content, on_thinking=on_thinking)
 
     def complete_request(self, app, pool, prep, item, cancel_event):
-        """Blocking completion: override with the Qwen engine (see complete)."""
-        raise NotImplementedError(
-            "Qwen completion not implemented: override complete_request / "
-            "stream_response reusing core.tools, core.transport, "
-            "core.openai._openai_response and core.pools.make_pool "
-            "(deepseaport.accounts pool)")
+        """Blocking completion via the local Qwen failover engine."""
+        from .completion_service import _complete_with_failover_sync
+        return _complete_with_failover_sync(app, pool, prep, item, cancel_event)
 
     def stream_response(self, app, pool, item, prep):
-        """Async-gen streaming: override with the Qwen SSE mapping."""
-        raise NotImplementedError(
-            "Qwen streaming not implemented: override stream_response reusing "
-            "core.transport SSE helpers and core.openai._openai_response")
+        """Async-gen streaming via the local Qwen streaming engine."""
+        from .completion_service import _stream_completion
+        return _stream_completion(app, pool, item, prep)
 
 
 def create_provider() -> QwenProvider:

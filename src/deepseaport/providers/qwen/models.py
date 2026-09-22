@@ -1,16 +1,23 @@
-"""Qwen model catalogue (template: fill in once the web API is reversed)."""
+"""Qwen model catalogue as first-class ModelSpec entries.
+
+Capabilities come from the live verified catalogue (GET /api/v2/models/):
+thinking/search flags below mirror ``info.meta.capabilities``.
+"""
 
 from __future__ import annotations
 
-# PLACEHOLDERS to verify, not facts — confirm against the live web app before use:
-#   qwen3-max, qwen3-235b-a22b, qwen-plus
-# Fill MODELS_SPEC with core.provider.ModelSpec entries, e.g.:
-#   MODELS_SPEC = {
-#       "qwen3-max": ModelSpec(id="qwen3-max", thinking=False, search=False,
-#                              model_type="default", owned_by="qwen"),
-#   }
-# ModelSpec fields: id, thinking, search, model_type, owned_by, capabilities.
+from ...core.provider import ModelSpec
 
-MODELS_SPEC: dict = {}
+MODELS_SPEC: dict[str, ModelSpec] = {
+    "qwen3.7-plus": ModelSpec(
+        id="qwen3.7-plus", thinking=True, search=True,
+        model_type="default", owned_by="qwen"),
+    "qwen3.8-max": ModelSpec(
+        id="qwen3.8-max", thinking=True, search=True,
+        model_type="default", owned_by="qwen"),
+    "qwen3.8-omni-flash": ModelSpec(
+        id="qwen3.8-omni-flash", thinking=True, search=False,
+        model_type="default", owned_by="qwen"),
+}
 
-DEFAULT_MODEL = ""
+DEFAULT_MODEL = "qwen3.7-plus"
