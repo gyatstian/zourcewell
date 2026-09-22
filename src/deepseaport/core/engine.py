@@ -13,7 +13,6 @@ DeepSeek keeps session/PoW/SSE/ban + token-refresh in
 from __future__ import annotations
 
 import logging
-import threading
 from collections.abc import Callable, Sequence
 
 logger = logging.getLogger("deepseaport.core.engine")
@@ -155,53 +154,3 @@ def run_with_failover(
         except Exception:
             pass
         return result
-
-
-class ProducerBridge:
-    """Queue + cancel_event + executor submit for stream producers.
-
-    One account-holding thread per stream, bounded by the shared executor so
-    a burst queues instead of piling unbounded raw threads. Falls back to a
-    daemon thread when the executor is shut down (interpreter exit).
-    """
-
-    def __init__(self, executor=None) -> None:
-        import queue as _q
-
-        self.queue: _q.Queue = _q.Queue()
-        self.cancel_event = threading.Event()
-        self._executor = executor
-
-    def emit(self, item: tuple) -> None:
-        try:
-            self.queue.put_nowait(item)
-        except Exception:
-            pass
-
-    def submit(self, fn: Callable[[], None]) -> None:
-        ex = self._executor
-        if ex is None:
-            try:
-                from ..server_concurrency import _STREAM_EXECUTOR as _ex
-
-                ex = _ex
-            except Exception:
-                ex = None
-        try:
-            if ex is not None:
-                ex.submit(fn)
-                return
-            raise RuntimeError("no executor")
-        except RuntimeError:
-            threading.Thread(target=fn, daemon=True).start()
-        except Exception:
-            try:
-                threading.Thread(target=fn, daemon=True).start()
-            except Exception:
-                pass
-
-    def cancelled(self) -> bool:
-        try:
-            return bool(self.cancel_event.is_set())
-        except Exception:
-            return False

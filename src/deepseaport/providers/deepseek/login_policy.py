@@ -59,7 +59,6 @@ LOGIN_BUTTON_SELECTOR = (
 COOKIE_SELECTOR = (
     ".cookie_banner-accept-essential-button, .cookie_banner-accept-all-button"
 )
-COOKIE_SELECTOR_ESSENTIAL = ".cookie_banner-accept-essential-button"
 
 # --- timeouts / polling (values preserved per driver) --------------------
 LOGIN_TIMEOUT = 90.0  # Obscura/MCP driver (auth.BrowserLogin)
@@ -136,7 +135,6 @@ function dsVisibleText() {
   return out.join(' ');
 }
 """
-_JS_VISIBILITY = JS_VISIBILITY
 
 PAGE_PROBE = ("(function(){" + JS_VISIBILITY + r"""
   var overlay = document.getElementById('cf-overlay');
@@ -151,7 +149,6 @@ PAGE_PROBE = ("(function(){" + JS_VISIBILITY + r"""
     captcha_visible: captcha
   });
 })()""")
-_PAGE_PROBE = PAGE_PROBE
 
 MARK_LOGIN = ("(function(){" + JS_VISIBILITY + r"""
   var candidates = document.querySelectorAll('div[role="button"], button');
@@ -166,7 +163,6 @@ MARK_LOGIN = ("(function(){" + JS_VISIBILITY + r"""
   }
   return 'not-found';
 })()""")
-_MARK_LOGIN = MARK_LOGIN
 
 MARK_COOKIE = ("(function(){" + JS_VISIBILITY + r"""
   var el = document.querySelector('.cookie_banner-accept-essential-button, .cookie_banner-accept-all-button');
@@ -176,7 +172,6 @@ MARK_COOKIE = ("(function(){" + JS_VISIBILITY + r"""
   }
   return 'not-found';
 })()""")
-_MARK_COOKIE = MARK_COOKIE
 
 # CDP snapshot: same visibility projection as PAGE_PROBE, but keeps the
 # real_browser wire shape (``token`` key, 3000-char body slice).
@@ -336,42 +331,3 @@ def parse_ban_until(text: str) -> float | None:
         return dt.timestamp()
     except Exception:
         return None
-
-
-class LoginPagePolicy:
-    """Discoverability namespace for the shared page policy.
-
-    Module-level names are the single source of truth (so ``auth`` /
-    ``real_browser`` re-exports and test monkeypatching keep working);
-    these attributes alias them. RHS names resolve to module globals.
-    """
-
-    SIGN_IN_URL = SIGN_IN_URL  # noqa: F821
-    EMAIL_SELECTOR = EMAIL_SELECTOR  # noqa: F821
-    PASSWORD_SELECTOR = PASSWORD_SELECTOR  # noqa: F821
-    LOGIN_FALLBACK_SELECTOR = LOGIN_FALLBACK_SELECTOR  # noqa: F821
-    LOGIN_BUTTON_SELECTOR = LOGIN_BUTTON_SELECTOR  # noqa: F821
-    COOKIE_SELECTOR = COOKIE_SELECTOR  # noqa: F821
-    LOGIN_TIMEOUT = LOGIN_TIMEOUT  # noqa: F821
-    POLL_START = POLL_START  # noqa: F821
-    POLL_MAX = POLL_MAX  # noqa: F821
-    POLL_BACKOFF = POLL_BACKOFF  # noqa: F821
-    REAL_LOGIN_TIMEOUT = REAL_LOGIN_TIMEOUT  # noqa: F821
-    DEFAULT_LOGIN_TIMEOUT = DEFAULT_LOGIN_TIMEOUT  # noqa: F821
-    REAL_POLL_INTERVAL = REAL_POLL_INTERVAL  # noqa: F821
-    REACT_COMMIT_DELAY = REACT_COMMIT_DELAY  # noqa: F821
-    LOGIN_CAPTCHA_PHRASES = LOGIN_CAPTCHA_PHRASES  # noqa: F821
-    LOGIN_CREDENTIAL_PHRASES = LOGIN_CREDENTIAL_PHRASES  # noqa: F821
-    LOGIN_BAN_PHRASES = LOGIN_BAN_PHRASES  # noqa: F821
-    JS_VISIBILITY = JS_VISIBILITY  # noqa: F821
-    PAGE_PROBE = PAGE_PROBE  # noqa: F821
-    MARK_LOGIN = MARK_LOGIN  # noqa: F821
-    MARK_COOKIE = MARK_COOKIE  # noqa: F821
-    CDP_SNAPSHOT_JS = CDP_SNAPSHOT_JS  # noqa: F821
-    CDP_DISMISS_COOKIE_JS = CDP_DISMISS_COOKIE_JS  # noqa: F821
-    CDP_CLICK_LOGIN_JS = CDP_CLICK_LOGIN_JS  # noqa: F821
-
-    classify = staticmethod(classify_page_state)
-    verdict = staticmethod(snapshot_verdict)
-    collapse = staticmethod(collapse_text)
-    clean = staticmethod(clean_text)

@@ -120,10 +120,6 @@ def active_models(settings=None) -> dict[str, tuple[bool, bool, str]]:
     return out or dict(MODELS)
 
 
-def error_json(request, exc: HTTPException):  # helper for tests
-    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
-
-
 def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="deepseaport", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings or load_settings()

@@ -55,14 +55,10 @@ CHROME_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
-# Error families worth a single automatic retry.
-RETRYABLE_BIZ = {"POW_HEADER_ERROR", "INVALID_POW_RESPONSE", "INVALID_SESSION_ID"}
-
 # Ban family: completion returns biz_code 5 + "user is muted" with
 # biz_data {"is_muted": 1, "mute_until": <unix ts>}; users/current returns
 # the same shape under biz_data.chat when the token is still valid.
 BANNED_BIZ_CODES = {"5", "5.0"}
-BAN_KEYWORDS = ("muted", "mute", "suspend", "banned", "violation")
 
 # Word-ish ban match: plain substring "mute" false-positives on "commute" /
 # "transmute" and would 403 + cool down a healthy account, shrinking the

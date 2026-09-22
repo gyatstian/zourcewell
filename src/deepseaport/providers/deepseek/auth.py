@@ -39,7 +39,6 @@ from .login_policy import (
     COOKIE_DISMISS_DELAY_MCP,
     REACT_COMMIT_DELAY,
     SIGN_IN_URL,
-    JS_VISIBILITY as _JS_VISIBILITY,
     _POLL_MAX,
     _POLL_START,
     classify_page_state,

@@ -8,9 +8,6 @@ imports ``deepseaport.server``.
 
 from __future__ import annotations
 
-# Sentinel id used by menus to represent "all active providers" at once.
-MULTI_ID = "multi"
-
 
 def _provider_of(account) -> str:
     """Normalized provider id for an account (defaults to deepseek)."""
