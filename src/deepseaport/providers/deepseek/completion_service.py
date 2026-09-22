@@ -27,7 +27,12 @@ from . import pow as PoW
 from . import protocol as P
 from ...accounts import AccountPool, PooledAccount
 from ...config import Settings, load_settings
-from ...core.engine import drive_retries, run_with_failover
+from ...core import engine as _engine
+from ...core.engine import (
+    AttemptOutcome as _AttemptOutcome,
+    drive_retries,
+    slot_releaser as _slot_releaser,
+)
 from ...core.obscura_bridge import ObscuraBridge
 # Shared implementation: _openai_response lives in core.openai so every
 # web2api provider reuses one response shim (re-exported here for compat).
@@ -85,16 +90,10 @@ def _ensure_token(app: FastAPI, item: PooledAccount) -> str:
     to another account that already has a token.  Expired tokens still take
     the one-time Obscura refresh path in _run_completion_core.
     """
-    from ...accounts import TOKEN_HELP, extract_token
+    from ...accounts import TOKEN_HELP
 
-    if item.cfg.token:
-        token = extract_token(item.cfg.token)
-        if token != item.cfg.token:
-            item.cfg.token = token
-        return token
-    raise HTTPException(
-        status_code=401,
-        detail=f"account {item.cfg.identifier} has no token. " + TOKEN_HELP)
+    return _engine.ensure_token(
+        item, f"account {item.cfg.identifier} has no token. " + TOKEN_HELP)
 
 
 def _is_invalid_token_error(error: str | None) -> bool:
@@ -245,33 +244,10 @@ def _probe_ban(app: FastAPI, token: str, timeout: int = 5,
 
 def _ban_403_for_item(app: FastAPI, item: PooledAccount, ban_until: float | None,
                       error_text: str = "") -> HTTPException:
-    """Mark + persist an account ban and build the 403.
-
-    Persisting ``cfg.banned``/``cfg.banned_until`` is what makes the account
-    show up as ``(BANNED: 16 September)`` in the CLI/TUI even after the server
-    is restarted or the in-memory pool is rebuilt.  ``ban_until=None`` still
-    marks the account (unknown expiry -> ``(BANNED)``) instead of losing the
-    ban verdict.
-    """
-    try:
-        AccountPool.mark_banned(item, until=ban_until)
-        try:
-            _app_settings(app).save()
-        except Exception:
-            pass
-    except Exception:
-        pass
-    try:
-        base = P.ban_message(ban_until) if ban_until else ""
-        if not base:
-            detail = (error_text or "account banned")[:300]
-            if "banned" not in detail.lower() and "muted" not in detail.lower():
-                detail = f"Account {item.cfg.identifier} banned. {detail}"
-        else:
-            detail = f"Account {item.cfg.identifier} banned. {base}"
-    except Exception:
-        detail = (error_text or f"Account {item.cfg.identifier} banned")[:300]
-    return HTTPException(status_code=403, detail=detail)
+    """Mark + persist an account ban and build the 403 (delegates to engine)."""
+    return _engine.ban_403_for_item(
+        app, item, ban_until, error_text,
+        ban_message_fn=(lambda u: P.ban_message(u) if u else ""))
 
 
 def _refresh_token_via_obscura(app: FastAPI, item: PooledAccount,
@@ -506,48 +482,7 @@ def _delete_session_bg(headers: dict, session_id: str | None, enabled: bool = Tr
 
 
 def _app_settings(app: FastAPI) -> Settings:
-    settings = getattr(app.state, "settings", None)
-    if settings is None:
-        settings = load_settings()
-        app.state.settings = settings
-    return settings
-
-
-from contextlib import contextmanager
-
-
-@contextmanager
-def _slot_releaser(item: PooledAccount,
-                   cancel_event: threading.Event | None = None):
-    """Release the per-account slot during global (browser/WAF) waits.
-
-    Releases ``item.lock`` on entry (no-op when not held, e.g. unit tests
-    calling the engine with a fresh account), reacquires on exit. The
-    reacquire polls so a disconnect aborts promptly instead of blocking
-    indefinitely under contention (raises ``_StreamCancelled``). Leaving
-    the slot released on cancel is safe: the outer ``run_with_failover``
-    release is ``RuntimeError``-safe.
-    """
-    released = False
-    try:
-        item.lock.release()
-        released = True
-    except RuntimeError:
-        released = False
-    except Exception:
-        released = False
-    try:
-        yield released
-    finally:
-        if released:
-            while True:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise _StreamCancelled()
-                try:
-                    if item.lock.acquire(timeout=0.5):
-                        break
-                except Exception:
-                    break
+    return _engine.app_settings(app)
 
 
 def _leave_token_refresh(key: str, inflight: threading.Event,
@@ -608,37 +543,16 @@ def _refresh_waf_without_account_lock(app: FastAPI, item: PooledAccount,
 
 def _is_ban_http_exception(exc: BaseException) -> bool:
     """True when exc is the ban 403 raised by _run_completion_core."""
-    return (isinstance(exc, HTTPException) and exc.status_code == 403
-            and P.is_ban_error_text(str(getattr(exc, "detail", "") or "")))
+    return _engine.is_ban_http_exception(exc, P.is_ban_error_text)
 
 
 def _switch_current_after_ban_failover(pool: AccountPool, settings: Settings,
                                        used: PooledAccount,
                                        failed: PooledAccount,
                                        reason: str = "unusable") -> None:
-    """Move CURRENT to the working account after failover.
-
-    Only fires when CURRENT pointed at the failed account: the request
-    already proved it unusable (ban/auth cooldown), so future requests should
-    prefer the healthy one first. Best-effort, never raises.
-    """
-    try:
-        from ...accounts import _matches as _m
-        cur = pool.current
-        if not cur or not _m(failed.cfg, cur):
-            return  # auto-failover mode or CURRENT wasn't the failed one
-        if _m(used.cfg, cur):
-            return  # same account (shouldn't happen after mark_bad)
-        if pool.set_current(used.cfg.identifier):
-            try:
-                settings.active_account = pool.current
-                settings.save()
-            except Exception:
-                pass
-            logger.warning("account %s %s, CURRENT auto-switched -> %s",
-                           failed.cfg.identifier, reason, used.cfg.identifier)
-    except Exception:
-        pass
+    """Move CURRENT to the working account after failover (engine-owned)."""
+    _engine.switch_current_after_ban_failover(pool, settings, used, failed,
+                                              reason=reason)
 
 
 def _complete_with_failover_sync(app: FastAPI, pool: AccountPool, prep: dict,
@@ -648,68 +562,24 @@ def _complete_with_failover_sync(app: FastAPI, pool: AccountPool, prep: dict,
                                  allow_failover: bool | None = None) -> dict:
     """Run one completion, auto-failing over on ban or broken credentials.
 
-    DeepSeek supplies the retryability predicate (ban 403 / auth 401), the
-    cooling work, and the account after a success; ``core.engine`` owns the
-    generic slot lifecycle: release exactly once per attempt, acquire the next
-    account before retrying, re-raise when no healthy account remains.
-    allow_failover=False (settings.use_multiple_accounts=False) surfaces the
-    first error directly, never touching another account.
-    None (default) reads the flag from app settings.
+    DeepSeek supplies the retryability predicate (ban 403 / auth 401) via
+    module-global ``_is_ban_http_exception`` and its ``_run_completion_core``;
+    ``core.engine`` owns the generic slot lifecycle. Late-binds both globals
+    so monkeypatching this module keeps working.
     """
-    if allow_failover is None:
-        try:
-            allow_failover = bool(getattr(_app_settings(app), "use_multiple_accounts", True))
-        except Exception:
-            allow_failover = True
-
-    first_exc: HTTPException | None = None
-    failed_item: PooledAccount | None = None
-    used_item: PooledAccount | None = None
-
-    def _run_once(account: PooledAccount) -> dict:
-        nonlocal used_item
-        result = _run_completion_core(
+    def _run_core(account: PooledAccount) -> dict:
+        return _run_completion_core(
             app, account, prep, on_content=on_content, on_thinking=on_thinking,
             cancel_event=cancel_event)
-        used_item = account
-        return result
 
-    def _is_retryable(exc: BaseException) -> bool:
-        # Bans and 401 auth failures are account-specific; try a healthy
-        # account before surfacing the error. Other HTTP failures (400, 429,
-        # WAF, ...) and non-HTTP errors belong to the caller/current request.
-        return (isinstance(exc, HTTPException)
-                and (_is_ban_http_exception(exc) or exc.status_code == 401))
+    def _is_ban(exc: BaseException) -> bool:
+        return _is_ban_http_exception(exc)
 
-    def _on_before_retry(exc, account: PooledAccount, tries: int, max_tries: int) -> None:
-        nonlocal first_exc, failed_item
-        if first_exc is None:
-            first_exc, failed_item = exc, account
-        if isinstance(exc, HTTPException) and exc.status_code == 401:
-            AccountPool.mark_bad(account, seconds=INVALID_TOKEN_COOLDOWN_SECONDS)
-            logger.info("account %s has no usable token, failing over "
-                        "(%d/%d)", account.cfg.identifier, tries + 1, max_tries)
-        else:
-            logger.info("account %s banned, failing over to next account "
-                        "(%d/%d)", account.cfg.identifier, tries + 1, max_tries)
-
-    result = run_with_failover(
-        pool,
-        first_item,
-        _run_once,
-        _is_retryable,
-        on_before_retry=_on_before_retry,
-        acquire_timeout=FAILOVER_ACQUIRE_TIMEOUT,
-        is_cancelled=lambda: cancel_event is not None and cancel_event.is_set(),
-        allow_failover=allow_failover,
-        release=AccountPool.release,
-        acquire=lambda timeout: pool.acquire(timeout=timeout),
-    )
-    if failed_item is not None and used_item is not None:
-        reason = "banned" if _is_ban_http_exception(first_exc) else "has no usable token"
-        _switch_current_after_ban_failover(
-            pool, _app_settings(app), used_item, failed_item, reason=reason)
-    return result
+    return _engine.complete_with_failover_sync(
+        app, pool, prep, first_item, _run_core, _is_ban,
+        cancel_event=cancel_event, on_content=on_content,
+        on_thinking=on_thinking, allow_failover=allow_failover,
+        get_settings=_app_settings)
 
 
 def _invalid_token_401_detail(identifier: str, error: str,
@@ -771,41 +641,25 @@ def _terminal_rate_limit(app: FastAPI, item: PooledAccount, prep: dict,
                          token: str | None, error: str, login_note: str,
                          stream_ban_until: float | None) -> None:
     # Global throttle: do NOT poison a specific account with a cooldown.
-    raise HTTPException(status_code=429,
-                        detail=f"DeepSeek rate limited: {error[:200]}. "
-                               "Wait 2-20 min, space requests, avoid parallel loops.")
+    _engine.raise_rate_limit("DeepSeek", error)
 
 
 def _terminal_overload(app: FastAPI, item: PooledAccount, prep: dict,
                        token: str | None, error: str, login_note: str,
                        stream_ban_until: float | None) -> None:
-    raise HTTPException(status_code=503,
-                        detail=f"DeepSeek server busy: {error[:200]}. "
-                               "Retry shortly (transient overload).")
+    _engine.raise_overload("DeepSeek", error)
 
 
 def _terminal_upstream_invalid(app: FastAPI, item: PooledAccount, prep: dict,
                                token: str | None, error: str, login_note: str,
                                stream_ban_until: float | None) -> None:
-    logger.warning("upstream rejected completion payload (%s); "
-                   "prompt_len=%d model=%s",
-                   error[:500], len(prep.get("prompt", "")),
-                   prep.get("model"))
-    raise HTTPException(
-        status_code=502,
-        detail=f"DeepSeek rejected the request as invalid ({error[:800]}). "
-               "The prompt/payload failed upstream validation, not a ban or "
-               "rate limit. Retry with a non-empty prompt; if it persists, "
-               "the upstream API schema likely changed.")
+    _engine.raise_upstream_invalid("DeepSeek", prep, error)
 
 
 def _terminal_upstream(app: FastAPI, item: PooledAccount, prep: dict,
                        token: str | None, error: str, login_note: str,
                        stream_ban_until: float | None) -> None:
-    logger.warning("upstream completion error: %s", error[:500])
-    raise HTTPException(
-        status_code=502,
-        detail=f"DeepSeek upstream error: {error[:800]}")
+    _engine.raise_upstream("DeepSeek", error)
 
 
 #: Terminal dispatch table: one RetryKind (from the shared classifier) per
@@ -829,16 +683,10 @@ def _raise_for_terminal_error(app: FastAPI, item: PooledAccount, prep: dict,
                               token: str | None, error: str,
                               login_note: str,
                               stream_ban_until: float | None) -> None:
-    """Map a terminal completion error event to its HTTP status. Always raises.
-
-    Single dispatch: ``classify_error`` (the same classifier the retry table
-    uses) produces one RetryKind, then the terminal handler for that kind
-    raises. No string matching lives here; ban-vs-rate-limit and
-    invalid-token-before-ban ordering are encoded once, in ``classify_error``.
-    """
-    kind = classify_error(error)
-    _TERMINAL_HANDLERS.get(kind, _terminal_upstream)(
-        app, item, prep, token, error, login_note, stream_ban_until)
+    """Map a terminal completion error event to its HTTP status. Always raises."""
+    _engine.dispatch_terminal(classify_error, _TERMINAL_HANDLERS,
+                              _terminal_upstream, app, item, prep, token,
+                              error, login_note, stream_ban_until)
 
 
 def _ensure_wasm_cached(app: FastAPI) -> None:
@@ -1038,29 +886,12 @@ def _run_completion_core(
         # from the ban envelope) so the ban path below needs no extra HTTP.
         # check_ban stays only as fallback when the stream carried no ts.
         stream_ban_until: float | None = None
-        # Live mode already _put partial deltas to the client; a retry after
-        # partial emit would re-stream from 0 (duplicated/interleaved text
-        # and corrupt tool-call JSON). Track emits so overload retries skip
-        # when output already left the server.
-        emitted_live = False
-
-        def _tracked(cb) -> Callable[[str], None]:
-            """Wrap a live callback to also flag partial emits (overload guard)."""
-
-            def _emit_tracked(t: str) -> None:
-                nonlocal emitted_live
-                if t:
-                    emitted_live = True
-                if cb is not None:
-                    try:
-                        cb(t)
-                    except Exception:
-                        pass
-
-            return _emit_tracked
-
-        _wrapped_content = _tracked(on_content)
-        _wrapped_thinking = _tracked(on_thinking)
+        # Overload-after-partial-emit guard lives in core.engine
+        # (LiveEmitTracker): a re-stream after output left would duplicate
+        # text and corrupt tool-call JSON.
+        _emit_tracker = _engine.LiveEmitTracker()
+        _wrapped_content = _emit_tracker.wrap(on_content)
+        _wrapped_thinking = _emit_tracker.wrap(on_thinking)
 
         def _do_attempt(h: dict, p: dict) -> None:
             nonlocal content, think, error, usage_total, stream_ban_until
@@ -1186,7 +1017,8 @@ def _run_completion_core(
                 ("waf", lambda e: classify_error(e) == RetryKind.WAF,
                  _recover_waf),
                 ("overload",
-                 lambda e: classify_error(e) == RetryKind.OVERLOAD and not emitted_live,
+                 lambda e: classify_error(e) == RetryKind.OVERLOAD
+                 and not _emit_tracker.emitted,
                  _recover_overload),
             ),
         )
@@ -1198,9 +1030,7 @@ def _run_completion_core(
         if not content and not think:
             # Upstream closed without content/thinking/error (e.g. unparsed toast).
             # Never return silent empty 200: it surfaces as "tool stopped working".
-            raise HTTPException(status_code=502,
-                                detail="empty upstream response from DeepSeek "
-                                       "(likely throttling; wait then retry)")
+            raise _engine.empty_response_error("DeepSeek")
         return {"content": content, "thinking": think, "usage_total": usage_total}
     finally:
         try:
@@ -1212,78 +1042,13 @@ def _run_completion_core(
             pass
 
 
-class _AttemptOutcome(tuple):
-    """4-tuple (content, thinking, error, usage) + ban_until attr.
-
-    Subclass so existing unpacking `a, b, c, d = _attempt(...)` keeps
-    working (tests + callers), while _run_completion_core reads
-    `.ban_until` to skip the extra users/current HTTP on bans.
-    Plain-tuple mocks simply have no attr -> getattr(..., None) fallback.
-    """
-
-    def __new__(cls, content: str, think: str, error: str | None,
-                usage: int, ban_until: float | None = None):
-        obj = super().__new__(cls, (content, think, error, usage))
-        obj.ban_until = ban_until
-        return obj
-
-
 def _attempt(headers: dict, payload: dict, on_content=None, on_thinking=None,
              cancel_event: threading.Event | None = None,
              ) -> tuple[str, str, str | None, int]:
-    content: list[str] = []
-    think: list[str] = []
-    error: str | None = None
-    usage_total = 0
-    ban_until: float | None = None
-    # Explicit gen.close(): break out of a generator does NOT run its
-    # finally (resp.close() in client.stream_completion) until close()/GC.
-    # Close promptly so the curl connection returns to the pool instead of
-    # lingering through retries (burst contention) or GC timing.
-    gen = DS.stream_completion(headers, payload)
-    try:
-        for event in gen:
-            if cancel_event is not None and cancel_event.is_set():
-                # Client gone: stop reading and close below so the HTTP
-                # response closes and the account lock releases promptly.
-                break
-            if event.kind == "content":
-                content.append(event.text)
-                if on_content is not None:
-                    try:
-                        on_content(event.text)
-                    except Exception:
-                        pass
-            elif event.kind == "thinking":
-                think.append(event.text)
-                if on_thinking is not None:
-                    try:
-                        on_thinking(event.text)
-                    except Exception:
-                        pass
-            elif event.kind == "usage":
-                try:
-                    usage_total = max(usage_total, int(event.text))
-                except ValueError:
-                    pass
-            elif event.kind == "error":
-                error = _error_text(event.code, event.message)
-                try:
-                    ban_until = getattr(event, "ban_until", None)
-                except Exception:
-                    ban_until = None
-                break
-            elif event.kind == "finished":
-                break
-    finally:
-        try:
-            close = getattr(gen, "close", None)
-            if callable(close):
-                close()
-        except Exception:
-            pass
-    return _AttemptOutcome("".join(content), "".join(think), error,
-                           usage_total, ban_until)
+    """Drain one SSE stream (engine-owned); keeps this module's patch seam."""
+    return _engine.drain_attempt(DS.stream_completion, headers, payload,
+                                 on_content=on_content, on_thinking=on_thinking,
+                                 cancel_event=cancel_event)
 
 
 def _run_completion(app: FastAPI, item: PooledAccount, prep: dict,
@@ -1293,32 +1058,21 @@ def _run_completion(app: FastAPI, item: PooledAccount, prep: dict,
 
 
 async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccount, prep: dict):
-    """Async generator: buffered (default) or live deltas, tools parsed at end."""
-    cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-    created = int(time.time())
-    model = prep["model"]
-    out: asyncio.Queue = asyncio.Queue()
+    """Async generator: buffered (default) or live deltas, tools parsed at end.
+
+    Producer (account-holding thread) is DeepSeek-specific only in the
+    failover entrypoint; the SSE consumer (chunk framing, tool tail,
+    timeout/errors) is engine-owned via ``drain_stream_queue``.
+    """
     loop = asyncio.get_running_loop()
     settings = _app_settings(app)
     live = str(getattr(settings, "stream_mode", "live")).lower() == "live"
-    # Consumer wait must outlast the blocking curl stream timeout, otherwise the
-    # async reader times out while the producer is still working on a valid long
-    # reply. Derive it so the two can never drift apart.
-    consumer_timeout = float(DS.DEFAULT_TIMEOUT) + _CONSUMER_GRACE_SECONDS
-    # The producer bridge's cancel flag: the client-disconnect event is set
-    # on generator close, the producer checks it between SSE events, and
-    # the account lock is released promptly. (Plain Event: ProducerBridge
-    # adds an unused queue indirection here — one producer, one consumer,
-    # finite events — so direct call_soon_threadsafe emit is enough.)
-    cancel_event = threading.Event()
+    cid, created, out, cancel_event, consumer_timeout = _engine.new_stream_context(
+        prep, DS.DEFAULT_TIMEOUT, _CONSUMER_GRACE_SECONDS)
+    model = prep["model"]
 
     def _emit(item: tuple) -> None:
-        # call_soon_threadsafe raises RuntimeError once the loop is closed
-        # (shutdown). Swallow: producer work is best-effort at that point.
-        try:
-            loop.call_soon_threadsafe(out.put_nowait, item)
-        except RuntimeError:
-            pass
+        _engine.emit_to_loop(loop, out, item)
 
     def _put(kind: str, text: str) -> None:
         if text:
@@ -1357,47 +1111,6 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
     def produce_live():
         _produce(live=True)
 
-    def chunk(delta: dict, finish: str | None = None) -> bytes:
-        return ("data: " + json.dumps(
-            {"id": cid, "object": "chat.completion.chunk", "created": created,
-             "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]},
-            ensure_ascii=False) + "\n\n").encode("utf-8")
-
-    async def _parse_stream_calls(content: str):
-        """Tool-parse buffered content (tools requested); log when none found."""
-        limit = prep.get("tool_args_max_chars")
-        forgiving = bool(prep.get("forgiving_toolcalls", False))
-        if limit:
-            calls, remaining = await asyncio.to_thread(
-                _parse_tool_calls_local, content, prep["tools"],
-                max_args_chars=limit, forgiving=forgiving)
-        else:
-            calls, remaining = await asyncio.to_thread(
-                _parse_tool_calls_local, content, prep["tools"], forgiving=forgiving)
-        truncated = False
-        if not calls:
-            truncated = bool(looks_truncated_tool_attempt(
-                content, prep["tools"], forgiving=forgiving))
-            if truncated:
-                logger.warning("stream tool call looks truncated model=%s preview=%.200s",
-                               prep.get("model"), (content or "")[:200])
-            else:
-                logger.debug("stream no tool call parsed model=%s preview=%.200s",
-                             prep.get("model"), (content or "")[:200])
-        return calls, remaining, truncated
-
-    def _tool_finish_chunks(calls, truncated: bool = False):
-        """tool_call deltas + finish chunk; length when a call was cut off."""
-        if calls:
-            for call in calls:
-                yield chunk({"tool_calls": [{
-                    "id": call["id"], "type": "function",
-                    "function": {"name": call["function"]["name"],
-                                 "arguments": call["function"]["arguments"]}}]})
-            yield chunk({}, "tool_calls")
-        else:
-            yield chunk({}, "length" if truncated else "stop")
-
     # Bounded producer: one account-holding thread per stream, capped by the
     # shared executor so a parallel-subagent burst queues instead of piling
     # unbounded raw threads (each with account + PoW CPU).
@@ -1407,66 +1120,10 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
         # Executor shut down (interpreter exit): fall back to a raw thread.
         threading.Thread(target=produce_live if live else produce_buffered, daemon=True).start()
     try:
-        yield chunk({"role": "assistant"})
-        # One shared consumer: buffered and live differ only in how a
-        # (kind, payload) item becomes chunks. Buffered emits thinking +
-        # content once the whole reply lands; live already forwarded the
-        # deltas and only needs the close/tool tail. Error/timeout handling
-        # is identical, so it lives here once.
-        while True:
-            try:
-                kind, payload = await asyncio.wait_for(
-                    out.get(), timeout=consumer_timeout)
-            except asyncio.TimeoutError:
-                yield ("data: " + json.dumps({"error": {"message": "upstream timed out"}},
-                                            ensure_ascii=False) + "\n\n").encode()
-                yield b"data: [DONE]\n\n"
-                return
-            if kind == "thinking":
-                # Live-only: buffered never emits partial deltas.
-                yield chunk({"reasoning_content": payload})
-                continue
-            if kind == "content":
-                # Live-only: buffered content arrives via "done".
-                yield chunk({"content": payload})
-                continue
-            if kind == "done":
-                if not live:
-                    thinking, content = payload["thinking"], payload["content"]
-                    truncated = False
-                    if prep["tools"]:
-                        calls, remaining, truncated = await _parse_stream_calls(content)
-                    else:
-                        calls, remaining = None, content
-                    if thinking:
-                        yield chunk({"reasoning_content": thinking})
-                    if remaining:
-                        yield chunk({"content": remaining})
-                    for piece in _tool_finish_chunks(calls, truncated):
-                        yield piece
-                elif prep.get("tools"):
-                    calls, remaining, truncated = await _parse_stream_calls(
-                        payload["content"])
-                    # Thinking already streamed live; emit only the remainder.
-                    if remaining:
-                        yield chunk({"content": remaining})
-                    for piece in _tool_finish_chunks(calls, truncated):
-                        yield piece
-                else:
-                    # Content already streamed live; just close.
-                    yield chunk({}, "stop")
-                yield b"data: [DONE]\n\n"
-                return
-            if kind == "http_error":
-                err = payload
-                yield ("data: " + json.dumps({"error": {"message": err.detail, "code": err.status_code}},
-                                            ensure_ascii=False) + "\n\n").encode()
-                yield b"data: [DONE]\n\n"
-                return
-            yield ("data: " + json.dumps({"error": {"message": str(payload)}},
-                                        ensure_ascii=False) + "\n\n").encode()
-            yield b"data: [DONE]\n\n"
-            return
+        async for frame in _engine.drain_stream_queue(
+                out, prep, live, cid, created, model, consumer_timeout,
+                _parse_tool_calls_local, looks_truncated_tool_attempt):
+            yield frame
     finally:
         # Generator closed (client disconnect, cancellation, completion): tell
         # the producer to stop at the next event so the account lock frees.

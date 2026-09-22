@@ -51,11 +51,13 @@ Direct-API login works — no browser, no captcha needed.
   sources: `qwen_token` / `token`.
 - Shape: raw JWT string, NOT a `{"value":...}` JSON wrapper (the shared
   `core.tokens.extract_token` still normalizes both fine).
-- Completions REQUIRES the `token` cookie: `Cookie: token=<jwt>` alone →
-  200 text/event-stream (acw_tc NOT required); `Authorization: Bearer <jwt>`
-  (± acw_tc) → 200 text/html (WAF challenge).
-- Every hot-path request carries `Cookie: token=<jwt>` (plus any bridge
-  cookies); `Authorization: Bearer <jwt>` is kept too (helps non-WAF
+- Completions REQUIRE `Cookie: token=<jwt>` PLUS the solved WAF jar:
+  bare `acw_tc` from curl `GET models/` passes `chats/new` but NOT
+  `completions` (live 2026-09-22: `token+acw_tc` still `WAF_CHALLENGE`).
+  Solved jar = obscura `fetch https://chat.qwen.ai/ --dump cookies`
+  (`acw_tc` 64-char + `x-ap`/`sca`/`cna`/`tfstk`/`isg`).
+- Every hot-path request carries `Cookie: token=<jwt>` (account wins) +
+  cached jar; `Authorization: Bearer <jwt>` is kept too (helps non-WAF
   endpoints like chats/new).
 - **Design decision:** the web app deletes the `Authorization` header for
   `source:web`/`h5` (session rides cookies), but the backend is FastAPI
@@ -183,7 +185,7 @@ qwen (never plants qwen cookies, WinError5 noise on Windows).
 
 | String family | Kind | Retry | Terminal HTTP |
 |---|---|---|---|
-| `WAF` / `403` / `challenge` | WAF | bridge warmup + fresh chat | 502 |
+| `WAF` / `403` / `challenge` | WAF | qwen-host solved fetch + fresh chat (DeepSeek `warmup` skipped) | 502 |
 | `401` / `unauthorized` / `invalid` / `authorization` | INVALID_TOKEN | recreate chat once (same token) | 401 |
 | `overload` / `server busy` / `try again` / `timeout` / `502` / `bad gateway` | OVERLOAD | retry (skipped after partial live emit) | 503 |
 | `rate_limit` / `quota` (`quota_limit`) / `429` / `too many` | RATE_LIMIT | no | 429 |
@@ -196,6 +198,16 @@ Ban envelope shape is **UNVERIFIED**: `extract_ban_timestamp` always returns
 payload carries `mute_until`). Bans surface only via generic wording.
 Stream error envelope message key is `details`
 (`{"error":{"code":"quota_limit","details":"..."}}`).
+
+## Ops traps (live 2026-09-22)
+
+- `WinError 5` on `obscura-profile` = transient LevelDB lock from two
+  servers racing one `--storage-dir`, not ACL (ACL is FullControl; a manual
+  `fetch chat.qwen.ai` succeeds). Kill the stale server before retrying.
+- `prime_waf()` returning `False` with a fake `<JWT>` is envelope-miss
+  only — the `acw_tc` harvest still lands. Test with `prime_noauth`
+  (`base_headers()` empty) → `True`.
+- `prime_qwen_bridge()` is the real fix; `prime_waf()` is bare fallback.
 
 ## UNVERIFIED / TODO
 

@@ -411,12 +411,16 @@ def _edit_chat_model(settings: Settings) -> None:
 
 
 def _select_provider(settings: Settings) -> None:
-    """Shared provider-selection loop used by the serve gate and settings item 19.
+    """Shared provider-selection used by the serve gate and settings item 19.
 
-    Never raises on bad input; EOF/KeyboardInterrupt keeps the current
-    selection and returns.
+    A successful pick saves and returns immediately (caller shows main menu
+    or settings again). Only invalid input re-prompts. Never raises on bad
+    input; EOF/KeyboardInterrupt keeps the current selection and returns.
     """
     from .core import registry as _reg
+
+    # Short aliases accepted alongside provider ids / numbers.
+    _ALIASES = {"ds": "deepseek"}
 
     try:
         from .core import pools as _pools
@@ -491,15 +495,17 @@ def _select_provider(settings: Settings) -> None:
                 return
             _ok(f"Provider mode -> multi ({', '.join(ids)}) (saved)")
             _info("One server will expose all listed providers' models.")
-            continue
+            return
         picked = ""
         if choice.isdigit():
             idx = int(choice) - 1
             if 0 <= idx < len(ids):
                 picked = ids[idx]
         elif choice:
+            # Alias first (e.g. ds -> deepseek), then exact provider id.
+            aliased = _ALIASES.get(choice, choice)
             for pid in ids:
-                if pid.strip().lower() == choice:
+                if pid.strip().lower() == aliased:
                     picked = pid
                     break
         if not picked:
@@ -513,12 +519,74 @@ def _select_provider(settings: Settings) -> None:
             print()
             return
         _ok(f"Provider -> {picked} (saved)")
+        return
 
 
 def provider_menu(settings: Settings) -> None:
     """First-run provider gate for `serve`. Always returns (never exits)."""
     _clear_screen()
     _select_provider(settings)
+
+
+# Short aliases accepted wherever a provider id is typed (account creation,
+# provider gate). deepseek <-> ds.
+_PROVIDER_ALIASES = {"ds": "deepseek"}
+
+
+def _normalize_provider_choice(raw: str, valid_ids: list[str]) -> str:
+    """Normalize typed provider to a valid id, resolving aliases.
+
+    Returns "" when the choice does not match. Empty input returns "" here;
+    callers apply the deepseek default.
+    """
+    key = (raw or "").strip().lower()
+    if not key:
+        return ""
+    key = _PROVIDER_ALIASES.get(key, key)
+    for pid in valid_ids:
+        if str(pid or "").strip().lower() == key:
+            return str(pid or "").strip().lower()
+    return ""
+
+
+def _ask_account_provider(settings: Settings) -> str:
+    """Provider id for a new account. Single mode returns it directly.
+
+    Multi mode prompts with text choices (e.g. deepseek [ds] / qwen),
+    defaulting to deepseek on empty input. Never raises; EOF defaults.
+    """
+    try:
+        from .core import pools as _pools
+        active = list(_pools.active_provider_ids(settings))
+        multi = len(active) > 1
+        single = _pools.selected_provider(settings)
+    except Exception:
+        active = [(getattr(settings, "provider", "") or "deepseek").strip().lower()]
+        multi = False
+        single = active[0] if active else "deepseek"
+    if not multi:
+        return (single or "deepseek").strip().lower() or "deepseek"
+    # Multi: text choices only, deepseek shows its ds alias in brackets.
+    parts: list[str] = []
+    for pid in active:
+        low = str(pid or "").strip().lower()
+        if low == "deepseek":
+            parts.append("deepseek [ds]")
+        else:
+            parts.append(low)
+    prompt = f"Provider ({' / '.join(parts)})"
+    while True:
+        try:
+            ans = _ask(prompt, default="deepseek")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "deepseek"
+        if not ans.strip():
+            return "deepseek"
+        picked = _normalize_provider_choice(ans, active)
+        if picked:
+            return picked
+        _err(f"Unknown provider '{ans}'. Choose: {', '.join(active)} (ds = deepseek).")
 
 
 def _preview_append(value: str, width: int = 30) -> str:
@@ -712,14 +780,18 @@ def accounts_menu(settings: Settings) -> None:
             settings.save()
         return pool
 
-    def _offer_auto_login(email: str, password: str, confirmed: bool = False) -> str:
+    def _offer_auto_login(email: str, password: str, confirmed: bool = False,
+                          provider: str | None = None) -> str:
         """Run Obscura login inside TUI. confirmed=True skips the Y/n prompt."""
         from .accounts import token_help_for as _token_help_for
-        try:
-            from .core import pools as _pools
-            _pid = _pools.selected_provider(settings)
-        except Exception:
-            _pid = "deepseek"
+        if provider:
+            _pid = (str(provider or "deepseek").strip().lower()) or "deepseek"
+        else:
+            try:
+                from .core import pools as _pools
+                _pid = _pools.selected_provider(settings)
+            except Exception:
+                _pid = "deepseek"
         _pid = (str(_pid or "deepseek").strip().lower()) or "deepseek"
         _help = _token_help_for(_pid)
         if not email:
@@ -825,46 +897,77 @@ def accounts_menu(settings: Settings) -> None:
     _clear_screen()
     while True:
         pool = _pool()
-        rows = pool.status()
-        current = pool.current or ""
+        # Provider-scoped view: single-provider shows only its own accounts,
+        # multi shows everything. Numbers below always refer to this view.
+        try:
+            from .core import pools as _pools_v
+            _active_ids = list(_pools_v.active_provider_ids(settings))
+            _is_multi_v = len(_active_ids) > 1
+            _single_v = ("" if _is_multi_v else
+                         (_pools_v.selected_provider(settings) or "deepseek").strip().lower()
+                         or "deepseek")
+        except Exception:
+            _active_ids = [(getattr(settings, "provider", "") or "deepseek").strip().lower()
+                           or "deepseek"]
+            _is_multi_v = False
+            _single_v = _active_ids[0]
+        try:
+            from .core.pools import _provider_of as _prov_of_v
+            _all_provs = [_prov_of_v(a) for a in settings.accounts]
+        except Exception:
+            _all_provs = ["deepseek"] * len(getattr(settings, "accounts", []) or [])
+        full_rows = pool.status()
+        if _is_multi_v:
+            _vis_idx = list(range(len(full_rows)))
+            _visible_accounts = list(settings.accounts)
+            _scope_label = "multi (" + " + ".join(_active_ids) + ")"
+        else:
+            _vis_idx = [i for i, _p in enumerate(_all_provs) if _p == _single_v]
+            _visible_accounts = [settings.accounts[i] for i in _vis_idx
+                                 if 0 <= i < len(settings.accounts)]
+            _scope_label = _single_v
+        rows = [full_rows[i] for i in _vis_idx if 0 <= i < len(full_rows)]
+        _row_provs = [_all_provs[i] if 0 <= i < len(_all_provs) else "deepseek"
+                      for i in _vis_idx]
+        # Hide a CURRENT that belongs to another provider (stale after switch).
+        try:
+            from .accounts import _matches as _m_cur
+            _cur_raw = pool.current or ""
+            if (not _is_multi_v and _cur_raw
+                    and not any(_m_cur(a, _cur_raw) for a in _visible_accounts)):
+                current = ""
+            else:
+                current = _cur_raw
+        except Exception:
+            current = pool.current or ""
         # Best-effort ban labels without blocking menu render: instant TTL
         # cache read + background refresh (network never on the draw path).
         # Skips missing/short (test) tokens without network; never raises.
+        # Scoped to the visible accounts so a qwen view never probes deepseek.
         try:
             from .accounts import (ban_label_for as _ban_lookup,
                                    get_cached_ban_labels as _ban_cached,
                                    refresh_ban_labels_background as _ban_refresh)
             from . import protocol as _P
-            ban_map = _ban_cached(settings.accounts) or {}
+            ban_map = _ban_cached(_visible_accounts) or {}
             try:
-                _ban_refresh(settings.accounts)
+                _ban_refresh(_visible_accounts)
             except Exception:
                 pass
         except Exception:
             ban_map = {}
             _ban_lookup = None  # type: ignore
             _P = None  # type: ignore
-        _header(f"Accounts ({len(settings.accounts)})")
+        _header(f"Accounts ({len(rows)})")
         _info(f"Current: [{current or 'ALL (auto-failover)'}]")
-        try:
-            from .core import pools as _pools
-
-            _scope = _pools.selected_provider(settings)
-        except Exception:
-            _scope = (getattr(settings, "provider", "") or "deepseek")
-        _info(f"Provider scope: {_scope}")
+        _info(f"Provider scope: {_scope_label}")
         print()
         if rows:
             id_width = max([len("Identifier")] + [len(r["identifier"]) for r in rows])
             id_width = min(id_width, 32)
             print(f"    {'#':<2} {'Identifier':<{id_width}}  {'Uses':<4} {'Token':<7} {'Busy':<4} {'Cool':<6} {'Cur'}")
             print(f"    {'--':<2} {'-' * id_width}  {'----':<4} {'-----':<7} {'----':<4} {'----':<6} {'---'}")
-            try:
-                from .core.pools import _provider_of as _prov_of
-
-                _row_provs = [_prov_of(a) for a in settings.accounts]
-            except Exception:
-                _row_provs = []
+            # _row_provs already scoped to the visible rows above.
             for i, row in enumerate(rows, 1):
                 mark = "*" if row.get("current") else ""
                 has = _has_token(settings, row["identifier"])
@@ -930,6 +1033,13 @@ def accounts_menu(settings: Settings) -> None:
         if choice == "a":
             _clear_screen()
             print()
+            # Multi mode: ask provider first (text only, ds = deepseek).
+            # Single mode: no prompt, binds to the selected provider.
+            try:
+                new_provider = _ask_account_provider(settings)
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
             try:
                 email = _ask("Email (Enter=skip)", default="")
                 password = _ask_password("Password (Enter=skip)")
@@ -938,16 +1048,12 @@ def accounts_menu(settings: Settings) -> None:
                 print()
                 return
             if raw_token.strip().lower() in ("y", "yes"):
-                token = _offer_auto_login(email, password, confirmed=True)
+                token = _offer_auto_login(email, password, confirmed=True,
+                                          provider=new_provider)
             else:
                 token = extract_token(raw_token)
-            cfg = AccountConfig(email=email, password=password, token=token)
-            try:
-                from .core import pools as _pools
-
-                cfg.provider = _pools.selected_provider(settings)
-            except Exception:
-                pass
+            cfg = AccountConfig(email=email, password=password, token=token,
+                                provider=new_provider)
             try:
                 from .accounts import add_account as _add
                 _add(settings, pool, cfg)
@@ -955,7 +1061,7 @@ def accounts_menu(settings: Settings) -> None:
                 _err(f"Add failed: {exc}")
                 continue
             settings.save()
-            _ok(f"Added {cfg.identifier} (saved)")
+            _ok(f"Added {cfg.identifier} [{cfg.provider}] (saved)")
             if not cfg.token:
                 _err("No token. Password-only fails.")
                 print()
@@ -980,7 +1086,13 @@ def accounts_menu(settings: Settings) -> None:
                 if existing is None:
                     _err(f"Not found: {ident}")
                     continue
-                token = _offer_auto_login(existing.email, existing.password)
+                try:
+                    _exist_prov = (getattr(existing, "provider", "deepseek")
+                                   or "deepseek")
+                except Exception:
+                    _exist_prov = "deepseek"
+                token = _offer_auto_login(existing.email, existing.password,
+                                          provider=_exist_prov)
                 if not token:
                     continue
             from .accounts import set_account_token as _set
@@ -1003,7 +1115,8 @@ def accounts_menu(settings: Settings) -> None:
                 _info("Cancelled (nothing deleted).")
                 continue
             # Allow number for delete, but ONLY inside explicit d flow.
-            rows_now = pool.status()
+            # Numbers refer to the provider-scoped view above.
+            rows_now = rows
             if ident.isdigit():
                 idx = int(ident) - 1
                 if 0 <= idx < len(rows_now):
@@ -1034,7 +1147,7 @@ def accounts_menu(settings: Settings) -> None:
             _err("Unknown option. Number selects, d deletes.")
             continue
         _clear_screen()
-        rows_now = pool.status()
+        rows_now = rows
         if 0 <= idx < len(rows_now):
             ident = rows_now[idx]["identifier"]
             if pool.set_current(ident):
@@ -1096,20 +1209,37 @@ def main_menu(settings: Settings, serve_fn: Callable[[Settings], int],
         _info(f"Port     : {settings.port}")
         _info(f"Reply    : {settings.stream_mode}  |  Tools: {_on_off(settings.enable_tools)}"
               f"  |  Failover: {_on_off(getattr(settings, 'use_multiple_accounts', True))}")
-        cur = (settings.active_account or "").strip() or "ALL"
-        _info(f"Accounts : {len(settings.accounts)}  |  Current: [{cur}]")
         try:
             from .core import pools as _pools
 
             _active = list(_pools.active_provider_ids(settings))
-            _display = (" + ".join(_active) + " (multi)") if len(_active) > 1 else (
+            _is_multi_mm = len(_active) > 1
+            if _is_multi_mm:
+                _scoped_accts = list(settings.accounts)
+                _cur_mm = (settings.active_account or "").strip() or "ALL"
+            else:
+                _single_mm = (_pools.selected_provider(settings) or "deepseek").strip().lower() or "deepseek"
+                _scoped_accts = _pools.accounts_for_provider(settings, _single_mm)
+                try:
+                    from .accounts import _matches as _m_mm
+                    _raw_mm = (settings.active_account or "").strip()
+                    if _raw_mm and any(_m_mm(a, _raw_mm) for a in _scoped_accts):
+                        _cur_mm = _raw_mm
+                    else:
+                        _cur_mm = "ALL"
+                except Exception:
+                    _cur_mm = (settings.active_account or "").strip() or "ALL"
+            _display = (" + ".join(_active) + " (multi)") if _is_multi_mm else (
                 _active[0] if _active else "deepseek")
         except Exception:
             _display = (getattr(settings, "provider", "") or "deepseek")
+            _scoped_accts = list(getattr(settings, "accounts", []) or [])
+            _cur_mm = (settings.active_account or "").strip() or "ALL"
+        _info(f"Accounts : {len(_scoped_accts)}  |  Current: [{_cur_mm}]")
         _info(f"Provider  : {_display}")
         has_token = any((getattr(a, "token", "") or "").strip()
-                        for a in settings.accounts)
-        if not settings.accounts:
+                        for a in _scoped_accts)
+        if not _scoped_accts:
             _info(f"Setup    : no accounts yet -> Accounts ({accounts_num}) to add one")
         elif not has_token:
             _info(f"Setup    : no account token -> Accounts ({accounts_num}) to refresh one")
@@ -1120,11 +1250,11 @@ def main_menu(settings: Settings, serve_fn: Callable[[Settings], int],
             print("  3. Run multiple servers")
             print("  4. Settings")
             print("  5. Accounts")
-            print("  6. Dry run (echo prompt, no DeepSeek)")
+            print("  6. Dry run")
         else:
             print("  2. Settings")
             print("  3. Accounts")
-            print("  4. Dry run (echo prompt, no DeepSeek)")
+            print("  4. Dry run")
         print("  q. Quit")
         print()
         try:
