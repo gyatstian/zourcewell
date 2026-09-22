@@ -8,10 +8,14 @@
 
 - app needs https://aka.ms/vs/17/release/vc_redist.x64.exe beacuse of obscura
 
-# deepseaport — DeepSeek web2api (Obscura WAF + real-browser login)
+# deepseaport — DeepSeek + Qwen web2api (multi-provider)
 
-Unofficial, research-only bridge: exposes `chat.deepseek.com` web chat as an
+Unofficial, research-only bridge: exposes web chat as an
 OpenAI-compatible API (`/v1/chat/completions`, streaming + `tools`).
+Supported upstreams: DeepSeek (`chat.deepseek.com`, Obscura WAF +
+real-browser login) and Qwen (`chat.qwen.ai`, direct-API login + Aliyun
+WAF jar). Provider is selected in the TUI provider gate or via
+`--provider`/`--providers` (`Settings.provider`/`providers`).
 
 How it works:
 
@@ -19,13 +23,18 @@ How it works:
   profile that solves the AWS WAF JavaScript challenge and holds the
   `aws-waf-token` cookie. All DeepSeek HTTP calls replay that cookie jar,
   with a browser User-Agent captured from the same engine.
-- **Auto-token/login** uses a real installed Helium/Chrome/Edge/Chromium via
+- **Auto-token/login (DeepSeek)** uses a real installed Helium/Chrome/Edge/Chromium via
   CDP (`browser_bin: "auto"`), because DeepSeek's Shumei device-id SDK does
   not initialize in the Obscura no-render engine. Obscura remains the WAF and
   hot-path engine.
-- Hot path is direct HTTP (`curl_cffi`, Chrome TLS impersonation):
-  login → create session → PoW challenge (`DeepSeekHashV1` wasm) →
+- **Login (Qwen)** is a direct `POST /api/v1/auths/signin` (no browser, no
+  captcha); the JWT rides the `token` cookie on every hot-path request (see
+  `src/deepseaport/providers/qwen/README.md`).
+- Hot path is direct HTTP (`curl_cffi`, Chrome TLS impersonation).
+  DeepSeek: login → create session → PoW challenge (`DeepSeekHashV1` wasm) →
   `POST /api/v0/chat/completion` (SSE `p`/`v` events) → delete session.
+  Qwen: create chat → `POST /api/v2/chat/completions?chat_id=<id>` →
+  best-effort delete chat (no PoW; Aliyun 200+HTML challenge vs AWS 403).
 - No DOM driving per token: fast enough for agentic loops.
 
 Agentic-harness support:
@@ -79,7 +88,9 @@ curl -N http://127.0.0.1:5001/v1/chat/completions `
 ```json
 {
   "keys": ["sk-local-dev"],
-  "accounts": [{ "email": "you@x.com", "password": "...", "token": "" }],
+  "accounts": [{ "email": "you@x.com", "mobile": "", "password": "...", "token": "",
+                  "token_expires_at": 0.0, "provider": "deepseek",
+                  "banned": false, "banned_until": 0.0 }],
   "active_account": "",
   "obscura_bin": "",
   "obscura_profile": "",
@@ -87,9 +98,19 @@ curl -N http://127.0.0.1:5001/v1/chat/completions `
   "browser_headless": false,
   "port": 5001,
   "listen": false,
-  "chat_model": "deepseek-flash"
+  "chat_model": "deepseek-flash",
+  "provider": "deepseek",
+  "providers": []
 }
 ```
+
+`provider` (single mode) / `providers` (multi mode, empty = use `provider`
+only) select the upstream (`Settings.provider`/`providers`, env
+`DEEPSEAPORT_PROVIDER`/`DEEPSEAPORT_PROVIDERS`, or `--provider`/`--providers`;
+TUI shows a provider gate first). `accounts[].provider` pins an account to
+one upstream. `accounts[].mobile` is an alternate identifier;
+`accounts[].token_expires_at` persists Qwen signin expiry (`0` = unknown,
+never blocks).
 
 `active_account` is the `CURRENT` selection (`""` = auto-failover over the
 whole pool). `chat_model` remembers the last `/model` pick from server-with-chat
@@ -144,10 +165,20 @@ Clear that state with `POST /v1/accounts/unblock` or
 
 - `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`
 - `GET /v1/waf/status` — Obscura binary, profile, WAF cookie state
+- Accounts: `GET /v1/accounts`, `POST /v1/accounts`,
+  `POST /v1/accounts/select`, `PUT /v1/accounts/{identifier}/token`,
+  `DELETE /v1/accounts/{identifier}`, `POST /v1/accounts/unblock`
 
-Models: `deepseek-flash`, `deepseek-flash-reasoner`,
-`deepseek-flash-search`, `deepseek-flash-reasoner-search`.
-Reasoner models return `reasoning_content` alongside `content`.
+Models (union of the active providers' catalogues; `/v1/models` serves all):
+DeepSeek — `deepseek-flash`, `deepseek-flash-reasoner`,
+`deepseek-flash-search`, `deepseek-flash-reasoner-search` (reasoner models
+return `reasoning_content` alongside `content`); Qwen — `qwen3.7-plus`
+(default), `qwen3.8-max`, `qwen3.8-omni-flash`.
+
+Note: OpenAI params the web upstreams cannot honor (`temperature`, `top_p`,
+`max_tokens`, `stop`, `n`, penalties, `response_format`) are accepted but
+ignored upstream (prompt + thinking/search/model only); the server logs a
+warning per request. `stream_options.include_usage` is honored locally.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for protocol details, auth/PoW/SSE
 notes, and the tool-calling design.

@@ -1,7 +1,8 @@
 # deepseaport architecture & reverse-engineering notes
 
 How the bridge works and everything non-obvious discovered while building it.
-Read this before touching `protocol.py`, `pow.py`, `accounts.py`, or auth.
+Read this before touching `providers/deepseek/*`, `providers/qwen/*`,
+`core/engine.py`, or auth.
 
 ## Big picture
 
@@ -20,8 +21,11 @@ real Helium/Chrome/Edge/Chromium (CDP) _______________|
   - controlled by `real_browser.py`; selector-driven, not ref-driven
 ```
 
-Hot path is **direct HTTP, never DOM driving**. Obscura is re-invoked only
-to refresh the WAF token (startup + on HTTP 403). Binary resolution
+Hot path is **direct HTTP, never DOM driving** (both providers).
+DeepSeek: Obscura is re-invoked only to refresh the WAF token (startup +
+on HTTP 403). Qwen: mutating endpoints sit behind Aliyun WAF anti-bot,
+which returns HTTP 200 + HTML challenge (not 403); recovery is a
+qwen-host solved-jar fetch + fresh chat (no PoW). Binary resolution
 (`obscura_bridge.py:_discover`): `obscura_bin` config / `OBSCURA_BIN` env
 first, then PATH, then a repo-local drop-in — `obscura.exe` (or `obscura`
 on unix) next to `config.json` / repo root, or under `bin/`, `tools/`,
@@ -29,6 +33,8 @@ on unix) next to `config.json` / repo root, or under `bin/`, `tools/`,
 needed. Local binaries are gitignored, never committed.
 
 ## Request lifecycle (per chat completion)
+
+DeepSeek path:
 
 1. Acquire account (one in-flight stream per account — DeepSeek limitation,
    enforced by per-account `threading.Lock` + rotation + 120 s cooldown).
@@ -49,7 +55,17 @@ Retry policy: fresh PoW once on PoW errors, recreate session once on
 `INVALID_SESSION_ID`, Obscura warmup + retry once on 403/WAF. Mark account
 bad (cooldown) on ban/restricted/401.
 
-## SSE stream shape (verified against live traffic)
+Qwen path (no PoW; `providers/qwen/completion_service.py` over
+`core/engine.py`): acquire account → pre-check `token_expires_at` with one
+proactive direct re-signin when a password is stored → `POST
+/api/v2/chats/new` → `POST /api/v2/chat/completions?chat_id=<id>` (`?chat_id=`
+required; `Cookie: token=<jwt>` + solved WAF jar; `Authorization: Bearer`
+kept too) → best-effort `DELETE /api/v2/chats/{id}`. Qwen SSE is
+OpenAI-style JSON per `data:` line (no `{p,v}` protocol); 401s probe
+`GET /api/v2/auths/` first (ban masquerading as 401 → 403 + failover), then
+one direct re-signin. Details in `src/deepseaport/providers/qwen/README.md`.
+
+## SSE stream shape — DeepSeek (verified against live traffic)
 
 - `event: ready` + `data: {request_message_id, response_message_id, model_type}` opens.
 - Deltas: `data: {"p":"response/content","o":"APPEND","v":"..."}` and
@@ -65,7 +81,13 @@ bad (cooldown) on ban/restricted/401.
 - `{"v":"<n>"}` heartbeats between chunks are content when `last_path` is
   content (e.g. "web","2","api","-","ok" spells "web2api-ok").
 
-## Auth (hard-won)
+Qwen SSE differs: OpenAI-style JSON per `data:` line, `delta.phase`
+(`think`/`think_summary` → thinking, `answer`/absent/`tool_call` →
+content), finish on `delta.status == "finished"` / `done:true` /
+`data: [DONE]`, usage from `input_tokens`/`output_tokens`/`total_tokens`.
+See `src/deepseaport/providers/qwen/README.md`.
+
+## Auth (hard-won; DeepSeek unless noted)
 
 - Token lives in page localStorage as JSON: `userToken = {"value":"<64-char>","__version":"0"}`.
 - Direct `POST /api/v0/users/login` (web headers) → `biz_code 11 RISK_DEVICE_DETECTED`.
@@ -102,7 +124,7 @@ bad (cooldown) on ban/restricted/401.
 - `POST /v1/accounts/unblock` (and `deepseaport accounts unblock [identifier]`)
   clears the in-memory cooldown and the persisted ban marker.
 
-## PoW details
+## PoW details (DeepSeek only; Qwen has no PoW)
 
 - Wasm URL host is **`fe-static.deepseek.com`**, not `chat.deepseek.com`:
   `https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm`.
@@ -133,9 +155,10 @@ JSON invoke bodies); replies that look like a truncated tool attempt surface
 Stream and non-stream both end with `finish_reason: "tool_calls"`.
 Multi-step loops verified live (weather → tool result → final answer).
 
-## Models (v4.1 lineup, Sep 2026)
+## Models
 
-Only these four; no Pro/expert exists yet (flash superseded v4 Pro):
+DeepSeek (v4.1 lineup, Sep 2026) — only these four; no Pro/expert exists yet
+(flash superseded v4 Pro):
 
 | id | thinking | search |
 |---|---|---|
@@ -148,13 +171,20 @@ Only these four; no Pro/expert exists yet (flash superseded v4 Pro):
 `model_type` stays `"default"`. Removed: `deepseek-chat/v3/r1`, `-search`
 variants under old names, `deepseek-vision`.
 
+Qwen (`providers/qwen/models.py`): `qwen3.7-plus` (default, thinking +
+search), `qwen3.8-max` (thinking + search), `qwen3.8-omni-flash` (thinking,
+no search). `/v1/models` serves the union of the active providers.
+
 ## TUI / serve modes (`tui.py`, `chat_ui.py`, `cli.py`)
 
-- `main_menu` loop: `1 Start server`, `2 Start server with chat`
-  (chat arg omitted → legacy 1-3 layout), `Settings`, `Accounts`,
-  `Dry run` (bottom, before `q Quit`). Both serve paths return to the menu
-  on stop — no app restart to switch accounts; API-side account changes are
-  reloaded from disk afterwards (`_refresh_from_disk`).   `send_dry_run_to_frontend`
+- `main_menu` loop: provider gate first (single/multi select over
+  `Settings.provider`/`providers`), then `1 Start server`,
+  `2 Start server with chat` (chat arg omitted → legacy 1-3 layout),
+  `Settings`, `Accounts`, `Dry run` (bottom, before `q Quit`). CLI
+  `--provider`/`--providers` flags do the same non-interactively. Both
+  serve paths return to the menu on stop — no app restart to switch
+  accounts; API-side account changes are reloaded from disk afterwards
+  (`_refresh_from_disk`). `send_dry_run_to_frontend`
   (Request handling 6, default ON) controls whether the reply content carries
   the printed raw + formatted dump or a short terminal-only note.
 - Dry run (`dry_run.py`): same port/host/stop-key wiring as serve but no
@@ -171,7 +201,8 @@ variants under old names, `deepseek-vision`.
   `termios`+`select` on POSIX) mapping `Esc`/`q` to `server.should_exit`;
   `Ctrl+C` arrives via SIGINT. Multi-worker falls back to `uvicorn.run`
   (no Esc listener — it can't reach subprocesses).
-- Port auto-fix (`cli._ensure_free_port`): socket pre-check; busy port scans
+- Port auto-fix (`server_runner._ensure_free_port`, thin-wrapped by
+  `cli._ensure_free_port`): socket pre-check; busy port scans
   `port+1..port+50`, asks `Y/n` on a tty (auto-picks headless), writes the
   winner to `settings.port` + `config.json`.
 - Server-with-chat (`chat_ui.py`, stdlib only): same API server in a
@@ -188,14 +219,15 @@ variants under old names, `deepseek-vision`.
 - Chat model memory: `/model` persists to `settings.chat_model`
   (`config.json` + `DEEPSEAPORT_CHAT_MODEL` env); unknown/empty values fall
   back to `deepseek-flash` (`_initial_chat_model`).
-- Accounts TUI: `Token (y = auto-token)` — `y` runs Obscura auto-login
-  (`confirmed=True`, no second prompt), anything else is a literal token.
-  New accounts become `CURRENT` immediately (TUI, CLI `accounts add`,
-  `POST /v1/accounts`, login upsert).
+- Accounts TUI: `Token (y = auto-token)` — `y` runs provider-specific
+  auto-login (`confirmed=True`, no second prompt): DeepSeek via Obscura
+  browser login, Qwen via direct-API signin (`provider.login()`); anything
+  else is a literal token. New accounts become `CURRENT` immediately (TUI,
+  CLI `accounts add`, `POST /v1/accounts`, login upsert).
 
 ## Environment / files
 
-- `config.json` (gitignored): `{keys, accounts[{email,mobile,password,token,banned,banned_until}], active_account, obscura_bin, obscura_profile, browser_bin, browser_headless, port, listen, enable_tools, warmup_on_startup, auto_delete_session, max_retries, parallel_challenge_fetch, tool_args_max_chars, forgiving_toolcalls, use_multiple_accounts, log_level, stream_mode, chat_model, enable_append, append_top, append_bottom, send_dry_run_to_frontend}`.
+- `config.json` (gitignored): `{keys, accounts[{email,mobile,password,token,token_expires_at,provider,banned,banned_until}], active_account, obscura_bin, obscura_profile, browser_bin, browser_headless, port, listen, enable_tools, warmup_on_startup, auto_delete_session, max_retries, parallel_challenge_fetch, tool_args_max_chars, forgiving_toolcalls, use_multiple_accounts, log_level, stream_mode, chat_model, enable_append, append_top, append_bottom, send_dry_run_to_frontend, provider, providers}`.
   `enable_append` (default true) gates both appends in `_prepare` (false keeps
   texts stored but sends nothing); `append_top`/`append_bottom` are free-form
   multi-line strings wrapped around
@@ -222,12 +254,15 @@ variants under old names, `deepseek-vision`.
 ## Provider architecture (multi-provider refactor)
 
 - Folder layout: `core/` holds provider-neutral code (provider ABC, registry,
-  pools, tools, transport, `openai` response shim, tokens); each upstream
-  lives in `providers/<name>/` (`protocol`, `client`, `sse_parser`, `pow`,
-  `auth`, `models`, `provider`); the completion engine stays DeepSeek-specific
-  in `providers/deepseek/completion_service.py`.
+  pools, tools, transport, `openai` response shim, tokens, `engine.py`
+  retry/failover mechanics); each upstream lives in `providers/<name>/`
+  (`protocol`, `client`, `sse_parser`, `pow`, `auth`, `models`, `provider`,
+  `completion_service.py` adapter). DeepSeek keeps session/PoW/SSE/ban logic
+  in `providers/deepseek/completion_service.py`, Qwen keeps chat lifecycle in
+  `providers/qwen/completion_service.py`; both delegate generic loops to
+  `core/engine.py`.
 - Registry (`core/registry.py`): lazy discovery via `_BUILTIN_MODULES`
-  (deepseek only) + `create_provider()` factories; failures log and never
+  (`deepseek`, `qwen`) + `create_provider()` factories; failures log and never
   raise; never imports `deepseaport.server` (no cycle).
 - Provider-scoped pools (`core/pools.py`): `active_provider_ids`,
   `accounts_for_provider`, `make_pool` build one `AccountPool` per active
@@ -241,9 +276,11 @@ variants under old names, `deepseek-vision`.
 - Shared shim: `core/openai._openai_response` shapes OpenAI replies for all
   providers; tool parsing resolves through `deepseaport.server.parse_tool_calls`
   at call time so test monkeypatches keep working.
-- Templates: `providers/glm|qwen|kimi/` are import-safe stubs (empty models,
+- Templates: `providers/glm|kimi/` are import-safe stubs (empty models,
   `NotImplementedError` login/complete) activated by filling `models.py`,
   implementing protocol/client + `complete()`, then adding one line to
-  `_BUILTIN_MODULES`. See `PROVIDERS.md`.
+  `_BUILTIN_MODULES`. Qwen is a full provider (reference #2). New providers
+  write a thin adapter over `core/engine.py` — do NOT copy
+  `completion_service.py`. See `PROVIDERS.md`.
 - Back-compat: old module paths (`deepseaport.server`, `completion_service`,
   `client`, ...) remain as alias shims; all monkeypatch seams preserved.

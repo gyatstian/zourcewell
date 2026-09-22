@@ -11,6 +11,7 @@ Template only: `models()` is empty, `login`/`complete` raise `NotImplementedErro
 
 ## Shared modules to reuse
 
+- `core.engine` — generic retry/failover/stream mechanics (thin adapter only).
 - `core.tools` — prompt rendering + tool-call parsing.
 - `core.transport` — SSE drain helpers.
 - `core.openai._openai_response` — OpenAI response shaping.
@@ -19,7 +20,9 @@ Template only: `models()` is empty, `login`/`complete` raise `NotImplementedErro
 ## Activate in 4 steps
 
 1. Fill `models.py` (`MODELS_SPEC`, `DEFAULT_MODEL`).
-2. Implement `protocol.py`/`client.py` (+ `sse_parser.py`, `pow.py`, `auth.py` as needed).
+2. Implement `protocol.py`/`client.py` (+ `sse_parser.py`, `pow.py`, `auth.py` as needed)
+   plus a thin `completion_service.py` adapter over `core.engine` — do NOT copy
+   `providers/deepseek/completion_service.py`.
 3. Override `complete_request` / `stream_response` in `provider.py` reusing
    `core.tools`, `core.transport`, `core.openai._openai_response` and
    `core.pools.make_pool` (`deepseaport.accounts` pool).

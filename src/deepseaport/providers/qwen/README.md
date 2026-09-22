@@ -53,11 +53,13 @@ Direct-API login works — no browser, no captcha needed.
   sources: `qwen_token` / `token`.
 - Shape: raw JWT string, NOT a `{"value":...}` JSON wrapper (the shared
   `core.tokens.extract_token` still normalizes both fine).
-- Completions REQUIRE `Cookie: token=<jwt>` PLUS the solved WAF jar:
-  bare `acw_tc` from curl `GET models/` passes `chats/new` but NOT
-  `completions` (live 2026-09-22: `token+acw_tc` still `WAF_CHALLENGE`).
-  Solved jar = obscura `fetch https://chat.qwen.ai/ --dump cookies`
-  (`acw_tc` 64-char + `x-ap`/`sca`/`cna`/`tfstk`/`isg`).
+- Completions REQUIRE `Cookie: token=<jwt>` PLUS the solved WAF jar.
+  To be explicit: a bare `acw_tc` from curl `GET models/` passes `chats/new`
+  but is NOT enough for `completions` (live 2026-09-22: `token+acw_tc`
+  still `WAF_CHALLENGE` — that means the jar is incomplete, not that Qwen
+  is broken). Solved jar = obscura `fetch https://chat.qwen.ai/ --dump cookies`
+  (`acw_tc` 64-char + `x-ap`/`sca`/`cna`/`tfstk`/`isg`), harvested by
+  `prime_qwen_bridge()`; `prime_waf()` is bare fallback only.
 - Every hot-path request carries `Cookie: token=<jwt>` (account wins) +
   cached jar; `Authorization: Bearer <jwt>` is kept too (helps non-WAF
   endpoints like chats/new).

@@ -5,8 +5,10 @@
   "accounts": [
     {
       "email": "",
+      "mobile": "",
       "password": "",
       "token": "",
+      "token_expires_at": 0.0,
       "provider": "deepseek",
       "banned": false,
       "banned_until": 0.0
