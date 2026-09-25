@@ -29,6 +29,16 @@ class Provider(ABC):
     id: str = ""
     display_name: str = ""
 
+    # False for local providers that need no AccountPool slot (e.g. a
+    # locally running CLI serve instance that multiplexes sessions itself).
+    # Routes skip slot acquisition and pass item=None; preflight passes
+    # when only such providers are active.
+    requires_accounts: bool = True
+
+    # False for providers needing no WAF bridge (no Obscura warmup at
+    # startup, no bridge in one-shot chat). Local CLI providers set this.
+    needs_bridge: bool = True
+
     @abstractmethod
     def models(self) -> dict[str, ModelSpec]:
         """Return this provider's model catalogue keyed by model id."""

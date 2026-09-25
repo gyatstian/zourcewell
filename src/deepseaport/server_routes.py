@@ -125,7 +125,10 @@ def register_routes(app: FastAPI) -> None:
         prep = _prepare(body, settings)  # raises 400/404 fast, before touching accounts
         from .core import registry as _registry
         provider = _registry.get(prep.get("provider")) or _registry.default()
-        pool = _pool_for(app, prep.get("provider"))
+        # Local providers (opencode CLI) need no account slot: skip the pool
+        # entirely and pass item=None (their engine ignores pool/item).
+        needs_slot = bool(getattr(provider, "requires_accounts", True))
+        pool = _pool_for(app, prep.get("provider")) if needs_slot else None
         # Async poll (no executor thread held): blocking acquire would
         # occupy default-executor threads and starve other to_thread work.
         # use_multiple_accounts=False pins to CURRENT (queue on its lock);
@@ -139,10 +142,15 @@ def register_routes(app: FastAPI) -> None:
             cancel_event = threading.Event()
             watcher = asyncio.create_task(_watch_disconnect(request, cancel_event))
             try:
-                item = await _acquire_slot_or_499(pool, request, cancel_event, 90, allow_multi)
-                if cancel_event.is_set():
-                    AccountPool.release(item)
-                    raise HTTPException(status_code=499, detail="client disconnected")
+                if needs_slot:
+                    item = await _acquire_slot_or_499(pool, request, cancel_event, 90, allow_multi)
+                    if cancel_event.is_set():
+                        AccountPool.release(item)
+                        raise HTTPException(status_code=499, detail="client disconnected")
+                else:
+                    item = None
+                    if cancel_event.is_set():
+                        raise HTTPException(status_code=499, detail="client disconnected")
             finally:
                 watcher.cancel()
             return StreamingResponse(
@@ -163,10 +171,16 @@ def register_routes(app: FastAPI) -> None:
         try:
             # Chunked acquire: a disconnect while queued surfaces as 499
             # within ~2s (instead of running an orphaned session once freed).
-            item = await _acquire_slot_or_499(pool, request, cancel_event, 90, allow_multi)
-            if cancel_event.is_set():
-                AccountPool.release(item)
-                raise HTTPException(status_code=499, detail="client disconnected")
+            # Local (accountless) providers skip acquisition (item=None).
+            if needs_slot:
+                item = await _acquire_slot_or_499(pool, request, cancel_event, 90, allow_multi)
+                if cancel_event.is_set():
+                    AccountPool.release(item)
+                    raise HTTPException(status_code=499, detail="client disconnected")
+            else:
+                item = None
+                if cancel_event.is_set():
+                    raise HTTPException(status_code=499, detail="client disconnected")
             try:
                 result = await asyncio.to_thread(
                     provider.complete_request, app, pool, prep, item, cancel_event)
@@ -413,6 +427,11 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
     tools = body.get("tools") or []
     use_tools = bool(tools) and body.get("tool_choice", "auto") != "none"
     if settings is not None and not getattr(settings, "enable_tools", True):
+        if use_tools:
+            logger.warning(
+                "ignoring %d client tool(s) for model=%s: enable_tools is "
+                "off (agentic harnesses like pi need it on for tool_calls)",
+                len(tools), model)
         use_tools = False
     tool_args_max_chars = None
     forgiving_toolcalls = False
@@ -489,6 +508,21 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
     stream_options = body.get("stream_options") or {}
     if not isinstance(stream_options, dict):
         stream_options = {}
+    # Reasoning effort (e.g. pi agents send reasoning_effort: medium).
+    # Honored by the opencode provider as the serve message `variant`
+    # (built-ins: none/minimal/low/medium/high/xhigh); other providers
+    # ignore it like the thinking flag. Unknown values stay warned below.
+    reasoning_effort = body.get("reasoning_effort")
+    if reasoning_effort is None and isinstance(body.get("reasoning"), dict):
+        reasoning_effort = body["reasoning"].get("effort")
+    if isinstance(reasoning_effort, str):
+        reasoning_effort = reasoning_effort.strip().lower() or None
+    else:
+        reasoning_effort = None
+    if reasoning_effort is not None and reasoning_effort not in (
+            "none", "minimal", "low", "medium", "high", "xhigh"):
+        unsupported["reasoning_effort"] = body.get("reasoning_effort")
+        reasoning_effort = None
     if unsupported:
         logger.warning(
             "ignoring unsupported OpenAI params for web upstream "
@@ -500,6 +534,7 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
         "tool_args_max_chars": tool_args_max_chars,
         "forgiving_toolcalls": forgiving_toolcalls,
         "thinking": thinking, "search": search, "model_type": model_type,
+        "reasoning_effort": reasoning_effort,
         "provider": provider.id,
         "temperature": body.get("temperature"),
         "top_p": body.get("top_p"),

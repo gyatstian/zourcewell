@@ -503,14 +503,29 @@ def cmd_chat(args) -> int:
         settings.provider = _pid
         settings.providers = []
     app = create_app(settings)
-    from .obscura_bridge import register_default_bridge
-
-    app.state.bridge = ObscuraBridge(settings.obscura_bin, settings.obscura_profile)
-    # Publish for protocol.bridge_headers ban probes; without this the probe
-    # falls back to bare headers (no WAF cookie/UA) and can false-negative.
-    register_default_bridge(app.state.bridge)
-    app.state.bridge.warmup()
     prep = _prepare({"model": args.model, "messages": [{"role": "user", "content": args.prompt}]}, settings)
+    try:
+        from .core import registry as _reg_scan
+
+        _chat_provider = _reg_scan.get(prep.get("provider", ""))
+    except Exception:
+        _chat_provider = None
+    if _chat_provider is None or getattr(_chat_provider, "needs_bridge", True):
+        from .obscura_bridge import ObscuraBridge, register_default_bridge
+
+        app.state.bridge = ObscuraBridge(settings.obscura_bin, settings.obscura_profile)
+        # Publish for protocol.bridge_headers ban probes; without this the probe
+        # falls back to bare headers (no WAF cookie/UA) and can false-negative.
+        register_default_bridge(app.state.bridge)
+        app.state.bridge.warmup()
+    else:
+        # Local providers (opencode CLI) need no WAF bridge: skip obscura.
+        app.state.bridge = None
+    if _chat_provider is not None and not getattr(_chat_provider, "requires_accounts", True):
+        # Local (accountless) provider (opencode CLI): no pool, no slot.
+        result = _chat_provider.complete_request(app, None, prep, None, None)
+        print(("THINKING:\n" + result["thinking"] + "\n\n" if result["thinking"] else "") + result["content"])
+        return 0
     try:
         from .core import pools as _pools
 

@@ -173,12 +173,41 @@ Models (union of the active providers' catalogues; `/v1/models` serves all):
 DeepSeek — `deepseek-flash`, `deepseek-flash-reasoner`,
 `deepseek-flash-search`, `deepseek-flash-reasoner-search` (reasoner models
 return `reasoning_content` alongside `content`); Qwen — `qwen3.7-plus`
-(default), `qwen3.8-max`, `qwen3.8-omni-flash`.
+(default), `qwen3.8-max`, `qwen3.8-omni-flash`; opencode (local CLI, no
+accounts) — `opencode/muse-spark-1.3-contributor-free` (default) plus the
+other seven `opencode/*-free` models, and any `provider/model` you
+configured on your own `opencode serve` passes through.
 
 Note: OpenAI params the web upstreams cannot honor (`temperature`, `top_p`,
 `max_tokens`, `stop`, `n`, penalties, `response_format`) are accepted but
 ignored upstream (prompt + thinking/search/model only); the server logs a
 warning per request. `stream_options.include_usage` is honored locally.
+The opencode provider additionally honors `reasoning_effort`
+(`none/minimal/low/medium/high/xhigh`, also as `reasoning.effort`) as the
+serve message `variant` — the only per-request parameter the serve API
+supports (`temperature` has no per-message field upstream, so it stays
+warn-and-drop like the web providers).
+
+## Pi harness + opencode (no accounts, tool_calls out of the box)
+
+1. Install the `opencode` binary (on PATH) and start the bridge on the
+   opencode provider: `python -m deepseaport serve --provider opencode`
+   (first request auto-boots a managed isolated `opencode serve`; your own
+   `~/.config/opencode` is never touched — or set
+   `DEEPSEAPORT_OPENCODE_BASE` to use your own serve as-is).
+2. In `config.json` keep `"enable_tools": true` (off strips the tool
+   schemas pi sends, so pi never sees `tool_calls` — the server now warns
+   when it does this) and `"provider": "opencode"`.
+3. In pi, pick provider `deepseaport` (base `http://127.0.0.1:5001/v1`)
+   and model `opencode/muse-spark-1.3-contributor-free`, then work
+   normally: pi's tools arrive as DSML text, the model replies with DSML
+   `tool_calls`, and the bridge returns OpenAI `tool_calls` for pi to
+   execute. Plain chat sends no native `tools` key at all; tool turns
+   declare only the gatekeeper-minimal bash+read pair (an explicit
+   all-false list is what the free tier 403s).
+4. If pi runs in a different directory than the bridge, set
+   `DEEPSEAPORT_OPENCODE_WORKDIR` to the project dir so sessions pin
+   (`?directory=`) where pi expects file tools to run.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for protocol details, auth/PoW/SSE
 notes, and the tool-calling design.

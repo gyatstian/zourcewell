@@ -166,10 +166,27 @@ async def lifespan(app: FastAPI):
 
 
 def _startup_warm(bridge: ObscuraBridge, settings=None) -> None:
+    # Local-only mode (opencode CLI) needs no WAF bridge: skip the obscura
+    # warmup (and the DeepSeek PoW fallback below) when none of the active
+    # providers wants the bridge. Provider warmups still run.
     try:
-        bridge.warmup()
+        from .core import pools as _pools_w
+        from .core import registry as _reg_w
+        if settings is not None:
+            _w_ids = _pools_w.active_provider_ids(settings)
+        else:
+            _w_ids = [_reg_w.default().id]
+        _needs_bridge = any(
+            bool(getattr(_reg_w.get(_pid), "needs_bridge", True))
+            for _pid in _w_ids)
     except Exception as exc:
-        logger.warning("startup WAF warmup failed: %s", exc)
+        logger.debug("bridge-need check unavailable, warming by default: %s", exc)
+        _needs_bridge = True
+    if _needs_bridge:
+        try:
+            bridge.warmup()
+        except Exception as exc:
+            logger.warning("startup WAF warmup failed: %s", exc)
     # Provider-driven warmup: warm every active provider (deepseek only in
     # single mode). Fall back to the historical inline PoW path if the
     # registry/provider warmup is unavailable.
@@ -190,6 +207,9 @@ def _startup_warm(bridge: ObscuraBridge, settings=None) -> None:
             return
     except Exception as exc:
         logger.debug("provider warmup unavailable, using inline PoW: %s", exc)
+    if not _needs_bridge:
+        # Local-only mode: no DeepSeek PoW fallback (nothing uses it).
+        return
     # Inline PoW fallback is DeepSeek-specific and lazy-imported so this
     # module has no top-level providers.deepseek import. Provider.warmup
     # above is the preferred path.

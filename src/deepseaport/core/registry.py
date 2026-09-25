@@ -15,7 +15,8 @@ from .provider import ModelSpec, Provider
 
 logger = logging.getLogger("deepseaport.providers")
 
-_BUILTIN_MODULES = ("deepseaport.providers.deepseek", "deepseaport.providers.qwen")
+_BUILTIN_MODULES = ("deepseaport.providers.deepseek", "deepseaport.providers.qwen",
+                     "deepseaport.providers.opencode")
 
 _REGISTRY: dict[str, Provider] = {}
 _LOADED = False

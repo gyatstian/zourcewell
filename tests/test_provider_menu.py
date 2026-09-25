@@ -64,7 +64,7 @@ def test_provider_menu_multi_select(monkeypatch):
     inputs = iter(["m", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     provider_menu(s)
-    assert s.providers == ids
+    assert sorted(s.providers) == ids
     assert s.provider == ids[0]
 
 

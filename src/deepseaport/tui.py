@@ -471,9 +471,8 @@ def _select_provider(settings: Settings) -> None:
             except Exception:
                 accts = []
             ntok = sum(1 for a in accts if (getattr(a, "token", "") or "").strip())
-            mark = " * CURRENT" if (pid in active) else ""
             print(f"  {i}. {name} ({pid}) — {nmodels} models, "
-                  f"{len(accts)} accounts ({ntok} with token){mark}")
+                  f"{len(accts)} accounts ({ntok} with token)")
         print()
         print("  m. Multi (all providers, one server exposes every model)")
         print("  q. Back (keep current)")
@@ -1169,9 +1168,17 @@ def _preflight_reason(settings: Settings) -> str:
     """
     try:
         from .core import pools as _pools
+        from .core import registry as _reg
 
         _ids = _pools.active_provider_ids(settings)
-        _accts = [a for _pid in _ids for a in _pools.accounts_for_provider(settings, _pid)]
+        _need = [pid for pid in _ids
+                 if getattr(_reg.get(pid), "requires_accounts", True)]
+        if _ids and not _need:
+            # Only local (accountless) providers active (opencode CLI):
+            # nothing to provision, serve can start.
+            return ""
+        _accts = [a for _pid in (_need or _ids)
+                  for a in _pools.accounts_for_provider(settings, _pid)]
     except Exception:
         _accts = settings.accounts
     if not _accts:
