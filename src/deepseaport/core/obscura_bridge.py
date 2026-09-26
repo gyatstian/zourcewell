@@ -108,7 +108,7 @@ def profile_lock(profile: str) -> threading.RLock:
 
 class ObscuraBridge:
     def __init__(self, binary: str = "", profile: str = "") -> None:
-        self.binary = binary or self._discover()
+        self.binary = self._resolve_binary(binary)
         default_profile = str(Path.home() / ".deepseaport" / "obscura-profile")
         self.profile = profile or default_profile
         Path(self.profile).mkdir(parents=True, exist_ok=True)
@@ -127,6 +127,36 @@ class ObscuraBridge:
         self._warm_lock = threading.Lock()
         self._warm_inflight: threading.Event | None = None
         self._last_warmup_ok: float = 0.0
+
+    @staticmethod
+    def _resolve_binary(binary: str = "") -> str:
+        """Resolve an explicit binary path, tolerating a directory.
+
+        A pasted release folder (e.g. ``obscura-x86_64-windows-no-render``)
+        used to reach ``subprocess`` verbatim and fail as ``[WinError 5]
+        Odmowa dostępu`` with 0 cookies and an empty UA, which then starved
+        every later request of its WAF token. A directory now resolves to
+        the ``obscura.exe``/``obscura`` inside it.
+        """
+        raw = (binary or "").strip()
+        if not raw:
+            return ObscuraBridge._discover()
+        try:
+            cand = Path(raw).expanduser()
+        except Exception:
+            return raw
+        try:
+            if cand.is_dir():
+                for name in ("obscura.exe", "obscura"):
+                    hit = cand / name
+                    try:
+                        if hit.is_file():
+                            return str(hit)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return raw
 
     @staticmethod
     def _search_roots() -> list[Path]:

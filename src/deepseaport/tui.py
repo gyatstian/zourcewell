@@ -362,6 +362,23 @@ def _edit_obscura_bin(settings: Settings) -> None:
         _err(f"Path not found: {p}. Not saved.")
         _info("TIP: place obscura.exe next to config.json, bin/, tools/, vendor/.")
         return
+    if p.is_dir():
+        # A pasted release folder: resolve to the exe inside it instead of
+        # saving a directory (which fails at runtime as WinError 5).
+        hit = None
+        for name in ("obscura.exe", "obscura"):
+            cand = p / name
+            try:
+                if cand.is_file():
+                    hit = cand
+                    break
+            except Exception:
+                continue
+        if hit is None:
+            _err(f"Directory has no obscura.exe in it: {p}. Not saved.")
+            return
+        p = hit
+        _info(f"Resolved directory -> {p}.")
     settings.obscura_bin = str(p)
     settings.save()
     _ok(f"Obscura binary -> {settings.obscura_bin} (saved)")

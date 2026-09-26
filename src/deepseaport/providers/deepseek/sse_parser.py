@@ -7,7 +7,8 @@ authoritative ban helpers.
 
 Ownership:
 - This module owns SSE line/event parsing: StreamParser.feed, batched
-  v-list, usage/finished/error envelopes, continuation chunks.
+  v-list, usage/finished/error envelopes, continuation chunks, and the
+  fragments-based stream shape (response/fragments/-1/content).
 - Header builders and ban helpers stay in protocol.py (re-exported here
   only via deferred local import to avoid a module cycle).
 - HTTP status/body/error-drain handling lives in transport_http.py.
@@ -27,13 +28,78 @@ logger = logging.getLogger("deepseaport.protocol")
 
 class StreamParser:
     """Stateful SSE parser: continuation chunks arrive as bare {"v": "..."}
-    with no "p" path, so the last content path is remembered."""
+    with no "p" path, so the last content path is remembered.
+
+    Upstream streams in two shapes (both handled):
+    - legacy: {"p": "response/content" | "response/thinking_content", "v": ...}
+    - fragments (current): the reply is a list of typed fragments. The first
+      fragment arrives inside {"v": {"response": {"fragments": [...]}}}, later
+      fragments via {"p": "response/fragments", "o": "APPEND", "v": [...]},
+      and every text delta via {"p": "response/fragments/-1/content", ...}
+      plus bare {"v": "..."} continuations. Fragment {"type": "THINK"} routes
+      to thinking, every other fragment type routes to content. The active
+      fragment type is remembered so continuations land on the right side.
+    """
 
     CONTENT = "response/content"
     THINKING = "response/thinking_content"
+    FRAG_CONTENT = "response/fragments/-1/content"
+    FRAGMENTS = "response/fragments"
+    # Finished markers: legacy response/status plus the BATCH-carried
+    # quasi_status (both qualified and parent-relative bare forms).
+    FINISHED_PATHS = ("response/status", "status",
+                      "response/quasi_status", "quasi_status")
+    USAGE_PATHS = ("response/accumulated_token_usage",
+                   "accumulated_token_usage")
 
     def __init__(self) -> None:
         self.last_path = ""
+        # True when the current (last) fragment is a THINK fragment, so
+        # fragment-content deltas and continuations route to thinking.
+        self.frag_thinking = False
+
+    @staticmethod
+    def _is_frag_content_path(path: str) -> bool:
+        """True for fragment text-delta paths (any fragment index)."""
+        return (path == StreamParser.FRAG_CONTENT
+                or (path.startswith("response/fragments/")
+                    and path.endswith("/content")))
+
+    def _route_text(self, path: str, text: str) -> StreamEvent | None:
+        """Route one non-empty text delta to thinking/content, else None.
+
+        Fragment deltas follow the active fragment type; legacy paths follow
+        the exact path. Sets last_path only when an event is produced (same
+        as the historical branches did).
+        """
+        if not isinstance(text, str) or not text:
+            return None
+        if self._is_frag_content_path(path):
+            kind = "thinking" if self.frag_thinking else "content"
+        elif path == self.THINKING:
+            kind = "thinking"
+        elif path == self.CONTENT:
+            kind = "content"
+        else:
+            return None
+        self.last_path = path
+        return StreamEvent(kind=kind, text=text)
+
+    def _frag_events(self, frag: dict) -> Iterator[StreamEvent]:
+        """Track one fragment dict, yielding its initial content (if any)."""
+        try:
+            kind = str(frag.get("type", "") or "").upper()
+        except Exception:
+            kind = ""
+        self.frag_thinking = "THINK" in kind
+        self.last_path = self.FRAG_CONTENT
+        try:
+            text = frag.get("content", "")
+        except Exception:
+            text = ""
+        event = self._route_text(self.last_path, text)
+        if event is not None:
+            yield event
 
     def feed(self, line: str) -> Iterator[StreamEvent]:
         # Deferred import: protocol.py re-exports this module at top level,
@@ -86,69 +152,74 @@ class StreamParser:
                 yield StreamEvent(kind="error", code=str(code), message=msg,
                                   ban_until=ban_ts)
             return
+        # Fragments snapshot: {"v": {"response": {"fragments": [...]}}}.
+        # Carries the first fragment's initial content (THINK -> thinking,
+        # RESPONSE -> content). Unknown v-dicts keep the historical no-op.
+        if isinstance(chunk.get("v"), dict):
+            resp = chunk["v"].get("response")
+            if isinstance(resp, dict):
+                for frag in resp.get("fragments", []) or []:
+                    if isinstance(frag, dict):
+                        yield from self._frag_events(frag)
+            return
+        # Later fragments: {"p": "response/fragments", "o": "APPEND", "v": [...]}
+        # (e.g. the THINK -> RESPONSE switch, carrying its initial content).
         path = chunk.get("p", "") or self.last_path
         value = chunk.get("v")
-        if path == "response/status" and value == "FINISHED":
+        if path == self.FRAGMENTS and isinstance(value, (list, dict)):
+            frags = value if isinstance(value, list) else [value]
+            for frag in frags:
+                if isinstance(frag, dict):
+                    yield from self._frag_events(frag)
+            return
+        if value == "FINISHED" and path in self.FINISHED_PATHS:
             self.last_path = ""
             yield StreamEvent(kind="finished")
             return
-        if path == "response/search_status":
+        if path == "response/search_status" or path.endswith("/elapsed_secs"):
             return
-        if path == "response/accumulated_token_usage" and isinstance(value, int):
+        if isinstance(value, int) and path in self.USAGE_PATHS:
             yield StreamEvent(kind="usage", text=str(value))
             return
         if isinstance(value, list):
             # Batched deltas: upstream can pack several {p,v} pairs (or raw
             # strings) in one "v" list. The old code only looked for FINISHED
             # and dropped any batched content, truncating the reply.
+            # Items under {"p": "response", "o": "BATCH"} carry parent-relative
+            # paths ("accumulated_token_usage", "quasi_status"), resolved here.
             for item in value:
                 if isinstance(item, dict):
                     ip = item.get("p", "") or path
+                    if "/" not in ip and path == "response":
+                        ip = "response/" + ip
                     iv = item.get("v", "")
-                    if iv == "FINISHED" and ip in ("status", "response/status"):
+                    if iv == "FINISHED" and ip in self.FINISHED_PATHS + ("status",):
                         self.last_path = ""
                         yield StreamEvent(kind="finished")
                         return
                     if ip == "response/search_status":
                         continue
-                    if (ip == "response/accumulated_token_usage"
+                    if (ip in self.USAGE_PATHS
                             and isinstance(iv, int)):
                         yield StreamEvent(kind="usage", text=str(iv))
                         continue
                     if isinstance(iv, list):
                         for sub in iv:
-                            if isinstance(sub, str) and sub:
-                                if ip == self.THINKING:
-                                    self.last_path = ip
-                                    yield StreamEvent(kind="thinking", text=sub)
-                                elif ip == self.CONTENT:
-                                    self.last_path = ip
-                                    yield StreamEvent(kind="content", text=sub)
+                            event = self._route_text(ip, sub) if isinstance(sub, str) else None
+                            if event is not None:
+                                yield event
                         continue
-                    if not isinstance(iv, str) or not iv:
-                        continue
-                    if ip == self.THINKING:
-                        self.last_path = ip
-                        yield StreamEvent(kind="thinking", text=iv)
-                    elif ip == self.CONTENT:
-                        self.last_path = ip
-                        yield StreamEvent(kind="content", text=iv)
+                    event = self._route_text(ip, iv) if isinstance(iv, str) else None
+                    if event is not None:
+                        yield event
                 elif isinstance(item, str) and item:
-                    if path == self.THINKING:
-                        self.last_path = path
-                        yield StreamEvent(kind="thinking", text=item)
-                    elif path == self.CONTENT:
-                        self.last_path = path
-                        yield StreamEvent(kind="content", text=item)
+                    event = self._route_text(path, item)
+                    if event is not None:
+                        yield event
             return
-        if not isinstance(value, str) or not value:
-            return
-        if path == self.THINKING:
-            self.last_path = path
-            yield StreamEvent(kind="thinking", text=value)
-        elif path == self.CONTENT:
-            self.last_path = path
-            yield StreamEvent(kind="content", text=value)
+        event = self._route_text(path, value) if isinstance(value, str) else None
+        if event is not None:
+            yield event
 
 
 def parse_sse_line(line: str) -> Iterator[StreamEvent]:

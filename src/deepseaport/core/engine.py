@@ -605,7 +605,10 @@ def empty_response_error(provider_label: str):
 
     return HTTPException(status_code=502,
                          detail=f"empty upstream response from {provider_label} "
-                                "(likely throttling; wait then retry)")
+                                "(no content/thinking/error events; often "
+                                "throttling — wait then retry; if it persists "
+                                "for hours, the upstream stream format likely "
+                                "changed — update deepseaport)")
 
 
 def dispatch_terminal(classify_fn: Callable[[str | None], object],
