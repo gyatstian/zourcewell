@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import json as _jsonlib
 import logging
-from typing import Any
+import re as _re
+from typing import Any, Callable, Iterator
 
 from .types import StreamEvent
 
@@ -164,3 +165,95 @@ def loads_lenient(body: str) -> Any:
 def truncate_message(text: str, limit: int = UPSTREAM_MESSAGE_MAX) -> str:
     """Truncate a surfaced upstream body (default 300, preserved)."""
     return (text or "")[:limit]
+
+
+# --- Shared singletons (F9: one copy, providers alias/delve) -----------------
+
+# Word-ish ban match (shared DeepSeek/Qwen): plain substring "mute"
+# false-positives on "commute"/"transmute". Letter boundaries (not \b: "_"
+# must count as a boundary so "is_muted"/"mute_until" still hit) keep true
+# bans while ignoring "commute". "unbanned" intentionally does NOT match
+# (preceded by a letter).
+BAN_WORD_RE = _re.compile(
+    r"(?<![a-z])(muted?|suspend\w*|bann?ed?|violat\w*)(?![a-z])",
+    _re.IGNORECASE,
+)
+
+
+def has_ban_word(text: str) -> bool:
+    """True when text carries a ban-family word (never raises)."""
+    try:
+        return bool(text and BAN_WORD_RE.search(text))
+    except Exception:
+        return False
+
+
+def parse_json_response(resp: Any) -> dict:
+    """Best-effort ``resp.json()``: {} on any error, never raises.
+
+    Single home for the identical ``parse_json`` helpers in
+    deepseek/qwen ``protocol.py`` (same 4 lines). Providers keep their
+    ``parse_json`` names as thin aliases so existing imports keep working.
+    """
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def close_quietly(resp: Any) -> None:
+    """Best-effort resp.close(), never raises."""
+    try:
+        resp.close()
+    except Exception:
+        pass
+
+
+def drain_json_text(resp: Any, cap: int = JSON_DRAIN_CAP) -> str:
+    """Drain a non-SSE 200 body via iter_lines -> stripped text.
+
+    stream=True leaves .text/.json() empty, so both providers drain the
+    same way (cap 20k preserved). Returns "" on any error, never raises.
+    """
+    try:
+        return "".join(drain_lines(resp, cap)).strip()
+    except Exception:
+        return ""
+
+
+def iter_text_lines(resp: Any) -> Iterator[str]:
+    """Yield decoded non-empty SSE lines (bytes->utf-8/replace)."""
+    for raw in resp.iter_lines():
+        if not raw:
+            continue
+        yield decode_line(raw)
+
+
+def pump_sse(resp: Any, parser: Any,
+             precheck: Callable[[str], Any | None] | None = None,
+             ) -> Iterator[StreamEvent]:
+    """Shared SSE pump: decode lines, optional per-line guard, feed parser.
+
+    Owns ``resp.close()`` via finally (callers no longer close manually).
+    ``precheck(line)`` maps one decoded line to an error StreamEvent (or
+    None to keep feeding): DeepSeek uses it for inline raw-JSON bans,
+    Qwen for WAF-challenge lines. The wire parsers stay distinct; only
+    this decode/close scaffolding is shared. Yields until
+    finished/error, then returns.
+    """
+    try:
+        for line in iter_text_lines(resp):
+            if precheck is not None:
+                try:
+                    guarded = precheck(line)
+                except Exception:
+                    guarded = None
+                if guarded is not None:
+                    yield guarded
+                    return
+            for event in parser.feed(line):
+                yield event
+                if event.kind in ("finished", "error"):
+                    return
+    finally:
+        close_quietly(resp)

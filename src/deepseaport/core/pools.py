@@ -51,9 +51,33 @@ def accounts_for_provider(settings, provider_id) -> list:
 
 
 def make_pool(settings, provider_id, current: str = ""):
-    """Build an AccountPool limited to one provider's accounts."""
+    """Build an AccountPool limited to one provider's accounts.
+
+    Canonical per-provider constructor (FROZEN seam): server_routes._pool_for
+    builds multi-mode pools through this; server_routes._pool (selected
+    provider) uses it when no unknown-provider fallback is needed. Keep all
+    pool construction here so the two route helpers never diverge.
+    """
     from ..accounts import AccountPool
     return AccountPool(accounts_for_provider(settings, provider_id), current=current)
+
+
+def needs_provider_pool(settings, provider_id) -> bool:
+    """True when ``provider_id`` selects a dedicated per-provider pool.
+
+    Centralizes the ``pid and is_multi(settings)`` gate that was previously
+    repeated as a ternary in every account route. Empty/blank ids and
+    single-provider mode return False (caller uses the selected-provider
+    pool, preserving the ``deepseaport.server._pool`` monkeypatch seam).
+    Unknown-id fallback still lives in server_routes._pool_for.
+    """
+    pid = str(provider_id or "").strip()
+    if not pid:
+        return False
+    try:
+        return bool(is_multi(settings))
+    except Exception:
+        return False
 
 
 def current_for(settings, provider_id) -> str:

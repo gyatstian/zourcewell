@@ -436,8 +436,8 @@ def _select_provider(settings: Settings) -> None:
     """
     from .core import registry as _reg
 
-    # Short aliases accepted alongside provider ids / numbers.
-    _ALIASES = {"ds": "deepseek"}
+    # Provider alias/match is shared (cli.normalize_provider_id via
+    # _normalize_provider_choice below); no local alias map needed.
 
     try:
         from .core import pools as _pools
@@ -518,12 +518,8 @@ def _select_provider(settings: Settings) -> None:
             if 0 <= idx < len(ids):
                 picked = ids[idx]
         elif choice:
-            # Alias first (e.g. ds -> deepseek), then exact provider id.
-            aliased = _ALIASES.get(choice, choice)
-            for pid in ids:
-                if pid.strip().lower() == aliased:
-                    picked = pid
-                    break
+            # Shared alias+match (cli.normalize_provider_id via thin wrapper).
+            picked = _normalize_provider_choice(choice, ids)
         if not picked:
             _err("Unknown option. Type a number, a provider id, m, or q.")
             continue
@@ -545,24 +541,33 @@ def provider_menu(settings: Settings) -> None:
 
 
 # Short aliases accepted wherever a provider id is typed (account creation,
-# provider gate). deepseek <-> ds.
-_PROVIDER_ALIASES = {"ds": "deepseek"}
+# provider gate). deepseek <-> ds. Canonical map lives in cli.PROVIDER_ALIASES;
+# this name stays importable for backward compat (tests import tui.*).
+try:
+    from .cli import PROVIDER_ALIASES as _PROVIDER_ALIASES
+except Exception:  # pragma: no cover - import fallback
+    _PROVIDER_ALIASES = {"ds": "deepseek"}
 
 
 def _normalize_provider_choice(raw: str, valid_ids: list[str]) -> str:
     """Normalize typed provider to a valid id, resolving aliases.
 
+    Thin adapter over cli.normalize_provider_id (single implementation).
     Returns "" when the choice does not match. Empty input returns "" here;
     callers apply the deepseek default.
     """
-    key = (raw or "").strip().lower()
-    if not key:
+    try:
+        from .cli import normalize_provider_id as _norm_pid
+        return _norm_pid(raw, valid_ids)
+    except Exception:
+        key = (raw or "").strip().lower()
+        if not key:
+            return ""
+        key = _PROVIDER_ALIASES.get(key, key)
+        for pid in valid_ids:
+            if str(pid or "").strip().lower() == key:
+                return str(pid or "").strip().lower()
         return ""
-    key = _PROVIDER_ALIASES.get(key, key)
-    for pid in valid_ids:
-        if str(pid or "").strip().lower() == key:
-            return str(pid or "").strip().lower()
-    return ""
 
 
 def _ask_account_provider(settings: Settings) -> str:
@@ -800,15 +805,21 @@ def accounts_menu(settings: Settings) -> None:
                           provider: str | None = None) -> str:
         """Run Obscura login inside TUI. confirmed=True skips the Y/n prompt."""
         from .accounts import token_help_for as _token_help_for
+        # Shared login-pid resolution (cli.resolve_login_provider_id): explicit
+        # provider wins, else the selected single-mode provider, else deepseek.
         if provider:
-            _pid = (str(provider or "deepseek").strip().lower()) or "deepseek"
+            try:
+                from .cli import resolve_login_provider_id as _resolve_pid
+                _pid = _resolve_pid(settings, provider)
+            except Exception:
+                _pid = (str(provider or "deepseek").strip().lower()) or "deepseek"
         else:
             try:
                 from .core import pools as _pools
                 _pid = _pools.selected_provider(settings)
             except Exception:
                 _pid = "deepseek"
-        _pid = (str(_pid or "deepseek").strip().lower()) or "deepseek"
+            _pid = (str(_pid or "deepseek").strip().lower()) or "deepseek"
         _help = _token_help_for(_pid)
         if not email:
             return ""

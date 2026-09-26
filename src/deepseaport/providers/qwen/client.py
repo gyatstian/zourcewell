@@ -610,9 +610,16 @@ def check_ban(headers: dict, timeout: int = 20) -> tuple[bool, float | None]:
 
 
 def _waf_markers_in_line(line: str) -> bool:
-    """True when a drained line carries Aliyun WAF challenge markers."""
-    low = (line or "").lower()
-    return "aliyun_waf" in low or "aliyuncaptcha" in low or "nc-container" in low
+    """True when a drained line carries Aliyun WAF challenge markers.
+
+    Thin alias over the shared ``protocol.is_waf_body`` (identical
+    substring set); kept so existing ``QC._waf_markers_in_line`` imports
+    keep working while the marker set lives in exactly one place.
+    """
+    try:
+        return bool(P.is_waf_body(line or ""))
+    except Exception:
+        return False
 
 
 def stream_completion(headers: dict, payload: dict,
@@ -639,12 +646,11 @@ def stream_completion(headers: dict, payload: dict,
     if resp.status_code == 200 and not T.is_sse_response(resp):
         # Some errors arrive as JSON with HTTP 200 (e.g. unauthorized
         # envelope). With stream=True the body is not buffered, so resp.json()
-        # is empty — drain via iter_lines.
+        # is empty — drain via iter_lines (shared cap/helpers).
         try:
-            chunks = T.drain_lines(resp, T.JSON_DRAIN_CAP)
-            body = "".join(chunks).strip()
+            body = T.drain_json_text(resp, T.JSON_DRAIN_CAP)
             if _waf_markers_in_line(body):
-                resp.close()
+                T.close_quietly(resp)
                 _log_waf_headers("stream_completion_body", headers)
                 yield StreamEvent(
                     kind="error", code="WAF_CHALLENGE",
@@ -652,7 +658,7 @@ def stream_completion(headers: dict, payload: dict,
                 return
             data = T.loads_lenient(body) if body else {}
             if isinstance(data, dict) and data.get("success") is False:
-                resp.close()
+                T.close_quietly(resp)
                 inner = data.get("data") if isinstance(data.get("data"), dict) else {}
                 code = str(inner.get("code") or data.get("code") or "UPSTREAM_ERROR")
                 msg = str(inner.get("details") or inner.get("message")
@@ -669,7 +675,7 @@ def stream_completion(headers: dict, payload: dict,
                                   ban_until=ban_until)
                 return
             if body:
-                resp.close()
+                T.close_quietly(resp)
                 yield StreamEvent(kind="error", code="UPSTREAM_ERROR",
                                   message=T.truncate_message(body))
                 return
@@ -677,30 +683,21 @@ def stream_completion(headers: dict, payload: dict,
             pass
         except Exception:
             pass
-        try:
-            resp.close()
-        except Exception:
-            pass
+        T.close_quietly(resp)
     if resp.status_code != 200:
         event = T.build_http_error_event(resp, payload)
-        resp.close()
+        T.close_quietly(resp)
         yield event
         return
-    try:
-        parser = QwenStreamParser()
-        for raw in resp.iter_lines():
-            if not raw:
-                continue
-            line = T.decode_line(raw)
-            if _waf_markers_in_line(line):
-                _log_waf_headers("stream_completion_line", headers)
-                yield StreamEvent(
-                    kind="error", code="WAF_CHALLENGE",
-                    message="Qwen completions returned a WAF challenge line")
-                return
-            for event in parser.feed(line):
-                yield event
-                if event.kind in ("finished", "error"):
-                    return
-    finally:
-        resp.close()
+    # Shared decode/close scaffolding (transport.pump_sse); the per-line WAF
+    # guard + Qwen wire parser stay Qwen-specific (DeepSeek uses its own
+    # parser + raw-JSON ban guard).
+    def _qwen_waf_precheck(line: str) -> StreamEvent | None:
+        if _waf_markers_in_line(line):
+            _log_waf_headers("stream_completion_line", headers)
+            return StreamEvent(
+                kind="error", code="WAF_CHALLENGE",
+                message="Qwen completions returned a WAF challenge line")
+        return None
+
+    yield from T.pump_sse(resp, QwenStreamParser(), precheck=_qwen_waf_precheck)

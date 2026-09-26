@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 from dataclasses import dataclass
 from typing import Iterator, Literal
+
+from ...core.transport import BAN_WORD_RE as _SHARED_BAN_RE
+from ...core.transport import has_ban_word as _shared_has_ban_word
+from ...core.transport import parse_json_response as _shared_parse_json
 
 logger = logging.getLogger("deepseaport.protocol")
 
@@ -60,22 +63,15 @@ CHROME_UA = (
 # the same shape under biz_data.chat when the token is still valid.
 BANNED_BIZ_CODES = {"5", "5.0"}
 
-# Word-ish ban match: plain substring "mute" false-positives on "commute" /
-# "transmute" and would 403 + cool down a healthy account, shrinking the
-# pool. Letter boundaries (not \b: "_" must count as a boundary so
-# "is_muted"/"mute_until" still hit) keep true bans while ignoring
-# "commute". "unbanned" intentionally does NOT match (preceded by a letter).
-_BAN_RE = re.compile(
-    r"(?<![a-z])(muted?|suspend\w*|bann?ed?|violat\w*)(?![a-z])",
-    re.IGNORECASE,
-)
+# Ban word-match is shared (core.transport.BAN_WORD_RE): identical regex
+# previously tripled here/Qwen/transport. Local aliases stay so existing
+# ``P._BAN_RE`` / ``P._has_ban_word`` imports keep working; the ban-envelope
+# verdicts below stay DeepSeek-specific.
+_BAN_RE = _SHARED_BAN_RE
 
 
 def _has_ban_word(text: str) -> bool:
-    try:
-        return bool(text and _BAN_RE.search(text))
-    except Exception:
-        return False
+    return _shared_has_ban_word(text)
 
 
 def _as_float(value) -> float | None:
@@ -243,10 +239,7 @@ def with_ban_expiry(msg: str, data: dict) -> str:
 
 def parse_json(resp) -> dict:
     """Best-effort ``resp.json()``: {} on any error, never raises."""
-    try:
-        return resp.json()
-    except Exception:
-        return {}
+    return _shared_parse_json(resp)
 
 
 def _build_headers(*, user_agent: str = "", waf_cookies: str = "", bearer: str = "") -> dict[str, str]:

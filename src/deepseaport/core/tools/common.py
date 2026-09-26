@@ -23,6 +23,26 @@ def _int_env(name: str, default: int) -> int:
 
 MAX_ARGS_CHARS = _int_env("DEEPSEAPORT_MAX_ARGS_CHARS", 200_000)
 MAX_BARE_OBJECTS = _int_env("DEEPSEAPORT_MAX_BARE_OBJECTS", 40)
+# Universal bound for parser scans (json_array/fence/tags/DSML) and total
+# normalized calls. Reuses MAX_BARE_OBJECTS so one env knob bounds work.
+MAX_SCAN_OBJECTS = MAX_BARE_OBJECTS
+MAX_TOTAL_CALLS = MAX_BARE_OBJECTS
+MAX_PARAMS_PER_INVOKE = 64
+# Lenient-repair budget: skip Python-loop repairs on huge candidates that
+# would be dropped as oversize anyway (strict path still attempted).
+_LENIENT_REPAIR_BUDGET = MAX_ARGS_CHARS + 16_384
+
+# C-level fast guards (avoid Python-loop repair passes that would be no-ops).
+_TRAILING_COMMA_RE = re.compile(r",\s*[}\]]")
+_UNQUOTED_KEY_HINT_RE = re.compile(r"[{,]\s*[A-Za-z_]")
+_OTHER_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_CLEAN_DSML_STRICT_1 = re.compile(r"<\/?\|\|DSML\|\|[^>]*>", re.IGNORECASE)
+_CLEAN_DSML_STRICT_2 = re.compile(r"<\/?\|\|[^>]*>", re.IGNORECASE)
+_CLEAN_DSML_FORGIVING_1 = re.compile(
+    r"(?:<|&[lL][tT];)/?\|{0,2}\s*DSML\s*\|{0,2}[^>]*?(?:>|&[gG][tT];)",
+    re.IGNORECASE)
+_CLEAN_DSML_FORGIVING_2 = re.compile(
+    r"(?:<|&[lL][tT];)/?\|{1,2}[^>]*?(?:>|&[gG][tT];)", re.IGNORECASE)
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -244,6 +264,54 @@ def _replace_python_literals(text: str) -> str:
     return "".join(out)
 
 
+def _try_lenient_repairs(candidate: str):
+    """Repair path assuming strict ``json.loads`` already failed.
+
+    Split out so ``_normalize_args`` avoids a duplicate strict parse.
+    Fast C-level guards skip Python-loop passes that would be no-ops;
+    huge candidates skip repairs (would be dropped as oversize anyway).
+    """
+    if len(candidate) > _LENIENT_REPAIR_BUDGET:
+        return _LOOSE_JSON_MISS
+    text = candidate
+    # Escape control chars only when raw controls exist.
+    if ("\n" in text or "\r" in text or "\t" in text
+            or _OTHER_CONTROL_RE.search(text) is not None):
+        text = _escape_control_chars_in_strings(text)
+    # Trailing commas only when ",}" / ",]" pattern exists.
+    if "," in text and _TRAILING_COMMA_RE.search(text) is not None:
+        text = _remove_trailing_commas(text)
+    # Bare keys only when "{word" / ",word" hint exists.
+    if _UNQUOTED_KEY_HINT_RE.search(text) is not None:
+        text = _quote_unquoted_keys(text)
+    # Python literals only when those words appear.
+    if ("True" in text or "False" in text or "None" in text):
+        text = _replace_python_literals(text)
+    if text is not candidate:
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+    else:
+        # No repair applied and strict already failed: second loads would
+        # fail identically, skip it and try literal_eval below when plausible.
+        pass
+    # Python-style dicts (single quotes / True / None) still occur when a
+    # model is asked for an "arguments" object.
+    if ("'" in candidate or "True" in candidate or "False" in candidate
+            or "None" in candidate):
+        if len(candidate) > _LENIENT_REPAIR_BUDGET:
+            return _LOOSE_JSON_MISS
+        try:
+            import ast
+            value = ast.literal_eval(candidate)
+            if isinstance(value, (dict, list)):
+                return value
+        except Exception:
+            pass
+    return _LOOSE_JSON_MISS
+
+
 def _loads_json_lenient(text: str):
     """Parse JSON with small, safe repairs for common model-output damage.
 
@@ -259,24 +327,7 @@ def _loads_json_lenient(text: str):
         return json.loads(candidate)
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
-    repaired = _replace_python_literals(
-        _quote_unquoted_keys(
-            _remove_trailing_commas(
-                _escape_control_chars_in_strings(candidate))))
-    try:
-        return json.loads(repaired)
-    except (json.JSONDecodeError, ValueError, TypeError):
-        pass
-    # Python-style dicts (single quotes / True / None) still occur when a
-    # model is asked for an "arguments" object.
-    try:
-        import ast
-        value = ast.literal_eval(candidate)
-        if isinstance(value, (dict, list)):
-            return value
-    except Exception:
-        pass
-    return _LOOSE_JSON_MISS
+    return _try_lenient_repairs(candidate)
 
 
 class _OversizeArgs(ValueError):
@@ -305,8 +356,10 @@ def _normalize_args(args, call_idx: int, max_args_chars: int | None = None) -> s
         try:
             json.loads(candidate)
             return candidate
-        except json.JSONDecodeError:
-            repaired = _loads_json_lenient(candidate)
+        except (json.JSONDecodeError, ValueError):
+            # Strict already failed: repair directly without a second strict
+            # attempt inside _loads_json_lenient.
+            repaired = _try_lenient_repairs(candidate)
             if repaired is not _LOOSE_JSON_MISS:
                 dumped = json.dumps(repaired, ensure_ascii=False)
                 if len(dumped) > limit:
@@ -333,8 +386,17 @@ def _normalize_calls(
 
     Exact name match wins; case-insensitive fallback maps to the canonical
     name so harnesses don't reject `Read` vs `read`. Unknown names and
-    oversize arguments are dropped.
+    oversize arguments are dropped. Total calls are capped at
+    MAX_TOTAL_CALLS so per-argument limits can't combine into unbounded
+    memory (first N win, rest dropped with indexes preserved).
     """
+    if len(raw_calls) > MAX_TOTAL_CALLS:
+        # Bound total work: callers see first N, extras reported as dropped.
+        # Defer logging to per-call path; keep indexes stable.
+        truncated_extra = list(range(MAX_TOTAL_CALLS, len(raw_calls)))
+        raw_calls = raw_calls[:MAX_TOTAL_CALLS]
+    else:
+        truncated_extra: list[int] = []
     lower_map: dict[str, str] = {}
     if valid_names:
         for n in valid_names:
@@ -378,6 +440,9 @@ def _normalize_calls(
             "type": "function",
             "function": {"name": canonical, "arguments": norm_args},
         })
+    if truncated_extra:
+        dropped.extend(truncated_extra)
+        dropped.sort()
     return calls, dropped
 
 
@@ -397,15 +462,21 @@ def _clean_rest(rest: str, forgiving: bool = False) -> str:
     while lines and (_THOUGHT_LINE_RE.match(lines[0]) or lines[0].strip() == ""):
         lines.pop(0)
     cleaned = "\n".join(lines).strip()
-    # Remove stray DSML marker lines left after extraction.
+    # Remove stray DSML marker lines left after extraction. Guard with
+    # substring checks so plain answers skip regex work; patterns are
+    # precompiled (no per-call re.compile).
+    low = cleaned.lower()
+    if "<" not in cleaned and "&lt;" not in low and "dsml" not in low:
+        return cleaned
     if forgiving:
-        cleaned = re.sub(r"(?:<|&[lL][tT];)/?\|{0,2}\s*DSML\s*\|{0,2}[^>]*?(?:>|&[gG][tT];)",
-                         "", cleaned, flags=re.IGNORECASE).strip()
-        cleaned = re.sub(r"(?:<|&[lL][tT];)/?\|{1,2}[^>]*?(?:>|&[gG][tT];)",
-                         "", cleaned).strip()
+        cleaned = _CLEAN_DSML_FORGIVING_1.sub("", cleaned).strip()
+        # Second pass only when pipe markers may remain.
+        if "|" in cleaned or "&lt;" in cleaned.lower():
+            cleaned = _CLEAN_DSML_FORGIVING_2.sub("", cleaned).strip()
     else:
-        cleaned = re.sub(r"<\/?\|\|DSML\|\|[^>]*>", "", cleaned, flags=re.IGNORECASE).strip()
-        cleaned = re.sub(r"<\/?\|\|[^>]*>", "", cleaned).strip()
+        cleaned = _CLEAN_DSML_STRICT_1.sub("", cleaned).strip()
+        if "|" in cleaned:
+            cleaned = _CLEAN_DSML_STRICT_2.sub("", cleaned).strip()
     return cleaned
 
 
@@ -429,6 +500,29 @@ def _strip_spans(text: str, spans: list[tuple[int, int]]) -> str:
     return "".join(parts)
 
 
+def _contains_word(low_text: str, low_name: str) -> bool:
+    """Case-folded word match without per-tool regex compile.
+
+    Same semantics as ``(?<!\\w)name(?!\\w)``: neighbors must not be
+    ``[A-Za-z0-9_]``. Uses C-level ``str.find`` loop.
+    """
+    if not low_name:
+        return False
+    start = 0
+    nl = len(low_name)
+    tl = len(low_text)
+    while True:
+        idx = low_text.find(low_name, start)
+        if idx < 0:
+            return False
+        before = low_text[idx - 1] if idx > 0 else ""
+        after = low_text[idx + nl] if idx + nl < tl else ""
+        if ((not before or not (before.isalnum() or before == "_"))
+                and (not after or not (after.isalnum() or after == "_"))):
+            return True
+        start = idx + 1
+
+
 def _looks_like_tool_attempt(text: str, valid: set[str] | None) -> bool:
     low = text.lower()
     if '"tool_calls"' in low or "<tool_call" in low or "<function_call" in low or "dsml" in low or "<invoke" in low:
@@ -437,7 +531,7 @@ def _looks_like_tool_attempt(text: str, valid: set[str] | None) -> bool:
         for n in valid:
             if isinstance(n, str) and n:
                 # Word match: substring "read" must not fire on "already"/"bread".
-                if re.search(r"(?<!\w)" + re.escape(n) + r"(?!\w)", text, re.IGNORECASE):
+                if _contains_word(low, n.lower()):
                     return True
     return False
 

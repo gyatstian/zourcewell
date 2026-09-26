@@ -620,6 +620,12 @@ def dispatch_terminal(classify_fn: Callable[[str | None], object],
     Single dispatch: ``classify_fn`` (the provider's ``classify_error``)
     produces one kind, then the handler for that kind raises. No string
     matching lives at call sites.
+
+    Uniform terminal contract (all providers): handlers take
+    ``(app, item, prep, token, error, login_note, ban_until)``. Providers
+    without a browser note pass ``login_note=None``; providers without a
+    ban envelope pass ``ban_until=None``. ``*extra`` keeps old 6-arg
+    callers working during migration, but new code passes both.
     """
     kind = classify_fn(error)
     (handlers.get(kind, fallback))(app, item, prep, token, error, *extra)
@@ -698,19 +704,26 @@ async def parse_stream_calls(prep: dict, content: str,
     a bare debug preview — a stop-with-raw-markup reply is otherwise
     indistinguishable from a plain refusal. The ``parse_fn`` seam stays for
     tests; diagnostics always come from the real parser for logging only.
+    No core->server import: the default resolves via the shared
+    ``core.openai._resolve_parse_fn`` soft lookup (server patch wins when
+    loaded, else the real parser).
     """
     _real_parse = None
     _real_ex = None
     try:
-        from .tools import parse_tool_calls as _rp
-        from .tools.parser import parse_tool_calls_ex as _re
-        _real_parse, _real_ex = _rp, _re
+        from .openai import _resolve_parse_fn as _resolve
+        parse_fn, _real_parse, _real_ex = _resolve(parse_fn)
     except Exception:
-        pass
-    if parse_fn is None:
-        parse_fn = _real_parse
+        try:
+            from .tools import parse_tool_calls as _rp
+            from .tools.parser import parse_tool_calls_ex as _re
+            _real_parse, _real_ex = _rp, _re
+        except Exception:
+            pass
         if parse_fn is None:
-            from .tools import parse_tool_calls as parse_fn  # type: ignore[no-redef]
+            parse_fn = _real_parse
+            if parse_fn is None:
+                from .tools import parse_tool_calls as parse_fn  # type: ignore[no-redef]
     if truncated_fn is None:
         from .tools import looks_truncated_tool_attempt as truncated_fn  # type: ignore[no-redef]
     limit = prep.get("tool_args_max_chars")
@@ -754,8 +767,8 @@ async def parse_stream_calls(prep: dict, content: str,
             logger.warning("stream tool call looks truncated model=%s preview=%.200s",
                            prep.get("model"), (content or "")[:200])
         else:
-            # Rich miss log (same helper shape as core.openai): diagnostics
-            # say unknown-name vs oversize vs format drift.
+            # Rich miss log (single home in core.openai.format_miss_trail):
+            # diagnostics say unknown-name vs oversize vs format drift.
             try:
                 if diagnostics is None and _real_ex is not None:
                     from .tools import _valid_names as _vn
@@ -770,20 +783,11 @@ async def parse_stream_calls(prep: dict, content: str,
                         valid = _vn(prep.get("tools"))
                     except Exception:
                         valid = None
-                    parts = []
-                    for d in diagnostics or []:
-                        try:
-                            parts.append(
-                                f"{d.get('format')}:matched="
-                                f"{int(bool(d.get('matched')))} "
-                                f"kept={d.get('kept', 0)} "
-                                f"dropped={list(d.get('dropped') or [])} "
-                                f"raw={d.get('raw', 0)}")
-                        except Exception:
-                            continue
-                    trail = "; ".join(parts) if parts else "no formats matched"
-                    if valid:
-                        trail += f" valid={sorted(valid)}"
+                    try:
+                        from .openai import format_miss_trail as _fmt
+                        trail = _fmt(diagnostics, valid)
+                    except Exception:
+                        trail = None
                 else:
                     trail = None
                     if diagnostics is not None:
@@ -792,21 +796,11 @@ async def parse_stream_calls(prep: dict, content: str,
                             valid2 = _vn2(prep.get("tools"))
                         except Exception:
                             valid2 = None
-                        parts2 = []
-                        for d in diagnostics or []:
-                            try:
-                                parts2.append(
-                                    f"{d.get('format')}:matched="
-                                    f"{int(bool(d.get('matched')))} "
-                                    f"kept={d.get('kept', 0)} "
-                                    f"dropped={list(d.get('dropped') or [])} "
-                                    f"raw={d.get('raw', 0)}")
-                            except Exception:
-                                continue
-                        trail = ("; ".join(parts2) if parts2
-                                 else "no formats matched")
-                        if valid2:
-                            trail += f" valid={sorted(valid2)}"
+                        try:
+                            from .openai import format_miss_trail as _fmt2
+                            trail = _fmt2(diagnostics, valid2)
+                        except Exception:
+                            trail = None
                 if trail:
                     logger.warning(
                         "stream tool-call miss model=%s forgiving=%s %s "
@@ -936,3 +930,81 @@ def emit_to_loop(loop: asyncio.AbstractEventLoop, out: asyncio.Queue, item: tupl
         loop.call_soon_threadsafe(out.put_nowait, item)
     except RuntimeError:
         pass
+
+
+def live_emit_pair(on_content, on_thinking):
+    """One LiveEmitTracker + wrapped callbacks (shared _run_completion_core prelude).
+
+    Returns ``(tracker, wrapped_content, wrapped_thinking)``. Wrapping is
+    unconditional so the partial-emit guard sees live deltas even when a
+    caller passes callbacks selectively; call sites pass
+    ``wrapped if original is not None else None`` into ``_do_attempt``.
+    """
+    tracker = LiveEmitTracker()
+    return tracker, tracker.wrap(on_content), tracker.wrap(on_thinking)
+
+
+def ban_until_of(outcome) -> float | None:
+    """Best-effort ban-expiry from an attempt outcome (None when absent)."""
+    try:
+        return getattr(outcome, "ban_until", None)
+    except Exception:
+        return None
+
+
+def new_producer_context(prep: dict, client_timeout: float,
+                         consumer_grace: float = 10.0):
+    """Shared _stream_completion prelude: context + model + emit closures.
+
+    Owns ``new_stream_context`` + ``prep["model"]`` + the running loop +
+    ``_emit``/``_put`` pair so the three providers share one queue/cancel/
+    emit shape. The producer bodies stay provider-specific (failover entry
+    vs live token tail); the bounded-executor submit stays at the call site
+    so the executor property remains greppable per provider.
+    """
+    cid, created, out, cancel_event, consumer_timeout = new_stream_context(
+        prep, client_timeout, consumer_grace)
+    model = prep["model"]
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    def _emit(item: tuple) -> None:
+        if loop is not None:
+            emit_to_loop(loop, out, item)
+        else:  # pragma: no cover - defensive (no running loop in tests)
+            try:
+                out.put_nowait(item)
+            except Exception:
+                pass
+
+    def _put(kind: str, text: str) -> None:
+        if text:
+            _emit((kind, text))
+
+    return cid, created, out, cancel_event, consumer_timeout, model, _emit, _put
+
+
+async def consume_stream(out: asyncio.Queue, prep: dict, live: bool,
+                         cid: str, created: int, model: str,
+                         consumer_timeout: float,
+                         parse_fn: Callable | None = None,
+                         truncated_fn: Callable | None = None,
+                         cancel_event: threading.Event | None = None):
+    """Shared _stream_completion tail: drain + cancel on close.
+
+    Owns the ``drain_stream_queue`` consumer and the ``cancel_event.set()``
+    that frees the account slot on disconnect/completion. Yields SSE bytes.
+    """
+    try:
+        async for frame in drain_stream_queue(
+                out, prep, live, cid, created, model, consumer_timeout,
+                parse_fn, truncated_fn):
+            yield frame
+    finally:
+        try:
+            if cancel_event is not None:
+                cancel_event.set()
+        except Exception:
+            pass

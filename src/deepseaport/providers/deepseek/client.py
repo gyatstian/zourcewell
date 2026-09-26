@@ -168,6 +168,23 @@ def _ban_stream_event(data) -> P.StreamEvent | None:
     return None
 
 
+def _raw_json_ban_precheck(line: str) -> P.StreamEvent | None:
+    """Inline raw-JSON ban guard for the SSE pump (DeepSeek envelope only).
+
+    Raw JSON bans can arrive inside an event-stream body (no ``data:``
+    prefix). Returns the ban/error event to stop the pump, else None to
+    keep feeding the wire parser (which stays DeepSeek-specific).
+    """
+    stripped = (line or "").strip()
+    if not stripped.startswith("data:") and stripped.startswith("{"):
+        data3 = T.loads_lenient(stripped)
+        if isinstance(data3, dict):
+            event3 = _ban_stream_event(data3)
+            if event3 is not None:
+                return event3
+    return None
+
+
 def stream_completion(headers: dict, payload: dict,
                       timeout: int = DEFAULT_TIMEOUT) -> Iterator[P.StreamEvent]:
     """POST completion and yield parsed events. Caller must close on break."""
@@ -180,57 +197,33 @@ def stream_completion(headers: dict, payload: dict,
         data = _json(resp)
         event = _ban_stream_event(data) if data else None
         if event is not None:
-            resp.close()
+            T.close_quietly(resp)
             yield event
             return
         # Streaming mode: body arrives as raw JSON lines, not SSE "data:".
         try:
-            chunks = T.drain_lines(resp, T.JSON_DRAIN_CAP)
-            resp.close()
-            if chunks:
-                body = "".join(chunks).strip()
+            body = T.drain_json_text(resp, T.JSON_DRAIN_CAP)
+            T.close_quietly(resp)
+            if body:
                 data2 = T.loads_lenient(body)
                 event2 = _ban_stream_event(data2) if isinstance(data2, dict) else None
                 if event2 is not None:
                     yield event2
                     return
-                if body:
-                    yield P.StreamEvent(kind="error", code="UPSTREAM_ERROR",
-                                        message=T.truncate_message(body))
-                    return
+                yield P.StreamEvent(kind="error", code="UPSTREAM_ERROR",
+                                    message=T.truncate_message(body))
+                return
         except StopIteration:
             pass
         except Exception:
             pass
-        try:
-            resp.close()
-        except Exception:
-            pass
+        T.close_quietly(resp)
         # Fall through to SSE loop (empty body closes without events).
     if resp.status_code != 200:
         event = T.build_http_error_event(resp, payload)
-        resp.close()
+        T.close_quietly(resp)
         yield event
         return
-    try:
-        parser = StreamParser()
-        for raw in resp.iter_lines():
-            if not raw:
-                continue
-            line = T.decode_line(raw)
-            # Raw JSON ban can also arrive inside an event-stream body.
-            stripped = line.strip()
-            if not stripped.startswith("data:") and stripped.startswith("{"):
-                data3 = T.loads_lenient(stripped)
-                if isinstance(data3, dict):
-                    event3 = _ban_stream_event(data3)
-                    if event3 is not None:
-                        yield event3
-                        return
-                continue
-            for event in parser.feed(line):
-                yield event
-                if event.kind in ("finished", "error"):
-                    return
-    finally:
-        resp.close()
+    # Shared decode/close scaffolding; wire parser + ban precheck stay
+    # DeepSeek-specific (Qwen uses its own parser + WAF guard).
+    yield from T.pump_sse(resp, StreamParser(), precheck=_raw_json_ban_precheck)

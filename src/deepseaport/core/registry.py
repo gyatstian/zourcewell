@@ -98,3 +98,29 @@ def resolved_ids(provider_ids: list[str] | None) -> list[str]:
         if key and key not in out and key in _REGISTRY:
             out.append(key)
     return out or ["deepseek"]
+
+
+def catalogue_tuples_for(settings) -> dict[str, tuple[bool, bool, str]]:
+    """Central MODELS-shaped catalogue for ``settings`` (no MODELS fallback).
+
+    Union of ``tuple_spec()`` for ``resolved_ids(active_provider_ids(...))``.
+    Single home for the loop previously inline in ``server.active_models``;
+    callers fall back to ``dict(MODELS)`` when this returns empty (or when
+    settings is None). Never imports ``deepseaport.server`` (no cycle).
+    """
+    _ensure_loaded()
+    try:
+        from . import pools as _pools
+        ids = resolved_ids(_pools.active_provider_ids(settings))
+    except Exception:
+        ids = ["deepseek"]
+    out: dict[str, tuple[bool, bool, str]] = {}
+    for pid in ids:
+        provider = _REGISTRY.get(pid)
+        if provider is None:
+            continue
+        try:
+            out.update(provider.tuple_spec())
+        except Exception:
+            continue
+    return out

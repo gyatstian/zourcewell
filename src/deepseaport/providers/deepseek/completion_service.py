@@ -170,10 +170,10 @@ def _is_upstream_invalid_error(error: str | None) -> bool:
 
 
 def _error_text(code: str | None, message: str | None) -> str:
-    """Single "CODE: message" formatter (the string classify_error parses)."""
-    code = (code or "").strip()
-    message = (message or "").strip()
-    return f"{code}: {message}" if code else message
+    # Compat alias: single formatter lives in core.engine (qwen/opencode
+    # already alias it). Kept as a def (not a plain assignment) so existing
+    # ``completion_service._error_text`` patch seams keep working.
+    return _engine.error_text(code, message)
 
 
 def classify_error(error: str | None) -> RetryKind | None:
@@ -889,9 +889,8 @@ def _run_completion_core(
         # Overload-after-partial-emit guard lives in core.engine
         # (LiveEmitTracker): a re-stream after output left would duplicate
         # text and corrupt tool-call JSON.
-        _emit_tracker = _engine.LiveEmitTracker()
-        _wrapped_content = _emit_tracker.wrap(on_content)
-        _wrapped_thinking = _emit_tracker.wrap(on_thinking)
+        _emit_tracker, _wrapped_content, _wrapped_thinking = _engine.live_emit_pair(
+            on_content, on_thinking)
 
         def _do_attempt(h: dict, p: dict) -> None:
             nonlocal content, think, error, usage_total, stream_ban_until
@@ -901,10 +900,7 @@ def _run_completion_core(
                 on_thinking=(_wrapped_thinking if on_thinking is not None else None),
                 cancel_event=cancel_event)
             content, think, error, usage_total = outcome
-            try:
-                cur_ban = getattr(outcome, "ban_until", None)
-            except Exception:
-                cur_ban = None
+            cur_ban = _engine.ban_until_of(outcome)
             if cur_ban is not None:
                 stream_ban_until = cur_ban
 
@@ -1061,22 +1057,14 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
     """Async generator: buffered (default) or live deltas, tools parsed at end.
 
     Producer (account-holding thread) is DeepSeek-specific only in the
-    failover entrypoint; the SSE consumer (chunk framing, tool tail,
-    timeout/errors) is engine-owned via ``drain_stream_queue``.
+    failover entrypoint; queue/cancel/emit shape + SSE consumer are
+    engine-owned (``new_producer_context`` / ``consume_stream``).
     """
-    loop = asyncio.get_running_loop()
     settings = _app_settings(app)
     live = str(getattr(settings, "stream_mode", "live")).lower() == "live"
-    cid, created, out, cancel_event, consumer_timeout = _engine.new_stream_context(
+    (cid, created, out, cancel_event, consumer_timeout, model,
+     _emit, _put) = _engine.new_producer_context(
         prep, DS.DEFAULT_TIMEOUT, _CONSUMER_GRACE_SECONDS)
-    model = prep["model"]
-
-    def _emit(item: tuple) -> None:
-        _engine.emit_to_loop(loop, out, item)
-
-    def _put(kind: str, text: str) -> None:
-        if text:
-            _emit((kind, text))
 
     def _produce(*, live: bool) -> None:
         # Single publisher: buffered and live differ only in callbacks.
@@ -1119,12 +1107,8 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
     except RuntimeError:
         # Executor shut down (interpreter exit): fall back to a raw thread.
         threading.Thread(target=produce_live if live else produce_buffered, daemon=True).start()
-    try:
-        async for frame in _engine.drain_stream_queue(
-                out, prep, live, cid, created, model, consumer_timeout,
-                _parse_tool_calls_local, looks_truncated_tool_attempt):
-            yield frame
-    finally:
-        # Generator closed (client disconnect, cancellation, completion): tell
-        # the producer to stop at the next event so the account lock frees.
-        cancel_event.set()
+    async for frame in _engine.consume_stream(
+            out, prep, live, cid, created, model, consumer_timeout,
+            _parse_tool_calls_local, looks_truncated_tool_attempt,
+            cancel_event):
+        yield frame

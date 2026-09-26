@@ -9,10 +9,13 @@ compatibility (tests and tui import the historical names from there).
 
 from __future__ import annotations
 
+import logging
 import time
 import urllib.request
 
 import uvicorn
+
+logger = logging.getLogger("deepseaport.server_runner")
 
 
 def _watch_stop_keys(server) -> None:
@@ -288,6 +291,19 @@ def _run_server(settings, args, ensure_free=None) -> int:
     if workers != 1:
         # Multi-worker spawns subprocesses; Esc listener can't reach them.
         # Ctrl+C still stops; TUI main_menu loop returns to menu.
+        # Explicit runtime limit: singleflight (token refresh/login backoff),
+        # the config-save lock, and the ban-label TTL cache are process-local,
+        # so N workers duplicate warmups and last-writer-win on config.json
+        # (atomic os.replace keeps valid JSON). Run one worker per port /
+        # per config instead.
+        msg = (f"--workers {workers}: process-local state (token-refresh "
+               "singleflight, login backoff, config-save lock) does not cross "
+               "workers; concurrent saves last-writer-win. Prefer --workers 1.")
+        try:
+            logger.warning(msg)
+        except Exception:
+            pass
+        print(f"WARNING: {msg}")
         try:
             uvicorn.run(app, host=host, port=port,
                         log_level=log_level, workers=workers)

@@ -21,6 +21,17 @@ logger = logging.getLogger("deepseaport.accounts")
 
 COOLDOWN_SECONDS = 120
 _POLL_INTERVAL = 0.05
+
+
+def _acquire_remaining(deadline: float) -> float:
+    """Remaining wait for one acquire poll, clamped to (_POLL_INTERVAL].
+
+    Single home for the deadline math shared by acquire()/aacquire().
+    The wait mechanism stays split on purpose: sync uses the _SLOT_COND
+    event wake (release() notifies), async uses asyncio.sleep (a threading
+    Condition cannot park the event loop without a real bridge).
+    """
+    return min(_POLL_INTERVAL, max(0.001, deadline - time.monotonic()))
 # Event-driven wake for acquire(): release() notifies so waiters wake
 # immediately instead of sleeping the full 50ms poll. Wait timeout stays
 # _POLL_INTERVAL so cooldown/ban expiry behaviour is unchanged.
@@ -515,9 +526,9 @@ class AccountPool:
                 raise TimeoutError("no DeepSeek account free (busy or cooldown)")
             # Event-driven: wake immediately on release(), else re-poll after
             # _POLL_INTERVAL (same timeout/behavior as the old time.sleep).
-            remaining = max(0.001, deadline - time.monotonic())
+            remaining = _acquire_remaining(deadline)
             with _SLOT_COND:
-                _SLOT_COND.wait(timeout=min(_POLL_INTERVAL, remaining))
+                _SLOT_COND.wait(timeout=remaining)
 
     async def aacquire(self, timeout: float = 60, allow_failover: bool = True) -> PooledAccount:
         """Async acquire: same rotation/skip semantics, no worker thread held.
@@ -537,7 +548,7 @@ class AccountPool:
                 return got
             if time.monotonic() >= deadline:
                 raise TimeoutError("no DeepSeek account free (busy or cooldown)")
-            await asyncio.sleep(min(_POLL_INTERVAL, max(0.001, deadline - time.monotonic())))
+            await asyncio.sleep(_acquire_remaining(deadline))
 
     @contextmanager
     def slot(self, timeout: float = 60, allow_failover: bool = True) -> Iterator[PooledAccount]:
@@ -653,6 +664,9 @@ def check_ban_for_token(token: str, timeout: int = BAN_CHECK_TIMEOUT,
 # 12s). Cache for BAN_LABEL_TTL seconds; TUI reads the cache instantly and
 # refreshes in background so menu render never blocks on network.
 BAN_LABEL_TTL = 60.0
+# Bound on parallel ban-probe threads: one short-lived thread per account,
+# capped so a 50-account pool never piles 50 concurrent probes/threads.
+_BAN_PROBE_MAX_WORKERS = 8
 _BAN_CACHE_LOCK = threading.Lock()
 _BAN_CACHE: dict = {"ts": 0.0, "key": None, "result": {}}
 _BAN_REFRESH_INFLIGHT = False
@@ -756,7 +770,8 @@ def refresh_ban_labels_background(accounts: list[AccountConfig] | None,
                 with _BAN_CACHE_LOCK:
                     _BAN_REFRESH_INFLIGHT = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        threading.Thread(target=_run, daemon=True,
+                         name="ds-ban-refresh").start()
     except Exception:
         pass
 
@@ -815,7 +830,9 @@ def collect_ban_labels(accounts: list[AccountConfig],
             return ident, False, None
 
     try:
-        with _fut.ThreadPoolExecutor(max_workers=min(8, len(targets))) as ex:
+        with _fut.ThreadPoolExecutor(
+                max_workers=min(_BAN_PROBE_MAX_WORKERS, len(targets)),
+                thread_name_prefix="ds-ban-probe") as ex:
             for ident, banned, until in ex.map(_one, targets):
                 if banned:
                     out[ident] = until

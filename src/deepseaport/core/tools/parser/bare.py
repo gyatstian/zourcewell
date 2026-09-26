@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from ..common import (
     MAX_BARE_OBJECTS,
@@ -15,6 +16,10 @@ from ..common import (
 )
 
 logger = logging.getLogger("deepseaport.tools")
+
+# Near-miss counter for diagnostics only (unknown-name {"name": ...} shapes).
+# Module-level so the success/miss path never recompiles per call.
+_BARE_NAME_RE = re.compile(r'["\']name["\']\s*:\s*["\']([^"\']{1,256})["\']')
 
 
 def _parse_bare_name_objects(
@@ -34,6 +39,9 @@ def _parse_bare_name_objects(
     count = 0
     pos = 0
     n = len(text)
+    # Fast exit: no name/function marker means no bare tool shape.
+    if '"name"' not in text and "'name'" not in text and '"function"' not in text:
+        return raw, spans
     while pos < n:
         if count >= limit:  # bound scan on long replies (tunable)
             break
@@ -46,6 +54,10 @@ def _parse_bare_name_objects(
             continue
         count += 1
         pos = start + len(obj_text)
+        # Skip lenient repair for objects without tool shape (code samples).
+        if ('"name"' not in obj_text and "'name'" not in obj_text
+                and '"function"' not in obj_text):
+            continue
         obj = _loads_json_lenient(obj_text)
         if obj is _LOOSE_JSON_MISS:
             continue
@@ -85,4 +97,21 @@ def try_parse_bare(text, valid, valid_or_none, limit_args, limit_bare, forgiving
                 # Strip only the spans that survived normalization.
                 rest = _clean_rest(_strip_spans(text, bare_spans), forgiving_on)
                 return calls, rest
+            return None, None
+        # No valid-name candidates: record unknown-name near-miss so
+        # diagnostics distinguishes plain answers (no trail) from
+        # near-misses (matched=False trail). Bounded C-level scan only.
+        if diagnostics is not None and ('"name"' in text or "'name'" in text
+                                        or '"function"' in text):
+            cap = limit_bare if limit_bare is not None else MAX_BARE_OBJECTS
+            # Double + single quoted name values (lenient shapes included).
+            found = 0
+            for _m in _BARE_NAME_RE.finditer(text):
+                found += 1
+                if found >= cap:
+                    break
+            if found:
+                diagnostics.append({"format": "bare", "matched": False,
+                                    "kept": 0, "dropped": list(range(found)),
+                                    "raw": found})
     return None, None

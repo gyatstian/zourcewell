@@ -1,4 +1,11 @@
-"""Provider-neutral OpenAI response shaping: shared by all web2api providers. Tool parsing resolves through `deepseaport.server.parse_tool_calls` at call time so tests keep patching it."""
+"""Provider-neutral OpenAI response shaping: shared by all web2api providers.
+
+Tool parsing resolves to ``core.tools`` directly (no core->server import,
+no cycle). When ``deepseaport.server`` is already loaded, its (possibly
+monkeypatched) ``parse_tool_calls`` wins via a soft ``sys.modules`` lookup
+so tests patching ``deepseaport.server.parse_tool_calls`` keep working;
+otherwise the real parser is used. An explicit ``parse_fn`` overrides both.
+"""
 
 from __future__ import annotations
 
@@ -61,14 +68,15 @@ def should_emit_usage(prep: dict) -> bool:
         return False
 
 
-def _miss_summary(diagnostics: list[dict] | None,
-                  valid: set[str] | None = None) -> str:
+def format_miss_trail(diagnostics: list[dict] | None,
+                      valid: set[str] | None = None) -> str:
     """Compact one-line summary of parse_tool_calls_ex diagnostics.
 
     Turns the per-format trail into an operator-actionable hint:
     which format almost matched (matched but kept 0 = unknown-name or
     oversize drop), vs no format matched at all (format drift / plain
-    answer). Used by both buffered and streaming miss logs.
+    answer). Used by both buffered and streaming miss logs (single home;
+    engine imports this instead of an inline copy).
     """
     try:
         parts: list[str] = []
@@ -86,6 +94,35 @@ def _miss_summary(diagnostics: list[dict] | None,
         return trail
     except Exception:
         return "diagnostics unavailable"
+
+
+def _miss_summary(diagnostics: list[dict] | None,
+                  valid: set[str] | None = None) -> str:
+    """Backward-compat alias for :func:`format_miss_trail`."""
+    return format_miss_trail(diagnostics, valid)
+
+
+def _resolve_parse_fn(explicit=None):
+    """Return (parse_fn, real_parse, real_ex) without importing server.
+
+    Soft seam: when ``deepseaport.server`` is already in ``sys.modules``
+    (normal runtime + tests), its ``parse_tool_calls`` attribute wins so
+    monkeypatched fakes keep working. No import is forced, so core never
+    depends on server and no cycle is created. Explicit arg wins over both.
+    """
+    from .tools.parser import parse_tool_calls as _real_parse
+    from .tools.parser import parse_tool_calls_ex as _real_ex
+    if explicit is not None:
+        return explicit, _real_parse, _real_ex
+    try:
+        import sys as _sys
+        _mod = _sys.modules.get("deepseaport.server")
+        _cand = getattr(_mod, "parse_tool_calls", None) if _mod is not None else None
+        if callable(_cand):
+            return _cand, _real_parse, _real_ex
+    except Exception:
+        pass
+    return _real_parse, _real_parse, _real_ex
 
 
 def _log_tool_miss(prep: dict, content: str, where: str = "response") -> None:
@@ -134,11 +171,10 @@ def _log_tool_dropped(prep: dict, dropped: list[int] | None,
         pass
 
 
-def _openai_response(prep: dict, result: dict) -> dict:
-    # Late-bound so tests can monkeypatch deepseaport.server.parse_tool_calls.
-    from ..server import parse_tool_calls
-    from .tools.parser import parse_tool_calls as _real_parse
-    from .tools.parser import parse_tool_calls_ex as _real_ex
+def _openai_response(prep: dict, result: dict, parse_fn=None) -> dict:
+    # No core->server import: soft sys.modules lookup keeps the
+    # deepseaport.server.parse_tool_calls monkeypatch seam without a cycle.
+    parse_tool_calls, _real_parse, _real_ex = _resolve_parse_fn(parse_fn)
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
     limit = prep.get("tool_args_max_chars")

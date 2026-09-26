@@ -113,19 +113,22 @@ def _delete_session_bg(session_id: str | None, enabled: bool = True) -> None:
         pass
 
 
-def _terminal_rate_limit(app, item, prep, token, error, stream_ban_until) -> None:
+def _terminal_rate_limit(app, item, prep, token, error, login_note, stream_ban_until) -> None:
+    # login_note/stream_ban_until ignored: no accounts, dispatch uniformity only.
     _engine.raise_rate_limit("Opencode", error)
 
 
-def _terminal_overload(app, item, prep, token, error, stream_ban_until) -> None:
+def _terminal_overload(app, item, prep, token, error, login_note, stream_ban_until) -> None:
     _engine.raise_overload("Opencode", error)
 
 
-def _terminal_upstream_invalid(app, item, prep, token, error, stream_ban_until) -> None:
+def _terminal_upstream_invalid(app, item, prep, token, error, login_note, stream_ban_until) -> None:
     _engine.raise_upstream_invalid("Opencode", prep, error)
 
 
-def _terminal_upstream(app, item, prep, token, error, stream_ban_until) -> None:
+def _terminal_upstream(app, item, prep, token, error, login_note, stream_ban_until) -> None:
+    # login_note ignored (dispatch uniformity). Serve-down stays a distinct
+    # 502 with an actionable message (managed-serve boot), not generic 502.
     if P.is_serve_down_error(error):
         from fastapi import HTTPException as _HTTP
 
@@ -141,11 +144,11 @@ _TERMINAL_HANDLERS: dict[RetryKind, Callable[..., None]] = {
 }
 
 
-def _raise_for_terminal_error(app, item, prep, token, error, stream_ban_until) -> None:
+def _raise_for_terminal_error(app, item, prep, token, error, login_note, stream_ban_until) -> None:
     """Map a terminal completion error to its HTTP status. Always raises."""
     _engine.dispatch_terminal(classify_error, _TERMINAL_HANDLERS,
                               _terminal_upstream, app, item, prep, token,
-                              error, stream_ban_until)
+                              error, login_note, stream_ban_until)
 
 
 def _native_tools_for(prep: dict | None) -> dict | None:
@@ -411,9 +414,8 @@ def _run_completion_core(
     error: str | None = None
     usage_total = 0
     _overload_waits = 0
-    _emit_tracker = _engine.LiveEmitTracker()
-    _wrapped_content = _emit_tracker.wrap(on_content)
-    _wrapped_thinking = _emit_tracker.wrap(on_thinking)
+    _emit_tracker, _wrapped_content, _wrapped_thinking = _engine.live_emit_pair(
+        on_content, on_thinking)
 
     def _do_attempt() -> None:
         nonlocal content, think, error, usage_total
@@ -471,7 +473,7 @@ def _run_completion_core(
     if _cancelled():
         raise _StreamCancelled()
     if error:
-        _raise_for_terminal_error(app, item, prep, None, error, None)
+        _raise_for_terminal_error(app, item, prep, None, error, None, None)
     if not content and not think:
         raise _engine.empty_response_error("Opencode")
     return {"content": content, "thinking": think, "usage_total": usage_total}
@@ -504,23 +506,19 @@ async def _stream_completion(app: FastAPI, pool, item, prep: dict):
     (otherwise a tool_calls reply would also leak as user-visible text) —
     thinking always streams. ``stream_mode=buffered`` keeps the historical
     blocking fan-out; live falls back to it when the SSE tail cannot start.
+    Queue/cancel/emit shape + consumer are engine-owned
+    (``new_producer_context`` / ``consume_stream``); the live vs buffered
+    session lifecycle stays here (no accounts, stale-session recreate +
+    overload sleep preserved).
     """
-    loop = asyncio.get_running_loop()
     try:
         settings = _app_settings(app)
         live = str(getattr(settings, "stream_mode", "live")).lower() == "live"
     except Exception:
         live = True
-    cid, created, out, cancel_event, consumer_timeout = _engine.new_stream_context(
+    (cid, created, out, cancel_event, consumer_timeout, model,
+     _emit, _put) = _engine.new_producer_context(
         prep, OC.DEFAULT_TIMEOUT, _CONSUMER_GRACE_SECONDS)
-    model = prep["model"]
-
-    def _emit(entry: tuple) -> None:
-        _engine.emit_to_loop(loop, out, entry)
-
-    def _put(kind: str, text: str) -> None:
-        if text:
-            _emit((kind, text))
 
     def _produce(*, live_produce: bool) -> None:
         try:
@@ -552,10 +550,8 @@ async def _stream_completion(app: FastAPI, pool, item, prep: dict):
         threading.Thread(
             target=produce_live if live else produce_buffered,
             daemon=True).start()
-    try:
-        async for frame in _engine.drain_stream_queue(
-                out, prep, live, cid, created, model, consumer_timeout,
-                _parse_tool_calls_local, looks_truncated_tool_attempt):
-            yield frame
-    finally:
-        cancel_event.set()
+    async for frame in _engine.consume_stream(
+            out, prep, live, cid, created, model, consumer_timeout,
+            _parse_tool_calls_local, looks_truncated_tool_attempt,
+            cancel_event):
+        yield frame

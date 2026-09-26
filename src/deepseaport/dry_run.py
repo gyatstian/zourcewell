@@ -28,7 +28,7 @@ from fastapi import FastAPI, Header, Request
 from fastapi.responses import StreamingResponse
 
 from .config import Settings
-from .server_routes import _check_auth, _prepare
+from .server_routes import _check_auth, _prepare, build_models_list
 
 # Serializes the multi-line request dumps so concurrent requests never
 # interleave mid-block. Counter stays monotonic across requests.
@@ -94,10 +94,17 @@ def _dry_content(num: int, raw_body: dict, prep: dict, send: bool) -> str:
 
 
 def _openai_dry_response(cid: str, created: int, prep: dict, content: str) -> dict:
-    """Standard chat.completion shape so any frontend renders the content."""
+    """Standard chat.completion shape so any frontend renders the content.
+
+    Intentionally parallel to core.openai._openai_response (not a reuse):
+    dry-run carries dry_run:true, never parses tool_calls, and echoes the
+    formatted dump. Token heuristic shared via estimate_tokens so the two
+    never drift.
+    """
+    from .core.openai import estimate_tokens as _estimate
     prompt = str(prep.get("prompt", ""))
-    pt = max(1, len(prompt) // 4)
-    ct = max(1, len(content) // 4)
+    pt = _estimate(prompt)
+    ct = _estimate(content)
     return {
         "id": cid, "object": "chat.completion", "created": created,
         "model": prep.get("model"), "dry_run": True,
@@ -155,35 +162,16 @@ def create_dry_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/v1/models")
     async def list_models():
-        import time
-
-        now = int(time.time())
-        # Parity with live server_routes.list_models: union catalogue for
-        # the active provider(s) with per-model owned_by (was hardcoded
-        # "deepseek" over the single-provider MODELS dict).
+        # Central listing shared with the live route (F6): catalogue +
+        # owned_by in server_routes.build_models_list. Outer fallback keeps
+        # the dry surface up even if provider discovery fails.
         try:
-            from .core import pools as _pools
-            from .core import registry as _reg
-            from .server import MODELS as _MODELS
-            from .server import active_models as _active
-
             settings_ = app.state.settings
-            catalogue = _active(settings_) or dict(_MODELS)
-            resolved = _reg.resolved_ids(_pools.active_provider_ids(settings_))
-            data = []
-            for m in catalogue:
-                owner = None
-                try:
-                    found = _reg.resolve_model(m, provider_ids=resolved)
-                except Exception:
-                    found = None
-                if found is not None:
-                    _prov, _spec = found
-                    owner = getattr(_spec, "owned_by", "") or getattr(_prov, "id", "")
-                data.append({"id": m, "object": "model", "created": now,
-                             "owned_by": owner or "deepseek"})
-            return {"object": "list", "data": data}
+            return {"object": "list", "data": build_models_list(settings_)}
         except Exception:
+            import time as _time
+
+            now = int(_time.time())
             try:
                 from .server import MODELS as _MODELS
             except Exception:

@@ -33,6 +33,9 @@ from .chat_repl import (
     _restore_chat_logs,
     _select_usable_accounts_live,
     _silence_chat_logs,
+    _warn_chat_workers,
+    resolve_chat_catalogue,
+    resolve_chat_models,
 )
 from .server_runner import (
     _allocate_sequential_ports,
@@ -60,8 +63,7 @@ def run_multi_chat_servers(settings, args=None, count: int | None = None) -> int
     (no port save, no account rewrite). Returns 0 on clean stop/cancel,
     1 when startup is blocked or a server never became ready.
     """
-    if args is not None and int(getattr(args, "workers", 1) or 1) != 1:
-        print("  note: chat mode uses 1 worker (ignoring --workers).")
+    _warn_chat_workers(args)
     if not getattr(settings, "accounts", None):
         print("  ! No accounts yet. Add one first.")
         return 1
@@ -111,7 +113,7 @@ def run_multi_chat_servers(settings, args=None, count: int | None = None) -> int
     instances = [_build_instance_settings(settings, acc, spares, port)
                  for acc, port in zip(picked, ports)]
 
-    from .server import MODELS, active_models, create_app
+    from .server import create_app
 
     saved_logs = _silence_chat_logs()
     servers: list = []
@@ -144,19 +146,8 @@ def run_multi_chat_servers(settings, args=None, count: int | None = None) -> int
         api_key = _first_api_key(settings)
     except Exception:
         api_key = ""
-    try:
-        _catalogue: dict = {}
-        for _inst in instances:
-            try:
-                _catalogue.update(active_models(_inst) or {})
-            except Exception:
-                pass
-        if not _catalogue:
-            _catalogue = active_models(settings) or dict(MODELS)
-    except Exception:
-        _catalogue = dict(MODELS)
-    models = _model_list(_catalogue or MODELS)
-    model = _initial_chat_model(settings, models)
+    # Central catalogue (F6): union across instances, fallback to MODELS.
+    _catalogue, models, model = resolve_chat_models(settings, instances)
     history: list[dict] = []
 
     print()
@@ -212,10 +203,9 @@ def run_chat_server(settings, args=None) -> int:
     became ready. Ctrl+C also stops and returns.
     """
     from .cli import _ensure_free_port
-    from .server import MODELS, active_models, create_app
+    from .server import create_app
 
-    if args is not None and int(getattr(args, "workers", 1) or 1) != 1:
-        print("  note: chat mode uses 1 worker (ignoring --workers).")
+    _warn_chat_workers(args)
     bind_host = _resolve_bind_host(settings, args)
     port = _ensure_free_port(settings, bind_host, int(getattr(settings, "port", 5001)))
     client_base = f"http://127.0.0.1:{port}"
@@ -254,12 +244,8 @@ def run_chat_server(settings, args=None) -> int:
         print(f"  ! server slow to respond, continuing anyway ({client_base}).")
 
     api_key = _first_api_key(settings)
-    try:
-        _catalogue = active_models(settings) or dict(MODELS)
-    except Exception:
-        _catalogue = dict(MODELS)
-    models = _model_list(_catalogue or MODELS)
-    model = _initial_chat_model(settings, models)
+    # Central catalogue (F6): shared with multi-chat via chat_repl.
+    _catalogue, models, model = resolve_chat_models(settings)
     history: list[dict] = []
 
     print()

@@ -6,6 +6,7 @@ import logging
 import re
 
 from ..common import (
+    MAX_SCAN_OBJECTS,
     _LOOSE_JSON_MISS,
     _clean_rest,
     _loads_json_lenient,
@@ -14,15 +15,20 @@ from ..common import (
 
 logger = logging.getLogger("deepseaport.tools")
 
+_TAG_RE = re.compile(
+    r"<(?:tool_call|function_call|invoke)>(.*?)</(?:tool_call|function_call|invoke)>",
+    re.DOTALL | re.IGNORECASE,
+)
+
 
 def try_parse_tags(text, valid_or_none, limit_args, forgiving_on,
                    diagnostics=None):
-    tag_pat = re.compile(
-        r"<(?:tool_call|function_call|invoke)>(.*?)</(?:tool_call|function_call|invoke)>",
-        re.DOTALL | re.IGNORECASE,
-    )
     tagged = []
-    for m in tag_pat.finditer(text):
+    scanned = 0
+    for m in _TAG_RE.finditer(text):
+        if scanned >= MAX_SCAN_OBJECTS:
+            break
+        scanned += 1
         obj = _loads_json_lenient(m.group(1).strip())
         if obj is _LOOSE_JSON_MISS:
             continue
@@ -37,6 +43,6 @@ def try_parse_tags(text, valid_or_none, limit_args, forgiving_on,
                                 "kept": len(calls), "dropped": list(dropped),
                                 "raw": len(tagged)})
         if calls:
-            rest = _clean_rest(tag_pat.sub("", text), forgiving_on)
+            rest = _clean_rest(_TAG_RE.sub("", text), forgiving_on)
             return calls, rest
     return None, None

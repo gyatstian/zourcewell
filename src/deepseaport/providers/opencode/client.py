@@ -177,45 +177,9 @@ def send_message(session_id: str, provider_id: str, model_id: str,
         raise RuntimeError(
             f"OPENCODE_HTTP_{status}: message failed: "
             f"{_serve_error_message(data, json.dumps(data)[:500])[:500]}")
-    info = data.get("info") if isinstance(data.get("info"), dict) else {}
     # 200 with an error envelope (flaky agent loop): fail loudly instead of
-    # serving the error text as a normal reply.
-    info_error = info.get("error") if isinstance(info, dict) else None
-    parts = data.get("parts")
-    if not isinstance(parts, list):
-        parts = []
-    content = "".join(str(p.get("text") or "")
-                      for p in parts
-                      if isinstance(p, dict) and p.get("type") == "text")
-    thinking = "".join(str(p.get("text") or "")
-                       for p in parts
-                       if isinstance(p, dict) and p.get("type") in ("reasoning",))
-    usage_total = 0
-    try:
-        tokens = info.get("tokens") if isinstance(info, dict) else None
-        if isinstance(tokens, dict):
-            usage_total = int(tokens.get("output") or 0)
-    except (TypeError, ValueError):
-        usage_total = 0
-    finish = str((info.get("finish") if isinstance(info, dict) else "") or "stop")
-    if info_error:
-        detail = info_error if isinstance(info_error, str) else json.dumps(info_error)
-        if P.is_free_tier_error(detail):
-            raise RuntimeError(
-                "OPENCODE_FREE_TIER_DENIED: opencode free tier refused the "
-                "request (upstream client-fingerprint check). Upgrade the "
-                "`opencode` CLI and retry; key-gated models need "
-                "`opencode auth login`. "
-                f"Upstream: {detail[:300]}")
-        raise RuntimeError(
-            f"OPENCODE_UPSTREAM: agent loop failed for {provider_id}/{model_id}: "
-            f"{detail[:500]}")
-    if not content and not thinking:
-        raise RuntimeError(
-            f"OPENCODE_EMPTY: empty completion for {provider_id}/{model_id} "
-            "(transient contentless turn; retry on a fresh session)")
-    return {"content": content, "thinking": thinking,
-            "usage_total": usage_total, "finish": finish}
+    # serving the error text as a normal reply (single home below).
+    return _parse_message_result(data, provider_id, model_id)
 
 
 def delete_session(session_id: str | None, timeout: float = 10,

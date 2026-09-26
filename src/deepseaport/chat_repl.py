@@ -246,6 +246,69 @@ def _build_instance_settings(settings, assigned, spares, port):
     return inst
 
 
+def _warn_chat_workers(args) -> None:
+    """Shared --workers note for single + multi chat (F6).
+
+    Chat mode always uses 1 worker; warn once instead of duplicating the
+    gate in both chat_ui entry points.
+    """
+    if args is not None and int(getattr(args, "workers", 1) or 1) != 1:
+        print("  note: chat mode uses 1 worker (ignoring --workers).")
+
+
+def resolve_chat_catalogue(settings, instances=None) -> dict:
+    """Central chat catalogue dict (F6): union across instances or single.
+
+    Multi: union ``active_models(inst)`` for each instance, falling back to
+    ``active_models(settings)`` then ``MODELS``. Single: ``active_models``
+    then ``MODELS``. Never raises; outer fallback is the DeepSeek default.
+    """
+    try:
+        from .server import MODELS, active_models
+    except Exception:
+        return {"deepseek-flash": (False, False, "default")}
+    try:
+        if instances:
+            catalogue: dict = {}
+            for inst in instances:
+                try:
+                    catalogue.update(active_models(inst) or {})
+                except Exception:
+                    pass
+            if not catalogue:
+                try:
+                    catalogue = active_models(settings) or dict(MODELS)
+                except Exception:
+                    catalogue = dict(MODELS)
+            return catalogue or dict(MODELS)
+        try:
+            return active_models(settings) or dict(MODELS)
+        except Exception:
+            return dict(MODELS)
+    except Exception:
+        try:
+            from .server import MODELS as _MODELS
+            return dict(_MODELS)
+        except Exception:
+            return {"deepseek-flash": (False, False, "default")}
+
+
+def resolve_chat_models(settings, instances=None) -> tuple[dict, list[str], str]:
+    """Return (catalogue, models, model) for chat REPL startup (F6).
+
+    Composes ``resolve_chat_catalogue`` + ``_model_list`` +
+    ``_initial_chat_model`` so single + multi chat share one path.
+    """
+    try:
+        from .server import MODELS as _MODELS
+    except Exception:
+        _MODELS = {"deepseek-flash": (False, False, "default")}  # type: ignore
+    catalogue = resolve_chat_catalogue(settings, instances)
+    models = _model_list(catalogue or _MODELS)
+    model = _initial_chat_model(settings, models)
+    return catalogue, models, model
+
+
 def run_repl(*, model: str, models: list[str], api_key: str, history: list[dict],
              settings, post, can_continue, print_help, next_target,
              servers_command=None) -> str:
@@ -258,6 +321,10 @@ def run_repl(*, model: str, models: list[str], api_key: str, history: list[dict]
     - `next_target()` -> (base_url, tag) where tag is "" for single-target
       and "[i/n :port ident]" for multi-target (drives reply/error labels).
     - `servers_command()` -> optional /servers handler (multi only).
+
+    F6 note: the lambdas/closures passed for these seams are intentional
+    strategy injection (single vs round-robin), not duplication — verified
+    healthy, kept as-is.
     """
     while True:
         if not can_continue():

@@ -13,9 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import time
 import uuid
+
+from ...core.transport import BAN_WORD_RE as _SHARED_BAN_RE
+from ...core.transport import has_ban_word as _shared_has_ban_word
+from ...core.transport import parse_json_response as _shared_parse_json
 
 logger = logging.getLogger("deepseaport.protocol")
 
@@ -102,22 +105,16 @@ MODEL_META: dict[str, dict] = {
     "qwen3.8-omni-flash": {},
 }
 
-# Ban family: no verified Qwen ban envelope exists. Best-effort word matching
-# on generic suspension wording. Letter boundaries (not \b: "_" must count as a
-# boundary so "is_muted"/"mute_until" still hit) keep true bans while ignoring
-# "commute". Shape is UNVERIFIED — see the TODO list in README.md.
+# Ban family: no verified Qwen ban envelope exists. Word-match is the shared
+# core.transport.BAN_WORD_RE (identical regex previously tripled). Local
+# aliases stay so ``P._BAN_RE`` keeps working; the envelope verdicts below
+# stay Qwen-specific (UNVERIFIED — see the TODO list in README.md).
 # TODO(unverified): Qwen ban envelope shape unknown.
-_BAN_RE = re.compile(
-    r"(?<![a-z])(muted?|suspend\w*|bann?ed?|violat\w*)(?![a-z])",
-    re.IGNORECASE,
-)
+_BAN_RE = _SHARED_BAN_RE
 
 
 def _has_ban_word(text: str) -> bool:
-    try:
-        return bool(text and _BAN_RE.search(text))
-    except Exception:
-        return False
+    return _shared_has_ban_word(text)
 
 
 def is_ban_error_text(text: str) -> bool:
@@ -468,7 +465,4 @@ def completion_payload(chat_id: str, prompt: str, model: str, thinking: bool,
 
 def parse_json(resp) -> dict:
     """Best-effort ``resp.json()``: {} on any error, never raises."""
-    try:
-        return resp.json()
-    except Exception:
-        return {}
+    return _shared_parse_json(resp)

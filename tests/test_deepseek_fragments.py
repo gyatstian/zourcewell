@@ -77,14 +77,37 @@ def test_fragments_think_then_response_split():
     assert errors == []
 
 
-def test_fragments_unknown_type_routes_to_content():
+def test_fragments_tip_disclaimer_dropped():
     lines = [
-        'data: {"v":{"response":{"fragments":[{"id":9,"type":"WEIRD","content":"x"}]}}}',
+        'data: {"v":{"response":{"fragments":[{"id":2,"type":"RESPONSE","content":"Hi"}]}}}',
+        'data: {"v":" there."}',
+        'data: {"p":"response/fragments","v":[{"id":4,"type":"TIP",'
+        '"content":"This response is AI-generated, for reference only.",'
+        '"style":"WARNING","hide_on_wip":true}]}',
+        'data: {"p":"response","o":"BATCH","v":[{"p":"accumulated_token_usage","v":12},'
+        '{"p":"quasi_status","v":"FINISHED"}]}',
+        'data: {"p":"response/status","o":"SET","v":"FINISHED"}',
+    ]
+    content, thinking, usage, finished, _ = _drain(lines)
+    assert content == "Hi there."
+    assert "AI-generated" not in content
+    assert thinking == ""
+    assert usage == ["12"]
+    assert finished >= 1
+
+
+def test_fragments_chrome_does_not_reroute_thinking():
+    lines = [
+        'data: {"v":{"response":{"thinking_enabled":true,'
+        '"fragments":[{"id":2,"type":"THINK","content":"hmm"}]}}}',
+        'data: {"p":"response/fragments","v":[{"id":9,"type":"TIP",'
+        '"content":"chrome","style":"WARNING","hide_on_wip":true}]}',
+        'data: {"v":"..."}',
         'data: {"p":"response/status","o":"SET","v":"FINISHED"}',
     ]
     content, thinking, _, finished, _ = _drain(lines)
-    assert content == "x"
-    assert thinking == ""
+    assert thinking == "hmm..."
+    assert content == ""
     assert finished == 1
 
 

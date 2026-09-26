@@ -99,23 +99,8 @@ def register_routes(app: FastAPI) -> None:
 
     @app.get("/v1/models")
     async def list_models():
-        now = int(time.time())
-        from .core import registry as _registry
         settings: Settings = app.state.settings
-        catalogue = _server().active_models(settings)
-        if not catalogue:
-            catalogue = {mid: tuple(spec) for mid, spec in _server().MODELS.items()}
-        resolved = _registry.resolved_ids(pools.active_provider_ids(settings))
-        data = []
-        for mid in catalogue:
-            owner = None
-            found = _registry.resolve_model(mid, provider_ids=resolved)
-            if found is not None:
-                provider, spec = found
-                owner = spec.owned_by or provider.id
-            data.append({"id": mid, "object": "model", "created": now,
-                         "owned_by": owner or "deepseek"})
-        return {"object": "list", "data": data}
+        return {"object": "list", "data": build_models_list(settings)}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: dict, request: Request,
@@ -195,7 +180,7 @@ def register_routes(app: FastAPI) -> None:
         settings: Settings = app.state.settings
         _check_auth(settings, authorization)
         pid = (provider or "").strip()
-        pool = _pool_for(app, pid) if (pid and pools.is_multi(settings)) else _server()._pool(app)
+        pool = _pool_for_request(app, pid)
         data = await asyncio.to_thread(pool.status)
         return {"object": "list", "current": pool.current or None, "data": data}
 
@@ -235,7 +220,7 @@ def register_routes(app: FastAPI) -> None:
             cfg.provider = pid
         else:
             cfg.provider = pools.selected_provider(settings)
-        pool = _pool_for(app, pid) if (pid and pools.is_multi(settings)) else _server()._pool(app)
+        pool = _pool_for_request(app, pid)
         try:
             from .accounts import add_account as _add
             item = await asyncio.to_thread(_add, settings, pool, cfg)
@@ -259,7 +244,7 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=400,
                                 detail="token required (raw value or full JSON). " + TOKEN_HELP)
         pid = str((body.get("provider") if isinstance(body, dict) else "") or provider or "").strip()
-        pool = _pool_for(app, pid) if (pid and pools.is_multi(settings)) else _server()._pool(app)
+        pool = _pool_for_request(app, pid)
         item = await asyncio.to_thread(pool.get, identifier)
         if item is None:
             raise HTTPException(status_code=404, detail=f"account not found: {identifier}")
@@ -277,7 +262,7 @@ def register_routes(app: FastAPI) -> None:
         settings: Settings = app.state.settings
         _check_auth(settings, authorization)
         pid = (provider or "").strip()
-        pool = _pool_for(app, pid) if (pid and pools.is_multi(settings)) else _server()._pool(app)
+        pool = _pool_for_request(app, pid)
         removed = await asyncio.to_thread(pool.remove, identifier)
         if not removed:
             raise HTTPException(status_code=404, detail=f"account not found: {identifier}")
@@ -292,7 +277,7 @@ def register_routes(app: FastAPI) -> None:
         _check_auth(settings, authorization)
         identifier = (body or {}).get("identifier") if isinstance(body, dict) else None
         pid = str((body.get("provider") if isinstance(body, dict) else "") or provider or "").strip()
-        pool = _pool_for(app, pid) if (pid and pools.is_multi(settings)) else _server()._pool(app)
+        pool = _pool_for_request(app, pid)
         cleared = await asyncio.to_thread(pool.clear_cooldown, identifier)
         # Persist the ban-flag clear so labels survive the next restart too.
         await asyncio.to_thread(settings.save)
@@ -402,9 +387,74 @@ def _pool(app: FastAPI) -> AccountPool:
     return pool
 
 
-def _prepare(body: dict, settings: Settings | None = None) -> dict:
-    from .core import registry
-    model = str(body.get("model") or "deepseek-flash")
+def _pool_for_request(app: FastAPI, provider_id) -> AccountPool:
+    """Central pool selection for the account routes (F5).
+
+    Single home for the ``_pool_for(app, pid) if (pid and is_multi) else
+    _server()._pool(app)`` gate that was repeated in every handler. Empty pid
+    or single-provider mode goes through the historical ``_server()._pool``
+    seam so ``monkeypatch.setattr("deepseaport.server._pool", ...)`` keeps
+    working; multi mode with a real pid uses the per-provider registry.
+    """
+    settings = app.state.settings
+    if pools.needs_provider_pool(settings, provider_id):
+        return _pool_for(app, provider_id)
+    return _server()._pool(app)
+
+
+def _catalogue_for(settings) -> dict:
+    """Central model catalogue dict for /v1/models (F6).
+
+    ``active_models(settings)`` with a MODELS-shaped fallback, so the live
+    route and the dry-run route share one listing instead of two loops.
+    """
+    try:
+        catalogue = _server().active_models(settings)
+    except Exception:
+        catalogue = {}
+    if not catalogue:
+        try:
+            catalogue = {mid: tuple(spec) for mid, spec in _server().MODELS.items()}
+        except Exception:
+            catalogue = {"deepseek-flash": (False, False, "default")}
+    return catalogue or {"deepseek-flash": (False, False, "default")}
+
+
+def build_models_list(settings, now: int | None = None) -> list[dict]:
+    """Central /v1/models payload shared by live + dry-run routes (F6).
+
+    Owner per model via ``registry.resolve_model`` over the active provider
+    ids; unknown models fall back to ``deepseek``. Never raises: per-model
+    resolution is best-effort so one broken provider cannot 500 the listing.
+    """
+    from .core import registry as _registry
+    if now is None:
+        now = int(time.time())
+    catalogue = _catalogue_for(settings)
+    try:
+        resolved = _registry.resolved_ids(pools.active_provider_ids(settings))
+    except Exception:
+        resolved = ["deepseek"]
+    data: list[dict] = []
+    for mid in catalogue:
+        owner = None
+        try:
+            found = _registry.resolve_model(mid, provider_ids=resolved)
+        except Exception:
+            found = None
+        if found is not None:
+            try:
+                provider, spec = found
+                owner = spec.owned_by or provider.id
+            except Exception:
+                owner = None
+        data.append({"id": mid, "object": "model", "created": now,
+                     "owned_by": owner or "deepseek"})
+    return data
+
+
+def _validate_messages(body: dict) -> list:
+    """Validate the OpenAI messages array (400 on any shape error)."""
     messages = body.get("messages", [])
     if not messages:
         raise HTTPException(status_code=400, detail="messages is required")
@@ -416,15 +466,24 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
             raise HTTPException(
                 status_code=400,
                 detail=f"messages[{idx}] must be an object with a 'role' field")
+    return messages
+
+
+def _resolve_prep_model(model: str, settings: Settings | None):
+    """Resolve ``model`` to (provider, spec) across active providers (404)."""
+    from .core import registry
     resolved = registry.resolve_model(
         model,
         provider_ids=(registry.resolved_ids(pools.active_provider_ids(settings))
                       if settings is not None else None))
     if resolved is None:
         raise HTTPException(status_code=404, detail=f"model '{model}' not available")
-    provider, spec = resolved
-    thinking, search, model_type = spec.thinking, spec.search, spec.model_type
-    tools = body.get("tools") or []
+    return resolved
+
+
+def _decide_use_tools(body: dict, settings: Settings | None, tools: list) -> bool:
+    """Apply the tool_choice + enable_tools gates (warns when gated off)."""
+    model = str(body.get("model") or "deepseek-flash")
     use_tools = bool(tools) and body.get("tool_choice", "auto") != "none"
     if settings is not None and not getattr(settings, "enable_tools", True):
         if use_tools:
@@ -433,6 +492,11 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
                 "off (agentic harnesses like pi need it on for tool_calls)",
                 len(tools), model)
         use_tools = False
+    return use_tools
+
+
+def _prep_tool_limits(settings: Settings | None) -> tuple:
+    """Return (tool_args_max_chars|None, forgiving_toolcalls bool)."""
     tool_args_max_chars = None
     forgiving_toolcalls = False
     if settings is not None:
@@ -442,6 +506,12 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
         except (TypeError, ValueError):
             tool_args_max_chars = None
         forgiving_toolcalls = bool(getattr(settings, "forgiving_toolcalls", False))
+    return tool_args_max_chars, forgiving_toolcalls
+
+
+def _render_prep_prompt(messages: list, tools: list, use_tools: bool,
+                        tool_args_max_chars, settings: Settings | None) -> str:
+    """Build the upstream prompt: tool system + reminder + appends (400 if empty)."""
     if use_tools:
         messages = [{"role": "system",
                      "content": tool_system_prompt(
@@ -476,12 +546,36 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
             status_code=400,
             detail="messages must produce a non-empty prompt "
                    "(upstream rejects empty prompts with 422)")
-    # OpenAI params the web upstreams cannot honor: preserve for
-    # observability but warn once per request instead of silently dropping.
-    # Upstream payloads (DeepSeek/Qwen completion_payload) carry only
-    # prompt + thinking/search/model — no temperature/top_p/stop/n/
-    # penalties/response_format. stream_options is honored locally: when
-    # include_usage is true the streamer emits a final usage chunk.
+    return prompt
+
+
+def _parse_reasoning_effort(body: dict):
+    """Return (reasoning_effort|None, invalid_raw|None) for the opencode variant."""
+    # Reasoning effort (e.g. pi agents send reasoning_effort: medium).
+    # Honored by the opencode provider as the serve message `variant`
+    # (built-ins: none/minimal/low/medium/high/xhigh); other providers
+    # ignore it like the thinking flag. Unknown values stay warned below.
+    reasoning_effort = body.get("reasoning_effort")
+    if reasoning_effort is None and isinstance(body.get("reasoning"), dict):
+        reasoning_effort = body["reasoning"].get("effort")
+    if isinstance(reasoning_effort, str):
+        reasoning_effort = reasoning_effort.strip().lower() or None
+    else:
+        reasoning_effort = None
+    if reasoning_effort is not None and reasoning_effort not in (
+            "none", "minimal", "low", "medium", "high", "xhigh"):
+        return None, body.get("reasoning_effort")
+    return reasoning_effort, None
+
+
+def _extract_passthrough(body: dict) -> dict:
+    """Collect OpenAI passthrough fields + unsupported map + stream_options.
+
+    Upstream payloads (DeepSeek/Qwen completion_payload) carry only
+    prompt + thinking/search/model — no temperature/top_p/stop/n/
+    penalties/response_format. stream_options is honored locally: when
+    include_usage is true the streamer emits a final usage chunk.
+    """
     unsupported: dict = {}
     if body.get("temperature") is not None:
         unsupported["temperature"] = body.get("temperature")
@@ -508,21 +602,44 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
     stream_options = body.get("stream_options") or {}
     if not isinstance(stream_options, dict):
         stream_options = {}
-    # Reasoning effort (e.g. pi agents send reasoning_effort: medium).
-    # Honored by the opencode provider as the serve message `variant`
-    # (built-ins: none/minimal/low/medium/high/xhigh); other providers
-    # ignore it like the thinking flag. Unknown values stay warned below.
-    reasoning_effort = body.get("reasoning_effort")
-    if reasoning_effort is None and isinstance(body.get("reasoning"), dict):
-        reasoning_effort = body["reasoning"].get("effort")
-    if isinstance(reasoning_effort, str):
-        reasoning_effort = reasoning_effort.strip().lower() or None
-    else:
-        reasoning_effort = None
-    if reasoning_effort is not None and reasoning_effort not in (
-            "none", "minimal", "low", "medium", "high", "xhigh"):
-        unsupported["reasoning_effort"] = body.get("reasoning_effort")
-        reasoning_effort = None
+    reasoning_effort, invalid_raw = _parse_reasoning_effort(body)
+    if invalid_raw is not None:
+        unsupported["reasoning_effort"] = invalid_raw
+    return {
+        "temperature": body.get("temperature"),
+        "top_p": body.get("top_p"),
+        "max_tokens": _max_tok,
+        "stop": body.get("stop"),
+        "n": _n,
+        "presence_penalty": body.get("presence_penalty"),
+        "frequency_penalty": body.get("frequency_penalty"),
+        "response_format": _rf,
+        "stream_options": stream_options,
+        "reasoning_effort": reasoning_effort,
+        "unsupported": unsupported,
+    }
+
+
+def _prepare(body: dict, settings: Settings | None = None) -> dict:
+    """Validate + format one chat request (F6 orchestrator, signature frozen).
+
+    Steps (each in its helper above; dry_run reuses this): validate messages,
+    resolve model->provider, gate tools, render prompt + appends, collect
+    OpenAI passthrough/unsupported. Return shape unchanged (21 keys).
+    Provider dispatch below (registry.get(prep["provider"])) is the prior
+    boundary-wave injection point — kept as-is.
+    """
+    model = str(body.get("model") or "deepseek-flash")
+    messages = _validate_messages(body)
+    provider, spec = _resolve_prep_model(model, settings)
+    thinking, search, model_type = spec.thinking, spec.search, spec.model_type
+    tools = body.get("tools") or []
+    use_tools = _decide_use_tools(body, settings, tools)
+    tool_args_max_chars, forgiving_toolcalls = _prep_tool_limits(settings)
+    prompt = _render_prep_prompt(messages, tools, use_tools,
+                                tool_args_max_chars, settings)
+    passthrough = _extract_passthrough(body)
+    unsupported = passthrough["unsupported"]
     if unsupported:
         logger.warning(
             "ignoring unsupported OpenAI params for web upstream "
@@ -534,16 +651,16 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
         "tool_args_max_chars": tool_args_max_chars,
         "forgiving_toolcalls": forgiving_toolcalls,
         "thinking": thinking, "search": search, "model_type": model_type,
-        "reasoning_effort": reasoning_effort,
+        "reasoning_effort": passthrough["reasoning_effort"],
         "provider": provider.id,
-        "temperature": body.get("temperature"),
-        "top_p": body.get("top_p"),
-        "max_tokens": _max_tok,
-        "stop": body.get("stop"),
-        "n": _n,
-        "presence_penalty": body.get("presence_penalty"),
-        "frequency_penalty": body.get("frequency_penalty"),
-        "response_format": _rf,
-        "stream_options": stream_options,
+        "temperature": passthrough["temperature"],
+        "top_p": passthrough["top_p"],
+        "max_tokens": passthrough["max_tokens"],
+        "stop": passthrough["stop"],
+        "n": passthrough["n"],
+        "presence_penalty": passthrough["presence_penalty"],
+        "frequency_penalty": passthrough["frequency_penalty"],
+        "response_format": passthrough["response_format"],
+        "stream_options": passthrough["stream_options"],
         "unsupported_params": unsupported,
     }

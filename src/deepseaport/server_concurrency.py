@@ -46,6 +46,10 @@ _CONSUMER_GRACE_SECONDS = 10
 # banned mid-request. Short: healthy accounts are normally idle; long waits
 # would stall the request that already paid for a failed ban attempt.
 FAILOVER_ACQUIRE_TIMEOUT = 10
+# Poll interval for _await_cancelable: how long one fut.result() wait lasts
+# before re-checking cancel_event. Short enough to abort promptly on client
+# disconnect, long enough to avoid a hot spin on the challenge executor.
+_CANCEL_POLL_SECONDS = 0.05
 # A 401 means either a missing token or a browser refresh that could not
 # produce a usable one.  Cool that account briefly so failover can move to a
 # healthy account instead of immediately reacquiring the same broken one.
@@ -132,7 +136,7 @@ def _await_cancelable(fut, cancel_event: threading.Event | None):
                 pass
             raise _StreamCancelled()
         try:
-            return fut.result(timeout=0.05)
+            return fut.result(timeout=_CANCEL_POLL_SECONDS)
         except _fut.TimeoutError:
             continue
 

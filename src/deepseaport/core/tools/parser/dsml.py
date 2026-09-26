@@ -7,6 +7,8 @@ import logging
 import re
 
 from ..common import (
+    MAX_PARAMS_PER_INVOKE,
+    MAX_SCAN_OBJECTS,
     _LOOSE_JSON_MISS,
     _balanced_json,
     _clean_rest,
@@ -119,6 +121,16 @@ _PARAM_CLOSE_FORGIVING_RE = _tag_re("parameter", closing=True, forgiving=True)
 _GENERIC_CLOSE_RE = re.compile(re.escape(_LT + "/>"))
 _GENERIC_CLOSE_FORGIVING_RE = re.compile(
     _LT_FORGIVING + "/" + _SP_FORGIVING + _GT_FORGIVING)
+
+# Wrapper <calls>/<tool_calls> open+close patterns, precomputed so the DSML
+# success path never recompiles per call (strict + forgiving variants).
+_WRAPPER_RES = {
+    (tag, closing, forgiving): _tag_re(tag, closing=closing,
+                                       forgiving=forgiving)
+    for tag in ("calls", "tool_calls")
+    for closing in (False, True)
+    for forgiving in (False, True)
+}
 
 
 # Forgiving fix 1+2 (markup side only; parameter *values* stay verbatim so
@@ -270,7 +282,14 @@ def _scan_dsml_calls(text: str, forgiving: bool = False,
     generic_close = _GENERIC_CLOSE_FORGIVING_RE if forgiving else _GENERIC_CLOSE_RE
     info, lowers = _tool_param_info(tools) if forgiving else ({}, {})
     single_tool = next(iter(info)) if len(info) == 1 else None
-    opens = list(invoke_open.finditer(norm))
+    # Bound work: at most MAX_SCAN_OBJECTS invokes per reply. Lazy
+    # enumeration (no list materialization) so thousands of <invoke> tags
+    # stop scanning at the cap instead of building match lists first.
+    opens: list = []
+    for _inv in invoke_open.finditer(norm):
+        if len(opens) >= MAX_SCAN_OBJECTS:
+            break
+        opens.append(_inv)
     out: list[dict] = []
     spans: list[tuple[int, int]] = []
     for idx, inv in enumerate(opens):
@@ -290,7 +309,15 @@ def _scan_dsml_calls(text: str, forgiving: bool = False,
         param_limit = named_close.start() if named_close else body_end
         args: dict = {}
         last_param_end = body_start
-        params = list(param_open.finditer(norm, body_start, param_limit))
+        # Bound per-invoke parameters (malformed replies with thousands of
+        # <parameter> tags can't blow up the scan). Lazy: stop matching at
+        # the cap; truncation semantics match the old list-then-slice.
+        params: list = []
+        for _pm in param_open.finditer(norm, body_start, param_limit):
+            if len(params) >= MAX_PARAMS_PER_INVOKE:
+                param_limit = params[-1].start() if params else param_limit
+                break
+            params.append(_pm)
         for pidx, pm in enumerate(params):
             value_start = pm.end()
             value_limit = (params[pidx + 1].start()
@@ -352,16 +379,30 @@ def _parse_dsml_calls(text: str, forgiving: bool = False,
     return calls
 
 
+def _dsml_wrapper_spans(text_norm: str, forgiving: bool = False,
+                        ) -> list[tuple[int, int]]:
+    """Wrapper <calls>/<tool_calls> spans from already-normalized text.
+
+    Patterns are precomputed (no per-call compile); total spans are capped
+    at MAX_SCAN_OBJECTS so pathological wrapper counts can't blow up the
+    strip sort. Realistic replies carry 0-2 wrappers (cap never bites).
+    """
+    spans: list[tuple[int, int]] = []
+    for tag in ("calls", "tool_calls"):
+        for closing in (False, True):
+            rx = _WRAPPER_RES[(tag, closing, bool(forgiving))]
+            for m in rx.finditer(text_norm):
+                spans.append((m.start(), m.end()))
+                if len(spans) >= MAX_SCAN_OBJECTS:
+                    return spans
+    return spans
+
+
 def _dsml_spans(text: str, forgiving: bool = False,
                 tools: list[dict] | None = None) -> list[tuple[int, int]]:
     """Spans to strip on DSML success (length-preserving normalization)."""
     norm = _normalize_dsml_text(text)
-    spans: list[tuple[int, int]] = []
-    for tag in ("calls", "tool_calls"):
-        for rx in (_tag_re(tag, forgiving=forgiving),
-                   _tag_re(tag, closing=True, forgiving=forgiving)):
-            for m in rx.finditer(norm):
-                spans.append((m.start(), m.end()))
+    spans = _dsml_wrapper_spans(norm, forgiving=forgiving)
     # The tolerant scanner owns invoke/parameter/plain/generic blocks. Its
     # normalized copy is length-preserving, so positions map to `text`.
     _, invoke_spans = _scan_dsml_calls(text, forgiving=forgiving, tools=tools)
@@ -375,7 +416,9 @@ def try_parse_dsml(text, valid_or_none, limit_args, forgiving_on, tools,
     low = text.lower()
     if ("dsml" in low or "<invoke" in low
             or (forgiving_on and "&lt;invoke" in low)):
-        dsml_raw = _parse_dsml_calls(text, forgiving=forgiving_on, tools=tools)
+        # Single scan: raw calls + invoke spans together (no second scan).
+        dsml_raw, invoke_spans = _scan_dsml_calls(
+            text, forgiving=forgiving_on, tools=tools)
         if dsml_raw:
             calls, dropped = _normalize_calls(dsml_raw, valid_or_none, limit_args)
             if diagnostics is not None:
@@ -385,10 +428,14 @@ def try_parse_dsml(text, valid_or_none, limit_args, forgiving_on, tools,
             if calls:
                 # Strip on normalized text then map back by length-stable replace:
                 # fullwidth->ASCII is length-stable (1 char -> 1 char), so spans align.
-                spans = _dsml_spans(text, forgiving=forgiving_on, tools=tools)
+                norm = _normalize_dsml_text(text)
+                spans = _dsml_wrapper_spans(norm, forgiving=forgiving_on)
+                spans.extend(invoke_spans)
                 rest = _clean_rest(_strip_spans(text, spans), forgiving_on)
                 # If spans came from normalized copy with same length, safe.
                 return calls, rest
-            # DSML present but names unknown: don't fall through to bare scan
-            # producing junk; log and keep scanning fenced (explicit user intent).
+            # DSML present but names unknown: fall through to fence/bare.
+            # Unknown DSML must NOT suppress a valid bare call later; the
+            # chain continues and diagnostics keeps the near-miss trail
+            # (matched=False) so plain answers stay distinguishable.
     return None, None

@@ -49,6 +49,43 @@ def _valid_provider_id(raw) -> str:
     return ""
 
 
+# Canonical short aliases shared by CLI flags and the TUI interactive gate.
+# Single home so `ds` means `deepseek` in both. TUI keeps thin wrappers
+# (_PROVIDER_ALIASES / _normalize_provider_choice) delegating here for
+# backward compatibility (tests import those names from tui).
+PROVIDER_ALIASES = {"ds": "deepseek"}
+
+
+def normalize_provider_id(raw: str, valid_ids: list[str]) -> str:
+    """Normalize typed provider to a valid id, resolving aliases.
+
+    Returns "" when the choice does not match. Empty input returns "" here;
+    callers apply the deepseek default. Case-insensitive exact match after
+    alias resolution (e.g. ds -> deepseek).
+    """
+    key = (raw or "").strip().lower()
+    if not key:
+        return ""
+    key = PROVIDER_ALIASES.get(key, key)
+    for pid in valid_ids:
+        if str(pid or "").strip().lower() == key:
+            return str(pid or "").strip().lower()
+    return ""
+
+
+def resolve_login_provider_id(settings, provider: str | None = None) -> str:
+    """Login pid shared by CLI login and TUI auto-login.
+
+    Explicit provider wins; else the selected (single-mode) provider; else
+    deepseek. Always lowercased, never empty. Thin adapter so both frontends
+    resolve the same way without duplicating the fallback chain.
+    """
+    pid = (str(provider or "").strip().lower()
+           or (str(getattr(settings, "provider", "") or "").strip().lower())
+           or "deepseek")
+    return pid or "deepseek"
+
+
 def _apply_serve_provider_flags(settings, args) -> int | None:
     """Apply --provider/--providers to settings. None = ok, int = exit code."""
     from .core import registry as _reg
@@ -382,9 +419,7 @@ def _obscura_login_token(email: str, password: str, settings,
     DeepSeek default keeps the canonical ``providers.deepseek.auth`` path so
     existing monkeypatch seams (tests) and behavior are unchanged.
     """
-    pid = (str(provider or "").strip().lower()
-           or (str(getattr(settings, "provider", "") or "").strip().lower())
-           or "deepseek")
+    pid = resolve_login_provider_id(settings, provider)
     if pid != "deepseek":
         try:
             from .core import registry as _reg

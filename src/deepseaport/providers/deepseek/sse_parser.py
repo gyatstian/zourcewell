@@ -37,7 +37,8 @@ class StreamParser:
       fragments via {"p": "response/fragments", "o": "APPEND", "v": [...]},
       and every text delta via {"p": "response/fragments/-1/content", ...}
       plus bare {"v": "..."} continuations. Fragment {"type": "THINK"} routes
-      to thinking, every other fragment type routes to content. The active
+      to thinking, {"type": "RESPONSE"} to content; any other fragment type
+      is UI chrome (e.g. the TIP disclaimer) and is dropped. The active
       fragment type is remembered so continuations land on the right side.
     """
 
@@ -86,12 +87,24 @@ class StreamParser:
         return StreamEvent(kind=kind, text=text)
 
     def _frag_events(self, frag: dict) -> Iterator[StreamEvent]:
-        """Track one fragment dict, yielding its initial content (if any)."""
+        """Track one answer fragment, yielding its initial content (if any).
+
+        Only THINK (thinking) and RESPONSE (content) fragments carry answer
+        text. UI chrome such as {"type": "TIP", "style": "WARNING",
+        "hide_on_wip": true} ("This response is AI-generated, for reference
+        only.") is dropped entirely — and must not touch frag_thinking /
+        last_path, so a chrome fragment can never reroute later deltas.
+        """
         try:
             kind = str(frag.get("type", "") or "").upper()
         except Exception:
             kind = ""
-        self.frag_thinking = "THINK" in kind
+        if "THINK" in kind:
+            self.frag_thinking = True
+        elif "RESPONSE" in kind:
+            self.frag_thinking = False
+        else:
+            return
         self.last_path = self.FRAG_CONTENT
         try:
             text = frag.get("content", "")

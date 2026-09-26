@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from ..common import (
+    MAX_SCAN_OBJECTS,
     _LOOSE_JSON_MISS,
     _balanced_json,
     _clean_rest,
@@ -18,12 +19,23 @@ logger = logging.getLogger("deepseaport.tools")
 def try_parse_json_array(text, valid_or_none, limit_args, forgiving_on,
                          diagnostics=None):
     """First match wins: single left-to-right balanced scan (linear)."""
+    # Fast C-level exit: no tool_calls marker means no work (plain answers
+    # with many "{" skip Python-loop balanced scans entirely).
+    if '"tool_calls"' not in text:
+        return None, None
     pos = 0
     n = len(text)
+    scanned = 0
     while pos < n:
+        if scanned >= MAX_SCAN_OBJECTS:
+            break
+        # Remaining text can't match once the marker is gone.
+        if text.find('"tool_calls"', pos) < 0:
+            break
         start = text.find("{", pos)
         if start < 0:
             break
+        scanned += 1
         obj_text = _balanced_json(text, start)
         if not obj_text:
             pos = start + 1

@@ -44,6 +44,14 @@ from .core.tools import (
 )
 
 # --- Re-exports from the split modules (historical public surface) ---------
+# FROZEN COMPAT SURFACE (F5): tests + cli/chat_ui/dry_run/tui import
+# MODELS, active_models, _pool, _prepare, _complete_with_failover_sync,
+# _openai_response, parse_tool_calls and the executor/lifecycle names below
+# directly from deepseaport.server, and monkeypatch deepseaport.server._pool /
+# deepseaport.server.parse_tool_calls / completion_service fns. Do not remove
+# or rename these re-exports; add new names only. Canonical logic lives in
+# server_routes (routes/pools/_prepare), core.registry (catalogue),
+# core.openai (response shaping), providers.* (completion engine).
 # Order matters only for readability; all names are importable from
 # deepseaport.server exactly as before the split. The completion/stream
 # engine lives in providers.deepseek.completion_service; this module holds
@@ -93,6 +101,19 @@ from .server_concurrency import (
 )
 from .server_routes import _check_auth, _pool, _prepare, register_routes  # noqa: F401
 
+# Frozen test/import seam: `from deepseaport.server import X` must keep working
+# for every name above plus MODELS/active_models/create_app/app. __all__ pins
+# the surface so refactors do not silently drop a monkeypatch target.
+__all__ = [
+    "MODELS", "active_models", "create_app", "app", "register_routes",
+    "_check_auth", "_pool", "_prepare",
+    "_openai_response", "_complete_with_failover_sync", "_run_completion",
+    "_run_completion_core", "_stream_completion", "_attempt",
+    "parse_tool_calls", "render_prompt",
+    "AccountPool", "PooledAccount", "AccountConfig", "Settings",
+    "load_settings", "apply_log_level", "lifespan",
+]
+
 logger = logging.getLogger("deepseaport.server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
@@ -107,16 +128,16 @@ def active_models(settings=None) -> dict[str, tuple[bool, bool, str]]:
 
     Union of ``tuple_spec()`` for ``resolved_ids(active_provider_ids(...))``,
     falling back to ``dict(MODELS)`` when empty or settings is None.
+    Delegates the union to ``registry.catalogue_tuples_for`` (single home);
+    this wrapper stays as the frozen compat entry point.
     """
-    from .core import pools, registry
+    from .core import registry
     if settings is None:
         return dict(MODELS)
-    out: dict[str, tuple[bool, bool, str]] = {}
-    for pid in registry.resolved_ids(pools.active_provider_ids(settings)):
-        provider = registry.get(pid)
-        if provider is None:
-            continue
-        out.update(provider.tuple_spec())
+    try:
+        out = registry.catalogue_tuples_for(settings)
+    except Exception:
+        out = {}
     return out or dict(MODELS)
 
 
