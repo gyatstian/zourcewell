@@ -14,19 +14,15 @@ from subprocess import CompletedProcess
 
 import pytest
 
-from deepseaport import pow as PoW
+from support import (FakeBridge, app_with_bridge, cached_wasm, settings)
+from deepseaport.providers.deepseek import pow as PoW
 from deepseaport.accounts import PooledAccount
 from deepseaport.config import DEFAULT_PORT, AccountConfig, Settings
-from deepseaport.obscura_bridge import ObscuraBridge
-from deepseaport.protocol import StreamEvent
-from deepseaport.server import (
-    _attempt,
-    _prepare,
-    _run_completion_core,
-    _session_and_challenge,
-    _stream_completion,
-    create_app,
-)
+from deepseaport.core.obscura_bridge import ObscuraBridge
+from deepseaport.providers.deepseek.protocol import StreamEvent
+from deepseaport.server import create_app
+from deepseaport.providers.deepseek.completion_service import _attempt, _run_completion_core, _session_and_challenge, _stream_completion
+from deepseaport.server_routes import _prepare
 
 CHALLENGE = {
     "algorithm": PoW.ALGORITHM,
@@ -38,63 +34,61 @@ CHALLENGE = {
     "target_path": "/api/v0/chat/completion",
 }
 
+# Bounded waits for the Event handshakes below. These are NOT assertion bounds:
+# they exist so a regression FAILS instead of hanging the suite, and so a fake
+# producer that never gets released still unwinds on its own. They sit far
+# above the thing actually being waited for -- `server_concurrency.
+# _CANCEL_POLL_SECONDS` is 50ms, so a cancel abort arrives within one poll --
+# because on a loaded `windows-latest` runner the danger is a slow scheduler,
+# and only an Event can tell "slow" apart from "broken".
+_HANDSHAKE_TIMEOUT = 10.0
 
-class _FakeState:
-    user_agent = "test-ua"
-    cookies: dict = {}
 
-
-class _FakeBridge:
-    def __init__(self) -> None:
-        self.state = _FakeState()
-
-    def cookie_header(self) -> str:
-        return ""
-
-    def warmup(self) -> dict:
-        return {}
+# Default kwargs differ per file; the shared base dict lives in
+# support.py. Every list here is rebuilt per call on purpose.
 
 
 def _settings(**kw) -> Settings:
-    base = dict(
-        keys=[],
-        accounts=[AccountConfig(email="a@x.com", token="tok")],
-        config_path="",
-        warmup_on_startup=False,
-        max_retries=1,
-        log_level="WARNING",
-        parallel_challenge_fetch=True,
-    )
-    base.update(kw)
-    return Settings(**base)
+    kw.setdefault("accounts", [AccountConfig(email="a@x.com", token="tok")])
+    return settings(**kw)
 
 
-def _app_with_bridge(settings: Settings):
-    app = create_app(settings)
-    app.state.bridge = _FakeBridge()
-    return app
+class _AnnouncingLock:
+    """Delegating account lock that sets an Event the moment it is released.
 
+    `accounts.py`, `core/engine.py` and the providers only ever call `acquire`,
+    `release` and `locked` on an account lock, so those three are the whole
+    surface. Wrapping rather than polling turns "the slot came back" from a
+    sampled observation into a delivered signal.
+    """
 
-def _cached_wasm(monkeypatch, tmp_path):
-    """Point PoW at an existing >1000 byte file so ensure_wasm is skipped."""
-    wp = tmp_path / "wasm.bin"
-    wp.write_bytes(b"x" * 2000)
-    monkeypatch.setattr("deepseaport.server.PoW.wasm_path", lambda: wp)
-    return wp
+    def __init__(self, inner, released: threading.Event) -> None:
+        self._inner = inner
+        self._released = released
+
+    def acquire(self, *args, **kwargs) -> bool:
+        return self._inner.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._inner.release()
+        self._released.set()
+
+    def locked(self) -> bool:
+        return self._inner.locked()
 
 
 # 1. session leak on PoW failure -------------------------------------------
 
 
 def test_session_cleaned_up_when_pow_solve_raises(monkeypatch, tmp_path):
-    app = _app_with_bridge(_settings())
-    _cached_wasm(monkeypatch, tmp_path)
+    app = app_with_bridge(_settings())
+    cached_wasm(monkeypatch, tmp_path)
     deleted: list = []
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg",
                         lambda *a, **k: deleted.append(a))
-    monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-1")
-    monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: None)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-1")
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: None)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
@@ -108,10 +102,10 @@ def test_session_cleaned_up_when_pow_solve_raises(monkeypatch, tmp_path):
 
 def test_session_and_challenge_deletes_on_pow_fetch_failure(monkeypatch):
     deleted: list = []
-    monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-X")
-    monkeypatch.setattr("deepseaport.server.DS.fetch_pow",
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-X")
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow",
                         lambda h: (_ for _ in ()).throw(RuntimeError("pow fetch failed")))
-    monkeypatch.setattr("deepseaport.server.DS.delete_session",
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.delete_session",
                         lambda h, sid: deleted.append(sid))
 
     with pytest.raises(RuntimeError):
@@ -121,10 +115,10 @@ def test_session_and_challenge_deletes_on_pow_fetch_failure(monkeypatch):
 
 def test_session_and_challenge_deletes_on_fetch_failure_sequential(monkeypatch):
     deleted: list = []
-    monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-Y")
-    monkeypatch.setattr("deepseaport.server.DS.fetch_pow",
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-Y")
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow",
                         lambda h: (_ for _ in ()).throw(RuntimeError("pow fetch failed")))
-    monkeypatch.setattr("deepseaport.server.DS.delete_session",
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.delete_session",
                         lambda h, sid: deleted.append(sid))
 
     with pytest.raises(RuntimeError):
@@ -185,6 +179,11 @@ def test_concurrent_warmups_serialize_subprocesses(tmp_path):
         with guard:
             active += 1
             peak = max(peak, active)
+        # Deliberate serialization probe, not a synchronization point: the
+        # point is to hold each "subprocess" in flight long enough that the
+        # other four threads contend on `_proc_lock` while one holds it. Any
+        # positive value works; it must not be driven to ~0, or the five
+        # threads never overlap and peak==1 proves nothing.
         time.sleep(0.05)
         with guard:
             active -= 1
@@ -207,7 +206,7 @@ def test_bridges_on_same_profile_share_lock(tmp_path):
     per-profile lock they could spawn obscura concurrently with an app-bridge
     warmup and corrupt the cookie jar.
     """
-    from deepseaport.obscura_bridge import profile_lock
+    from deepseaport.core.obscura_bridge import profile_lock
 
     prof = str(tmp_path / "prof")
     a = ObscuraBridge(binary="fake-obscura", profile=prof)
@@ -223,7 +222,7 @@ def test_obscura_login_token_holds_profile_lock(monkeypatch, tmp_path):
     """Login's MCP subprocess must run under the shared profile lock."""
     from deepseaport import cli
     from deepseaport.config import Settings
-    from deepseaport.obscura_bridge import profile_lock
+    from deepseaport.core.obscura_bridge import profile_lock
 
     prof = str(tmp_path / "login-prof")
     settings = Settings(obscura_profile=prof, config_path="")
@@ -244,7 +243,7 @@ def test_obscura_login_token_holds_profile_lock(monkeypatch, tmp_path):
         def close(self):
             pass
 
-    monkeypatch.setattr("deepseaport.mcp_client.McpClient", FakeClient)
+    monkeypatch.setattr("deepseaport.core.mcp_client.McpClient", FakeClient)
 
     def run():
         try:
@@ -282,13 +281,13 @@ def test_malformed_port_env_falls_back(monkeypatch, tmp_path):
 
 
 def test_session_retry_refreshes_pow_header(monkeypatch, tmp_path):
-    app = _app_with_bridge(_settings())
-    _cached_wasm(monkeypatch, tmp_path)
+    app = app_with_bridge(_settings())
+    cached_wasm(monkeypatch, tmp_path)
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
     sessions = iter(["sess-1", "sess-2"])
-    monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: next(sessions))
-    monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: next(sessions))
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._solve",
                         lambda a, token: {"X-DS-PoW-Response": "FRESH"})
 
@@ -328,7 +327,7 @@ class _FakeResp:
 
 def test_ensure_wasm_rejects_non_wasm(monkeypatch, tmp_path):
     target = tmp_path / "sha3.wasm"
-    monkeypatch.setattr("deepseaport.pow.wasm_path", lambda: target)
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.wasm_path", lambda: target)
     monkeypatch.setattr("curl_cffi.requests.get",
                         lambda *a, **k: _FakeResp(b"<!doctype html><html>nope</html>"))
 
@@ -340,7 +339,7 @@ def test_ensure_wasm_rejects_non_wasm(monkeypatch, tmp_path):
 def test_ensure_wasm_accepts_valid_module(monkeypatch, tmp_path):
     target = tmp_path / "sha3.wasm"
     payload = b"\x00asm\x01\x00\x00\x00" + b"z" * 2000
-    monkeypatch.setattr("deepseaport.pow.wasm_path", lambda: target)
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.wasm_path", lambda: target)
     monkeypatch.setattr("curl_cffi.requests.get", lambda *a, **k: _FakeResp(payload))
 
     path = PoW.ensure_wasm()
@@ -354,23 +353,45 @@ def test_ensure_wasm_accepts_valid_module(monkeypatch, tmp_path):
 def test_attempt_stops_when_cancel_event_set(monkeypatch):
     """_attempt must stop consuming events once cancel_event is set."""
     consumed = {"n": 0}
+    first_event = threading.Event()
+    release = threading.Event()
 
     def fake_stream(headers, payload, **kw):
-        for i in range(1000):
-            consumed["n"] += 1
-            yield StreamEvent(kind="content", text="x")
-            time.sleep(0.001)
+        try:
+            for _ in range(1000):
+                consumed["n"] += 1
+                first_event.set()
+                yield StreamEvent(kind="content", text="x")
+                # Park between events on an Event instead of sleeping 1ms.
+                # The old sleep(0.001)/sleep(0.02) pair was a coin flip: a
+                # machine fast enough to drain all 1000 events before the
+                # watcher thread is even scheduled fails a healthy build. The
+                # park makes "the cancel landed mid-stream" the thing under
+                # test rather than "the scheduler was slow enough".
+                release.wait(_HANDSHAKE_TIMEOUT)
+                if cancel.is_set():
+                    return
+        finally:
+            release.set()
 
-    monkeypatch.setattr("deepseaport.server.DS.stream_completion", fake_stream)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.stream_completion", fake_stream)
     cancel = threading.Event()
+    watcher_errors: list[str] = []
 
-    def set_soon():
-        time.sleep(0.02)
+    def set_after_first_event():
+        if not first_event.wait(_HANDSHAKE_TIMEOUT):
+            watcher_errors.append("producer never yielded an event")
+        # Unconditional, including on the failure path: a producer left parked
+        # for the full timeout x 1000 events would stall the suite instead of
+        # failing this test.
         cancel.set()
+        release.set()
 
-    threading.Thread(target=set_soon, daemon=True).start()
+    threading.Thread(target=set_after_first_event, daemon=True).start()
     content, _think, error, _usage = _attempt(
         {"h": "1"}, {"p": "1"}, cancel_event=cancel)
+    release.set()
+    assert not watcher_errors, watcher_errors
     assert error is None
     assert consumed["n"] < 1000, "producer kept streaming after cancellation"
 
@@ -381,29 +402,50 @@ def test_generator_close_releases_account_lock(monkeypatch, tmp_path):
 
     from deepseaport.accounts import AccountPool
 
-    app = _app_with_bridge(_settings(stream_mode="live", auto_delete_session=False,
+    app = app_with_bridge(_settings(stream_mode="live", auto_delete_session=False,
                                      max_retries=0))
-    _cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-1")
-    monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
+    cached_wasm(monkeypatch, tmp_path)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-1")
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
 
     state = {"closed": False, "emitted": 0}
+    lock_released = threading.Event()
 
     def fake_stream(headers, payload, **kw):
         try:
             for _ in range(1000):
                 state["emitted"] += 1
                 yield StreamEvent(kind="thinking", text="t")
+                # LOAD-BEARING, do not delete or shrink towards 0.
+                #
+                # Cancellation here is only observable at a yield boundary:
+                # `drain_attempt` pulls an event and *then* checks
+                # cancel_event, and cancel_event is set by the async generator's
+                # finalization, which does not run synchronously inside
+                # `aclose()`. So the producer must still be mid-stream when that
+                # check happens. A free-running generator delivers all 1000
+                # events before the finalization lands -- measured on this
+                # machine at 156 / 398 / 401 / 1000 across four runs of an
+                # unpaced version, i.e. an outright coin flip against
+                # `emitted < 1000`. The 5ms is not a timing assertion and is
+                # not a budget to be tuned down; it is the producer's event
+                # cadence, and it buys roughly three orders of magnitude of
+                # margin (the stream would need ~5s to drain).
                 time.sleep(0.005)
         finally:
             state["closed"] = True
 
-    monkeypatch.setattr("deepseaport.server.DS.stream_completion", fake_stream)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.stream_completion", fake_stream)
 
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
     pool = AccountPool([])
     item.lock.acquire()
+    # Delegate to the real lock and announce the release. The old assertion
+    # polled `item.lock.locked()` 300 times with asyncio.sleep(0.01) between --
+    # up to 3s of pure waiting, and on a busy runner 300 polls is not obviously
+    # enough either. The release is a discrete event, so wait on that directly.
+    item.lock = _AnnouncingLock(item.lock, lock_released)
     prep = _prepare({"model": "deepseek-flash-reasoner", "stream": True,
                      "messages": [{"role": "user", "content": "hi"}]})
 
@@ -412,11 +454,10 @@ def test_generator_close_releases_account_lock(monkeypatch, tmp_path):
         await agen.__anext__()  # role chunk
         await agen.__anext__()  # first live delta
         await agen.aclose()
-        for _ in range(300):
-            if not item.lock.locked():
-                return True
-            await asyncio.sleep(0.01)
-        return False
+        # Waiting on a threading.Event from the loop thread would block it, so
+        # hand the wait to a worker and await its result.
+        return await asyncio.get_running_loop().run_in_executor(
+            None, lock_released.wait, _HANDSHAKE_TIMEOUT)
 
     released = asyncio.run(scenario())
     assert released, "account lock not released after generator close"
@@ -433,18 +474,18 @@ def test_banned_error_raises_403_with_expiry(monkeypatch, tmp_path):
 
     from fastapi import HTTPException
 
-    app = _app_with_bridge(_settings(max_retries=0))
-    _cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-ban")
-    monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
+    app = app_with_bridge(_settings(max_retries=0))
+    cached_wasm(monkeypatch, tmp_path)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-ban")
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
     ban_until = _time.time() + 86400
     monkeypatch.setattr(
         "deepseaport.providers.deepseek.completion_service._attempt",
         lambda *a, **k: ("", "", "5: user is muted (suspended until 16 September 2026 12:49)", 0),
     )
-    monkeypatch.setattr("deepseaport.server.DS.check_ban", lambda h, timeout=15: (True, ban_until))
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.check_ban", lambda h, timeout=15: (True, ban_until))
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(email="banned@x.com", token="tok"))
@@ -477,7 +518,7 @@ def _two_account_app():
         accounts=[AccountConfig(email="a@x.com", token="tok-a-1234567890"),
                   AccountConfig(email="b@x.com", token="tok-b-1234567890")],
         active_account="a@x.com")
-    app = _app_with_bridge(settings)
+    app = app_with_bridge(settings)
     pool = AccountPool(settings.accounts, current=settings.active_account)
     return app, settings, pool
 
@@ -485,7 +526,7 @@ def _two_account_app():
 def test_ban_failover_uses_next_account_and_switches_current(monkeypatch):
     """Banned CURRENT must transparently retry on the next unbanned account."""
     from deepseaport.accounts import AccountPool
-    from deepseaport.server import _complete_with_failover_sync
+    from deepseaport.providers.deepseek.completion_service import _complete_with_failover_sync
 
     app, settings, pool = _two_account_app()
     used: list = []
@@ -519,7 +560,7 @@ def test_ban_failover_all_banned_raises_403(monkeypatch):
     from fastapi import HTTPException
 
     from deepseaport.accounts import AccountPool
-    from deepseaport.server import _complete_with_failover_sync
+    from deepseaport.providers.deepseek.completion_service import _complete_with_failover_sync
 
     app, settings, pool = _two_account_app()
     used: list = []
@@ -546,7 +587,7 @@ def test_ban_failover_all_banned_raises_403(monkeypatch):
 def test_non_ban_error_does_not_failover(monkeypatch):
     """Generic failures must propagate without touching the next account."""
     from deepseaport.accounts import AccountPool
-    from deepseaport.server import _complete_with_failover_sync
+    from deepseaport.providers.deepseek.completion_service import _complete_with_failover_sync
 
     app, settings, pool = _two_account_app()
     used: list = []
@@ -571,23 +612,102 @@ def test_non_ban_error_does_not_failover(monkeypatch):
 
 
 def test_precancelled_event_aborts_session_setup_fast(monkeypatch):
-    """Fix 2: disconnect before session setup must abort, not run full PoW."""
-    import time as _time
+    """Fix 2: disconnect before session setup must abort, not run full PoW.
 
-    from deepseaport.server import _StreamCancelled, _session_and_challenge
+    This asserted `elapsed < 1.0` around a `slow_session` that slept 5s, and
+    both halves of that were inert. `_session_and_challenge` short-circuits on
+    an already-set `cancel_event` BEFORE the fake is ever submitted to the
+    challenge executor, so the fake never ran, no 5s was ever spent, and the
+    budget was met by a microsecond return on any machine at all -- it could
+    not tell a correct implementation from a broken one. What the test means is
+    that NO setup call was dispatched; recording the calls says exactly that
+    with no wall clock anywhere. The in-flight counterpart (a cancel that lands
+    after dispatch) is the next test, which is the half the clock was really
+    standing in for.
+    """
+    from deepseaport.server_concurrency import _StreamCancelled
+    from deepseaport.providers.deepseek.completion_service import _session_and_challenge
 
-    def slow_session(h):
-        _time.sleep(5)
-        return "sess-slow"
-
-    monkeypatch.setattr("deepseaport.server.DS.create_session", slow_session)
-    monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: {"a": 1})
+    dispatched: list[str] = []
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session",
+                        lambda h: dispatched.append("create_session"))
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow",
+                        lambda h: dispatched.append("fetch_pow"))
     cancel = threading.Event()
     cancel.set()
-    t0 = _time.time()
+
     with pytest.raises(_StreamCancelled):
         _session_and_challenge({"h": "1"}, parallel=True, cancel_event=cancel)
-    assert _time.time() - t0 < 1.0
+
+    assert dispatched == [], (
+        "session setup was dispatched despite a pre-set cancel_event: "
+        f"{dispatched}")
+
+
+def test_cancel_event_aborts_while_create_session_is_still_in_flight(monkeypatch):
+    """Fix 2, the half a wall-clock budget cannot express: a cancel that lands
+    AFTER the parallel setup was dispatched must raise to the caller while
+    `create_session` is still running.
+
+    Signal, not duration. `slow_session` parks on `release` until the caller
+    has already raised, so the worker still being parked at the instant
+    `_StreamCancelled` reaches the caller is a direct observation that the
+    caller did not wait for the future -- which is what the old
+    `_time.time() - t0 < 1.0` was approximating with a 5s sleep. The park is
+    bounded so a regression which does block fails this test in seconds
+    instead of hanging the suite.
+    """
+    from deepseaport.server_concurrency import _StreamCancelled
+    from deepseaport.providers.deepseek.completion_service import _session_and_challenge
+
+    in_flight = threading.Event()
+    release = threading.Event()
+    unwound = threading.Event()
+
+    def slow_session(h):
+        in_flight.set()
+        release.wait(_HANDSHAKE_TIMEOUT)
+        unwound.set()
+        return "sess-slow"
+
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", slow_session)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: {"a": 1})
+    # The aborted future still yields its id, which _delete_session_bg then
+    # hands to the real delete_session. Stub it: this test is about the abort,
+    # and an outbound call is not.
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.delete_session",
+                        lambda h, sid: None)
+    cancel = threading.Event()
+    watcher_errors: list[str] = []
+
+    def _cancel_once_in_flight():
+        if not in_flight.wait(_HANDSHAKE_TIMEOUT):
+            watcher_errors.append("create_session never started")
+        # Unconditional, including on the failure path: a caller left parked in
+        # `_await_cancelable`'s poll loop would hang the suite rather than
+        # failing this test.
+        cancel.set()
+
+    threading.Thread(target=_cancel_once_in_flight, daemon=True).start()
+
+    with pytest.raises(_StreamCancelled):
+        _session_and_challenge({"h": "1"}, parallel=True, cancel_event=cancel)
+
+    assert not watcher_errors, watcher_errors
+    # Snapshot taken the instant the caller returned, BEFORE we release the
+    # worker. The worker can only leave its park if `release` is set (we set it
+    # after this snapshot) or the park times out, and the park is 200x the
+    # 50ms cancel poll. So "not unwound yet" here can only mean the caller
+    # raised without waiting for the future; a caller that blocked on it would
+    # have sat out the whole park and unwound before returning. That ordering
+    # is the assertion -- no elapsed time is measured anywhere.
+    still_in_flight = not unwound.is_set()
+    release.set()
+    assert unwound.wait(_HANDSHAKE_TIMEOUT), \
+        "the in-flight create_session never unwound"
+    assert still_in_flight, (
+        "_session_and_challenge waited for the in-flight create_session "
+        "instead of aborting on cancel_event")
 
 
 def test_nonstream_endpoint_takes_request_param():
@@ -607,7 +727,7 @@ def test_nonstream_disconnect_while_queued_returns_499(monkeypatch):
     import asyncio
 
     from deepseaport.accounts import AccountPool
-    from deepseaport.server import _acquire_slot_or_499
+    from deepseaport.server_concurrency import _acquire_slot_or_499
     from fastapi import HTTPException
 
     pool = AccountPool([AccountConfig(email="a@x.com", token="tok")])
@@ -629,27 +749,38 @@ def test_nonstream_disconnect_while_queued_returns_499(monkeypatch):
         AccountPool.release(held)
 
 
-def test_stream_producer_uses_bounded_executor():
-    """Fix 3: stream producers submit to a bounded executor, not raw threads."""
+@pytest.mark.parametrize("provider", ["deepseek", "qwen", "opencode"])
+def test_stream_producer_uses_bounded_executor(provider):
+    """Fix 3: stream producers submit to a bounded executor, not raw threads.
+
+    Parametrized over all three `completion_service` modules because each owns
+    its own `_stream_completion` and each is a separate submit site; a source
+    grep of only the deepseek one would let qwen's or opencode's regress to
+    raw threads unnoticed.
+    """
+    import importlib
     import inspect
 
-    from deepseaport import server as S
+    from deepseaport import server_concurrency as SC
 
-    src = inspect.getsource(S._stream_completion)
-    assert "_STREAM_EXECUTOR.submit" in src
-    assert S._STREAM_EXECUTOR._max_workers <= 64
+    mod = importlib.import_module(
+        f"deepseaport.providers.{provider}.completion_service")
+
+    src = inspect.getsource(mod._stream_completion)
+    assert "_STREAM_EXECUTOR.submit" in src, f"{provider} streams off a raw thread"
+    assert SC._STREAM_EXECUTOR._max_workers <= 64
 
 
 def test_no_bridge_surfaces_real_error(monkeypatch, tmp_path):
     """Fix 4: missing bridge must not mask the PoW error with AttributeError."""
     app = create_app(_settings())
     assert not hasattr(app.state, "bridge")
-    _cached_wasm(monkeypatch, tmp_path)
+    cached_wasm(monkeypatch, tmp_path)
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg",
                         lambda *a, **k: None)
-    monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-1")
-    monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: None)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-1")
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: None)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
@@ -690,12 +821,12 @@ def _token_settings():
 
 def test_completion_40003_refreshes_token_and_retries(monkeypatch, tmp_path):
     """A 40003 error event must trigger one Obscura refresh + retry."""
-    app = _app_with_bridge(_token_settings())
-    _cached_wasm(monkeypatch, tmp_path)
+    app = app_with_bridge(_token_settings())
+    cached_wasm(monkeypatch, tmp_path)
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
-    monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-1")
-    monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-1")
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._solve",
                         lambda a, token: {"Authorization": f"Bearer {token}"})
 
@@ -732,12 +863,12 @@ def test_completion_40003_after_refresh_surfaces_401(monkeypatch, tmp_path):
     """A second 40003 (fresh token also rejected) must surface, not loop."""
     from fastapi import HTTPException
 
-    app = _app_with_bridge(_token_settings())
-    _cached_wasm(monkeypatch, tmp_path)
+    app = app_with_bridge(_token_settings())
+    cached_wasm(monkeypatch, tmp_path)
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
-    monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-1")
-    monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-1")
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._solve",
                         lambda a, token: {"Authorization": f"Bearer {token}"})
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._attempt",
@@ -757,8 +888,8 @@ def test_completion_40003_after_refresh_surfaces_401(monkeypatch, tmp_path):
 
 def test_session_create_40003_refreshes_token(monkeypatch, tmp_path):
     """40003 raised at session create must refresh and retry, not 500."""
-    app = _app_with_bridge(_token_settings())
-    _cached_wasm(monkeypatch, tmp_path)
+    app = app_with_bridge(_token_settings())
+    cached_wasm(monkeypatch, tmp_path)
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
 
     sessions = {"n": 0}
@@ -770,9 +901,9 @@ def test_session_create_40003_refreshes_token(monkeypatch, tmp_path):
                                "Authorization Failed (invalid token)")
         return "sess-fresh"
 
-    monkeypatch.setattr("deepseaport.server.DS.create_session", fake_create)
-    monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", fake_create)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._solve",
                         lambda a, token: {"Authorization": f"Bearer {token}"})
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._attempt",
@@ -797,7 +928,7 @@ def test_auth_failover_uses_next_token_account_and_switches_current(monkeypatch)
     from fastapi import HTTPException
 
     from deepseaport.accounts import AccountPool
-    from deepseaport.server import _complete_with_failover_sync
+    from deepseaport.providers.deepseek.completion_service import _complete_with_failover_sync
 
     app, settings, pool = _two_account_app()
     used: list = []
@@ -832,7 +963,7 @@ def test_auth_failover_all_invalid_raises_original_401(monkeypatch):
     from fastapi import HTTPException
 
     from deepseaport.accounts import AccountPool
-    from deepseaport.server import _complete_with_failover_sync
+    from deepseaport.providers.deepseek.completion_service import _complete_with_failover_sync
 
     app, settings, pool = _two_account_app()
     used: list = []
@@ -858,7 +989,7 @@ def test_ban_403_persists_banned_state_for_account_list(tmp_path):
     import time as _time
 
     from deepseaport.config import load_settings
-    from deepseaport.server import _ban_403_for_item
+    from deepseaport.providers.deepseek.completion_service import _ban_403_for_item
 
     path = tmp_path / "config.json"
     settings = _settings(
@@ -866,7 +997,7 @@ def test_ban_403_persists_banned_state_for_account_list(tmp_path):
         active_account="banned@x.com",
         config_path=str(path),
     )
-    app = _app_with_bridge(settings)
+    app = app_with_bridge(settings)
     item = PooledAccount(cfg=settings.accounts[0])
     until = _time.time() + 86400
 
@@ -882,12 +1013,12 @@ def test_ban_403_persists_banned_state_for_account_list(tmp_path):
 
 def test_token_refresh_normalizes_json_wrapper(monkeypatch):
     """Real-browser login returns localStorage JSON; never store it verbatim."""
-    from deepseaport.server import _refresh_token_via_obscura
+    from deepseaport.providers.deepseek.completion_service import _refresh_token_via_obscura
 
     settings = _settings(accounts=[AccountConfig(email="a@x.com", password="pw",
                                                  token="stale-token-1234567890")],
                          config_path="")
-    app = _app_with_bridge(settings)
+    app = app_with_bridge(settings)
     item = PooledAccount(cfg=settings.accounts[0])
     raw = '{"value":"' + ("x" * 64) + '","__version":"0"}'
     monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
@@ -910,12 +1041,12 @@ def test_token_refresh_releases_slot_during_browser_run(monkeypatch):
     """
     import threading as _threading
 
-    from deepseaport.server import _refresh_token_via_obscura
+    from deepseaport.providers.deepseek.completion_service import _refresh_token_via_obscura
 
     settings = _settings(accounts=[AccountConfig(email="a@x.com", password="pw",
                                                  token="stale-token-1234567890")],
                          config_path="")
-    app = _app_with_bridge(settings)
+    app = app_with_bridge(settings)
     item = PooledAccount(cfg=settings.accounts[0])
     item.lock.acquire()  # as run_with_failover holds it during the attempt
     seen_free = []

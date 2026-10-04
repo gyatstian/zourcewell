@@ -3,6 +3,7 @@
 import json
 import logging
 import types
+from support import FakeUvicornConfig, FakeUvicornServer, AliveThread, DeadThread
 
 
 def _mk_acc(email, token="t1"):
@@ -10,46 +11,10 @@ def _mk_acc(email, token="t1"):
     return AccountConfig(email=email, token=token)
 
 
-class _FakeCfg:
-    def __init__(self, *a, **k):
-        pass
-
-
-class _FakeSrv:
-    def __init__(self, cfg=None):
-        self.should_exit = False
-        self.config = cfg
-
-    def run(self):
-        pass
-
-
-class _AliveThread:
-    def __init__(self, target=None, daemon=None):
-        self._target = target
-        self.daemon = daemon
-        self.started = False
-        self._alive = True
-
-    def start(self):
-        self.started = True
-
-    def is_alive(self):
-        return True
-
-    def join(self, timeout=None):
-        self._alive = False
-
-
-class _DeadThread(_AliveThread):
-    def is_alive(self):
-        return False
-
-
 def _install_single_fakes(monkeypatch, chat_ui, wait_ret=True, post_ret="hi", dead=False):
-    monkeypatch.setattr("uvicorn.Config", _FakeCfg)
-    monkeypatch.setattr("uvicorn.Server", _FakeSrv)
-    monkeypatch.setattr("threading.Thread", _DeadThread if dead else _AliveThread)
+    monkeypatch.setattr("uvicorn.Config", FakeUvicornConfig)
+    monkeypatch.setattr("uvicorn.Server", FakeUvicornServer)
+    monkeypatch.setattr("threading.Thread", DeadThread if dead else AliveThread)
     monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
     monkeypatch.setattr(chat_ui, "_wait_for_server", lambda *a, **k: wait_ret)
     if isinstance(post_ret, Exception):
@@ -341,14 +306,14 @@ def test_run_multi_repl_roundrobin_commands(monkeypatch, capsys):
                         lambda h, b, n, is_free=None: [5011, 5012][:n])
     created = []
 
-    class FakeSrv(_FakeSrv):
+    class FakeSrv(FakeUvicornServer):
         def __init__(self, cfg=None):
             super().__init__(cfg)
             created.append(self)
 
-    monkeypatch.setattr("uvicorn.Config", _FakeCfg)
+    monkeypatch.setattr("uvicorn.Config", FakeUvicornConfig)
     monkeypatch.setattr("uvicorn.Server", FakeSrv)
-    monkeypatch.setattr("threading.Thread", _AliveThread)
+    monkeypatch.setattr("threading.Thread", AliveThread)
     monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
     monkeypatch.setattr(chat_ui, "_wait_for_server", lambda *a, **k: True)
     calls = []
@@ -424,9 +389,9 @@ def test_run_chat_repl_unknown_history_pop_quit_logs(monkeypatch, capsys):
     root.setLevel(logging.INFO)
     try:
         monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5098)
-        monkeypatch.setattr("uvicorn.Config", _FakeCfg)
-        monkeypatch.setattr("uvicorn.Server", _FakeSrv)
-        monkeypatch.setattr("threading.Thread", _AliveThread)
+        monkeypatch.setattr("uvicorn.Config", FakeUvicornConfig)
+        monkeypatch.setattr("uvicorn.Server", FakeUvicornServer)
+        monkeypatch.setattr("threading.Thread", AliveThread)
         monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
         monkeypatch.setattr(chat_ui, "_wait_for_server", lambda *a, **k: True)
         hists = []

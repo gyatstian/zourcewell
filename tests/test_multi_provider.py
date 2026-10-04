@@ -12,6 +12,8 @@ from deepseaport.config import AccountConfig, Settings, load_settings
 from deepseaport.core import pools, registry
 from deepseaport.core.provider import ModelSpec, Provider
 from deepseaport.server import create_app
+from support import settings
+from functools import partial
 from deepseaport.server_routes import _pool, _pool_for, _prepare
 
 
@@ -28,10 +30,9 @@ class _FakeProvider(Provider):
         raise NotImplementedError("fake provider cannot complete")
 
 
-def _settings(**kw) -> Settings:
-    base = dict(accounts=[], provider="deepseek", config_path="")
-    base.update(kw)
-    return Settings(**base)
+# Default kwargs differ per file; the shared base dict lives in
+# support.py. Every list here is rebuilt per call on purpose.
+_settings = partial(settings, log_level="INFO", warmup_on_startup=True)
 
 
 # 1. AccountConfig provider default + roundtrip ---------------------------------
@@ -40,13 +41,13 @@ def _settings(**kw) -> Settings:
 def test_account_provider_default_and_roundtrip(tmp_path):
     assert AccountConfig(email="a@x.com").provider == "deepseek"
     cfg = tmp_path / "c.json"
-    s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1", provider="glm")],
+    s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1", provider="qwen")],
                  config_path=str(cfg))
     s.save()
     data = json.loads(cfg.read_text(encoding="utf-8"))
-    assert data["accounts"][0]["provider"] == "glm"
+    assert data["accounts"][0]["provider"] == "qwen"
     loaded = load_settings(str(cfg))
-    assert loaded.accounts[0].provider == "glm"
+    assert loaded.accounts[0].provider == "qwen"
 
 
 def test_config_missing_provider_migrates_to_deepseek(tmp_path):
@@ -63,30 +64,30 @@ def test_config_missing_provider_migrates_to_deepseek(tmp_path):
 def test_active_provider_ids_single_vs_multi():
     assert pools.active_provider_ids(_settings(provider="deepseek")) == ["deepseek"]
     assert pools.active_provider_ids(_settings(providers=[])) == ["deepseek"]
-    assert pools.active_provider_ids(_settings(providers=["glm"])) == ["deepseek"]
+    assert pools.active_provider_ids(_settings(providers=["no-such-provider"])) == ["deepseek"]
     assert pools.active_provider_ids(
-        _settings(providers=["deepseek", "glm", "DEEPSEEK", ""])) == ["deepseek", "glm"]
+        _settings(providers=["deepseek", "qwen", "DEEPSEEK", ""])) == ["deepseek", "qwen"]
     assert pools.is_multi(_settings(provider="deepseek")) is False
-    assert pools.is_multi(_settings(providers=["deepseek", "glm"])) is True
+    assert pools.is_multi(_settings(providers=["deepseek", "qwen"])) is True
 
 
 def test_accounts_for_provider_filters():
-    s = _settings(providers=["deepseek", "glm"], accounts=[
+    s = _settings(providers=["deepseek", "qwen"], accounts=[
         AccountConfig(email="a@x.com", token="t1"),
-        AccountConfig(email="b@x.com", token="t2", provider="glm"),
-        AccountConfig(email="c@x.com", token="t3", provider="GLM"),
+        AccountConfig(email="b@x.com", token="t2", provider="qwen"),
+        AccountConfig(email="c@x.com", token="t3", provider="QWEN"),
     ])
     assert [a.email for a in pools.accounts_for_provider(s, "deepseek")] == ["a@x.com"]
-    assert [a.email for a in pools.accounts_for_provider(s, "glm")] == ["b@x.com", "c@x.com"]
+    assert [a.email for a in pools.accounts_for_provider(s, "qwen")] == ["b@x.com", "c@x.com"]
 
 
 # 3. _pool filters by selected provider ----------------------------------------
 
 
 def test_pool_filters_by_selected_provider():
-    s = _settings(provider="glm", accounts=[
+    s = _settings(provider="qwen", accounts=[
         AccountConfig(email="a@x.com", token="t1"),
-        AccountConfig(email="b@x.com", token="t2", provider="glm"),
+        AccountConfig(email="b@x.com", token="t2", provider="qwen"),
     ])
     app = create_app(s)
     pool = _pool(app)
@@ -98,7 +99,8 @@ def test_pool_filters_by_selected_provider():
 
 
 def _register_fake() -> _FakeProvider:
-    provider = registry.register(_FakeProvider())
+    provider = _FakeProvider()
+    registry._REGISTRY[registry._key(provider)] = provider
     return provider
 
 
@@ -201,3 +203,45 @@ def test_multi_provider_pools_share_one_registry():
         assert _pool(app) is ds  # selected provider is deepseek
     finally:
         registry._REGISTRY.pop("fakep", None)
+
+
+# 7. a pool is never assembled out of another provider's accounts --------------
+#
+# `server_routes._pool` is the last place that allowed the borrow: when the
+# selected id was unregistered it fell back to `list(settings.accounts)` with
+# NO provider filter, so a bad id on a multi-provider config handed DeepSeek a
+# pool of Qwen ES256 JWTs and replayed them to chat.deepseek.com as userTokens.
+# The account routes, `accounts.usable_provider` and tests/test_live_smoke.py
+# all refuse the borrow; these pin that the pool builder does too.
+
+
+def test_an_unregistered_selected_provider_never_borrows_another_accounts():
+    s = settings(provider="nope", accounts=[
+        AccountConfig(email="ds@x.com", token="t-ds"),
+        AccountConfig(email="qw@x.com", token="t-qw", provider="qwen"),
+    ])
+
+    pool = _pool(create_app(s))
+
+    assert pool.status() == [], (
+        "the unregistered provider borrowed "
+        f"{[r['identifier'] for r in pool.status()]}")
+    # The lend was only ever a read: nothing was taken away either.
+    assert len(s.accounts) == 2
+
+
+def test_a_registered_provider_with_no_bound_account_is_also_empty():
+    """The sibling half: right shape, right name, still nobody else's token."""
+    s = settings(provider="qwen", accounts=[AccountConfig(email="ds@x.com", token="t")])
+
+    assert _pool(create_app(s)).status() == []
+
+
+def test_the_borrow_never_reaches_the_account_routes():
+    """POST /v1/accounts with an unregistered provider is a 400, not a lend."""
+    s = settings(provider="nope", accounts=[AccountConfig(email="ds@x.com", token="t")])
+    resp = TestClient(create_app(s)).post("/v1/accounts", json={
+        "email": "new@x.com", "token": "tok-new", "provider": "glm"})
+
+    assert resp.status_code == 400, resp.text
+    assert s.accounts == [s.accounts[0]], "the rejected account was stored anyway"

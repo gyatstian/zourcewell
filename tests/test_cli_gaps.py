@@ -12,6 +12,10 @@ import json
 import time
 import types
 
+import pytest
+
+from support import on_disk, write_config
+
 from deepseaport.cli import (
     _ensure_free_port,
     _next_free_port,
@@ -21,12 +25,6 @@ from deepseaport.cli import (
     cmd_accounts,
     main as cli_main,
 )
-
-
-def _write_cfg(tmp_path, payload: dict):
-    p = tmp_path / "config.json"
-    p.write_text(json.dumps(payload), encoding="utf-8")
-    return str(p)
 
 
 def _load(path):
@@ -40,7 +38,7 @@ def _load(path):
 def test_login_success_saves_token_and_active(tmp_path, monkeypatch):
     import deepseaport.cli as cli_mod
 
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda email, password, settings: ("tok123", False, ""))
     rc = cli_main(["--config", cfg, "login", "--email", "a@x.com", "--password", "pw"])
@@ -56,7 +54,7 @@ def test_login_banned_with_token_returns_3_and_persists_banned(tmp_path, monkeyp
     import deepseaport.accounts as acc_mod
     import deepseaport.cli as cli_mod
 
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda email, password, settings: ("tok-banned", True, "suspended"))
     monkeypatch.setattr(acc_mod, "check_ban_for_token", lambda token, timeout=12: (True, None))
@@ -73,7 +71,7 @@ def test_login_banned_with_token_returns_3_and_persists_banned(tmp_path, monkeyp
 def test_login_no_token_returns_3(tmp_path, monkeypatch):
     import deepseaport.cli as cli_mod
 
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda email, password, settings: (None, False, ""))
     rc = cli_main(["--config", cfg, "login", "--email", "c@x.com", "--password", "pw"])
@@ -84,7 +82,7 @@ def test_login_no_token_returns_3(tmp_path, monkeypatch):
 def test_login_banned_no_token_returns_3(tmp_path, monkeypatch, capsys):
     import deepseaport.cli as cli_mod
 
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda email, password, settings: (None, True, "suspended detail"))
     rc = cli_main(["--config", cfg, "login", "--email", "d@x.com", "--password", "pw"])
@@ -97,28 +95,29 @@ def test_login_banned_no_token_returns_3(tmp_path, monkeypatch, capsys):
 
 def _patch_chat(monkeypatch, thinking="think-stuff", content="hello"):
     import deepseaport.accounts as acc_mod
-    import deepseaport.obscura_bridge as bridge_mod
+    import deepseaport.core.obscura_bridge as bridge_mod
+    import deepseaport.providers.deepseek.completion_service as ds_cs
     import deepseaport.server as srv_mod
 
     fake_app = types.SimpleNamespace(state=types.SimpleNamespace(bridge=None))
     monkeypatch.setattr(srv_mod, "create_app", lambda settings=None: fake_app)
 
-    class _FakeBridge:
+    class _FakeObscuraBridge:
         def __init__(self, *a, **k):
             self.state = types.SimpleNamespace(user_agent="ua", cookies={})
 
         def warmup(self, timeout=45):
             return {}
 
-    monkeypatch.setattr(bridge_mod, "ObscuraBridge", _FakeBridge)
+    monkeypatch.setattr(bridge_mod, "ObscuraBridge", _FakeObscuraBridge)
     monkeypatch.setattr(bridge_mod, "register_default_bridge", lambda *a, **k: None)
     monkeypatch.setattr(acc_mod.AccountPool, "acquire", lambda self, timeout=30, allow_failover=True: object())
-    monkeypatch.setattr(srv_mod, "_complete_with_failover_sync",
+    monkeypatch.setattr(ds_cs, "_complete_with_failover_sync",
                         lambda app, pool, prep, item, **k: {"content": content, "thinking": thinking})
 
 
 def test_chat_returns_0_and_prints_thinking(tmp_path, monkeypatch, capsys):
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": [{"email": "a@x.com", "token": "tok123"}]})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [{"email": "a@x.com", "token": "tok123"}]})
     _patch_chat(monkeypatch, thinking="think-stuff", content="hello")
     rc = cli_main(["--config", cfg, "chat", "--prompt", "hi"])
     assert rc == 0
@@ -129,13 +128,219 @@ def test_chat_returns_0_and_prints_thinking(tmp_path, monkeypatch, capsys):
 
 
 def test_chat_no_thinking_prints_content_only(tmp_path, monkeypatch, capsys):
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": [{"email": "a@x.com", "token": "tok123"}]})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [{"email": "a@x.com", "token": "tok123"}]})
     _patch_chat(monkeypatch, thinking="", content="just-content")
     rc = cli_main(["--config", cfg, "chat", "--prompt", "hi"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "THINKING" not in out
     assert "just-content" in out
+
+
+def test_chat_dispatches_through_the_selected_provider_not_deepseeks_engine(
+        tmp_path, monkeypatch, capsys):
+    """Finding 6. `chat --provider qwen` ran DeepSeek's whole code path.
+
+    Pre-change ``cmd_chat`` imported DeepSeek's
+    ``_complete_with_failover_sync`` unconditionally and called it for EVERY
+    provider. That function closes over DeepSeek's module global
+    ``_run_completion_core`` and never reads ``prep["provider"]``, so a Qwen
+    account was selected, validated, pooled -- and its ES256 JWT was then sent
+    to chat.deepseek.com as a ``userToken``.
+
+    The two tests above could never see it: they monkeypatch DeepSeek's engine
+    global, which is exactly the seam the bug hid behind. So this asserts
+    WHICH callable ran -- each provider's own ``Provider.complete`` -- and
+    makes DeepSeek's engine raise if it is entered at all.
+    """
+    import deepseaport.accounts as acc_mod
+    import deepseaport.core.obscura_bridge as bridge_mod
+    import deepseaport.providers.deepseek.completion_service as ds_cs
+    import deepseaport.providers.deepseek.provider as ds_prov
+    import deepseaport.providers.qwen.provider as qw_prov
+    import deepseaport.server as srv_mod
+
+    monkeypatch.setattr(srv_mod, "create_app",
+                        lambda settings=None: types.SimpleNamespace(
+                            state=types.SimpleNamespace(bridge=None)))
+
+    class _FakeObscuraBridge:
+        def __init__(self, *a, **k):
+            self.state = types.SimpleNamespace(user_agent="ua", cookies={})
+
+        def warmup(self, timeout=45):
+            return {}
+
+    monkeypatch.setattr(bridge_mod, "ObscuraBridge", _FakeObscuraBridge)
+    monkeypatch.setattr(bridge_mod, "register_default_bridge", lambda *a, **k: None)
+    monkeypatch.setattr(acc_mod.AccountPool, "acquire",
+                        lambda self, timeout=30, allow_failover=True: object())
+
+    ran: list[str] = []
+
+    def _qwen_complete(self, app, pool, prep, first_item, cancel_event=None,
+                       on_content=None, on_thinking=None):
+        ran.append(("qwen", first_item, prep.get("provider")))
+        return {"content": "qwen-answer", "thinking": ""}
+
+    def _ds_complete(self, *a, **k):
+        ran.append(("deepseek", None, None))
+        return {"content": "deepseek-answer", "thinking": ""}
+
+    def _ds_engine_entered(*a, **k):
+        raise AssertionError("DeepSeek's engine ran for a --provider qwen chat")
+
+    monkeypatch.setattr(qw_prov.QwenProvider, "complete", _qwen_complete)
+    monkeypatch.setattr(ds_prov.DeepSeekProvider, "complete", _ds_complete)
+    monkeypatch.setattr(ds_cs, "_complete_with_failover_sync", _ds_engine_entered)
+
+    cfg = write_config(tmp_path, {
+        "keys": [],
+        "accounts": [{"email": "a@x.com", "token": "qwen-jwt",
+                      "provider": "qwen"}]})
+
+    rc = cli_main(["--config", cfg, "chat", "--provider", "qwen",
+                   "--model", "qwen3.7-plus", "--prompt", "hi"])
+
+    assert rc == 0
+    # Which callable ran, in one assertion -- not "some engine was reached".
+    assert [name for name, _item, _pp in ran] == ["qwen"]
+    assert ran[0][2] == "qwen", "prep was not resolved to the qwen provider"
+    assert "qwen-answer" in capsys.readouterr().out
+
+
+def test_chat_ban_failover_survives_the_provider_dispatch(tmp_path, monkeypatch):
+    """The dispatch must not cost cmd_chat its same-request ban failover.
+
+    The replaced line existed to get ban failover (a banned CURRENT transparently
+    retries on the next unbanned account). Routing through ``Provider.complete``
+    keeps it only because every provider delegates to its OWN
+    _complete_with_failover_sync -- so this asserts Qwen's engine, not DeepSeek's,
+    is the one that owns the retry.
+    """
+    import deepseaport.accounts as acc_mod
+    import deepseaport.core.obscura_bridge as bridge_mod
+    import deepseaport.providers.qwen.completion_service as qw_cs
+    import deepseaport.server as srv_mod
+
+    monkeypatch.setattr(srv_mod, "create_app",
+                        lambda settings=None: types.SimpleNamespace(
+                            state=types.SimpleNamespace(bridge=None)))
+
+    class _FakeObscuraBridge:
+        def __init__(self, *a, **k):
+            self.state = types.SimpleNamespace(user_agent="ua", cookies={})
+
+        def warmup(self, timeout=45):
+            return {}
+
+    monkeypatch.setattr(bridge_mod, "ObscuraBridge", _FakeObscuraBridge)
+    monkeypatch.setattr(bridge_mod, "register_default_bridge", lambda *a, **k: None)
+    monkeypatch.setattr(acc_mod.AccountPool, "acquire",
+                        lambda self, timeout=30, allow_failover=True: object())
+
+    seen: dict = {}
+
+    def _engine(app, pool, prep, item, cancel_event=None, **k):
+        seen["engine"] = "qwen"
+        seen["cancel_event"] = cancel_event
+        return {"content": "after-failover", "thinking": ""}
+
+    monkeypatch.setattr(qw_cs, "_complete_with_failover_sync", _engine)
+
+    cfg = write_config(tmp_path, {
+        "keys": [],
+        "accounts": [{"email": "a@x.com", "token": "qwen-jwt",
+                      "provider": "qwen"}]})
+
+    assert cli_main(["--config", cfg, "chat", "--provider", "qwen",
+                     "--model", "qwen3.7-plus", "--prompt", "hi"]) == 0
+    assert seen == {"engine": "qwen", "cancel_event": None}
+
+
+def test_chat_reaches_the_accountless_provider_without_a_pool(tmp_path, monkeypatch,
+                                                             capsys):
+    """Finding 6, other half: the accountless branch must not touch DeepSeek.
+
+    ``chat --provider opencode`` skips the pool entirely. Asserting opencode's
+    own provider ran with pool=None/item=None proves both branches dispatch.
+    """
+    import deepseaport.core.obscura_bridge as bridge_mod
+    import deepseaport.providers.deepseek.completion_service as ds_cs
+    import deepseaport.providers.opencode.provider as oc_prov
+    import deepseaport.server as srv_mod
+
+    monkeypatch.setattr(srv_mod, "create_app",
+                        lambda settings=None: types.SimpleNamespace(
+                            state=types.SimpleNamespace(bridge=None)))
+    monkeypatch.setattr(bridge_mod, "ObscuraBridge",
+                        lambda *a, **k: pytest.fail("opencode needs no WAF bridge"))
+    monkeypatch.setattr(bridge_mod, "register_default_bridge", lambda *a, **k: None)
+
+    seen: dict = {}
+
+    def _oc_complete(self, app, pool, prep, first_item, cancel_event=None,
+                     on_content=None, on_thinking=None):
+        seen.update(pool=pool, item=first_item, provider=prep.get("provider"))
+        return {"content": "local-answer", "thinking": ""}
+
+    def _ds_engine_entered(*a, **k):
+        raise AssertionError("DeepSeek's engine ran for --provider opencode")
+
+    monkeypatch.setattr(oc_prov.OpencodeProvider, "complete", _oc_complete)
+    monkeypatch.setattr(ds_cs, "_complete_with_failover_sync", _ds_engine_entered)
+
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
+
+    rc = cli_main(["--config", cfg, "chat", "--provider", "opencode",
+                   "--model", "opencode/muse-spark-1.3-contributor-free",
+                   "--prompt", "hi"])
+
+    assert rc == 0
+    assert seen == {"pool": None, "item": None, "provider": "opencode"}
+    assert "local-answer" in capsys.readouterr().out
+
+
+def test_chat_refuses_instead_of_raising_when_no_provider_resolves(
+        tmp_path, monkeypatch, capsys):
+    """The account-holding branch needs a provider; ``None`` must not crash.
+
+    ``cmd_chat`` resolves the provider defensively, so it can be None. The
+    branch below it has no provider to dispatch to, and a one-shot CLI prints a
+    raw traceback as its whole UX -- so it takes the same _chat_fail path every
+    other failure there takes, and exits 1.
+    """
+    import deepseaport.accounts as acc_mod
+    import deepseaport.core.obscura_bridge as bridge_mod
+    import deepseaport.core.registry as reg_mod
+    import deepseaport.server as srv_mod
+
+    monkeypatch.setattr(srv_mod, "create_app",
+                        lambda settings=None: types.SimpleNamespace(
+                            state=types.SimpleNamespace(bridge=None)))
+
+    class _FakeObscuraBridge:
+        def __init__(self, *a, **k):
+            self.state = types.SimpleNamespace(user_agent="ua", cookies={})
+
+        def warmup(self, timeout=45):
+            return {}
+
+    monkeypatch.setattr(bridge_mod, "ObscuraBridge", _FakeObscuraBridge)
+    monkeypatch.setattr(bridge_mod, "register_default_bridge", lambda *a, **k: None)
+    monkeypatch.setattr(acc_mod.AccountPool, "acquire",
+                        lambda self, timeout=30, allow_failover=True: object())
+    monkeypatch.setattr(reg_mod, "get", lambda pid: None)
+
+    cfg = write_config(tmp_path, {
+        "keys": [], "accounts": [{"email": "a@x.com", "token": "tok"}]})
+
+    rc = cli_main(["--config", cfg, "chat", "--prompt", "hi"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "chat failed" in out
+    assert on_disk(cfg)["accounts"][0]["token"] == "tok"  # nothing else touched
 
 
 # cmd_waf / cmd_models ----------------------------------------------------------
@@ -157,14 +362,14 @@ class _FakeWafBridge:
 
 
 def _patch_waf(monkeypatch, has_token: bool):
-    import deepseaport.obscura_bridge as bridge_mod
+    import deepseaport.core.obscura_bridge as bridge_mod
 
     monkeypatch.setattr(bridge_mod, "ObscuraBridge",
                         lambda binary="", profile="": _FakeWafBridge(has_token))
 
 
 def test_waf_warmup_true_returns_0(tmp_path, monkeypatch, capsys):
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     _patch_waf(monkeypatch, True)
     assert cli_main(["--config", cfg, "waf"]) == 0
     out = capsys.readouterr().out
@@ -173,7 +378,7 @@ def test_waf_warmup_true_returns_0(tmp_path, monkeypatch, capsys):
 
 
 def test_waf_no_token_returns_2(tmp_path, monkeypatch):
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     _patch_waf(monkeypatch, False)
     assert cli_main(["--config", cfg, "waf"]) == 2
 
@@ -181,7 +386,7 @@ def test_waf_no_token_returns_2(tmp_path, monkeypatch):
 def test_models_prints_4_ids(tmp_path, monkeypatch, capsys):
     from deepseaport.server import MODELS
 
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     assert cli_main(["--config", cfg, "models"]) == 0
     out = capsys.readouterr().out
     ids = json.loads(out)
@@ -194,7 +399,7 @@ def test_models_prints_4_ids(tmp_path, monkeypatch, capsys):
 def test_accounts_list_ban_label_and_missing_hint(tmp_path, monkeypatch, capsys):
     import deepseaport.accounts as acc_mod
 
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": [
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [
         {"email": "a@x.com", "token": "tok-with-token-1234567890"},
         {"email": "b@x.com", "token": ""},
     ]})
@@ -207,7 +412,7 @@ def test_accounts_list_ban_label_and_missing_hint(tmp_path, monkeypatch, capsys)
 
 
 def test_accounts_select_clear(tmp_path):
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": [
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [
         {"email": "a@x.com", "token": "t1"},
     ], "active_account": "a@x.com"})
     assert cli_main(["--config", cfg, "accounts", "select", "--clear"]) == 0
@@ -215,13 +420,13 @@ def test_accounts_select_clear(tmp_path):
 
 
 def test_accounts_add_missing_id_returns_2(tmp_path, capsys):
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     assert cli_main(["--config", cfg, "accounts", "add"]) == 2
     assert "need --email" in capsys.readouterr().out
 
 
 def test_accounts_set_token_missing_args_returns_2(tmp_path):
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": [
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [
         {"email": "a@x.com", "token": "t1"},
     ]})
     # Empty token value -> usage error.
@@ -232,7 +437,7 @@ def test_accounts_set_token_missing_args_returns_2(tmp_path):
 
 
 def test_accounts_remove_missing_returns_1(tmp_path, capsys):
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": [
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [
         {"email": "a@x.com", "token": "t1"},
     ]})
     assert cli_main(["--config", cfg, "accounts", "remove", "missing@x.com"]) == 1
@@ -240,13 +445,13 @@ def test_accounts_remove_missing_returns_1(tmp_path, capsys):
 
 
 def test_accounts_remove_no_identifier_returns_2(tmp_path):
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     args = argparse.Namespace(config=cfg, accounts_action="remove", identifier="")
     assert cmd_accounts(args) == 2
 
 
 def test_accounts_unblock_clears_persisted_ban(tmp_path):
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": [
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [
         {"email": "a@x.com", "token": "tok123", "banned": True, "banned_until": 0.0},
     ]})
     assert cli_main(["--config", cfg, "accounts", "unblock"]) == 0
@@ -256,7 +461,7 @@ def test_accounts_unblock_clears_persisted_ban(tmp_path):
 
 
 def test_accounts_unknown_action_returns_2(tmp_path, capsys):
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     args = argparse.Namespace(config=cfg, accounts_action="bogus")
     assert cmd_accounts(args) == 2
     assert "unknown accounts action" in capsys.readouterr().out
@@ -299,27 +504,42 @@ def test_ensure_free_port_no_free_returns_original(tmp_path, monkeypatch, capsys
     assert "no free port" in capsys.readouterr().out
 
 
-def test_run_server_workers_calls_uvicorn_run(tmp_path, monkeypatch):
+def test_run_server_single_worker_uses_uvicorn_run(tmp_path, monkeypatch):
+    """The supported path is unchanged: uvicorn.Server on the resolved port."""
     import deepseaport.cli as cli_mod
     import deepseaport.server as srv_mod
     import uvicorn
 
     from deepseaport.config import Settings
 
-    calls = {}
+    captured: dict = {}
 
-    def _fake_run(app, host=None, port=None, log_level=None, workers=None):
-        calls.update(host=host, port=port, workers=workers)
+    class _FakeConfig:
+        def __init__(self, app, **kw):
+            captured.update(kw)
 
-    monkeypatch.setattr(uvicorn, "run", _fake_run)
+    class _FakeServer:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit = False
+
+        def run(self):
+            captured["ran"] = True
+
+    monkeypatch.setattr(uvicorn, "Config", _FakeConfig)
+    monkeypatch.setattr(uvicorn, "Server", _FakeServer)
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: captured.update(run_called=True))
     monkeypatch.setattr(srv_mod, "create_app", lambda settings=None: object())
     monkeypatch.setattr(srv_mod, "apply_log_level", lambda *a, **k: None)
     monkeypatch.setattr(cli_mod, "_ensure_free_port", lambda s, h, p: p)
 
     s = Settings(port=5001, log_level="INFO", config_path=str(tmp_path / "c.json"))
-    args = argparse.Namespace(host="", port=0, workers=2)
+    args = argparse.Namespace(host="", port=0, workers=1)
     assert _run_server(s, args) == 0
-    assert calls.get("workers") == 2
+    assert captured.get("ran") is True
+    assert captured.get("port") == 5001
+    assert captured.get("host") == "127.0.0.1"
+    assert "run_called" not in captured  # the multi-worker uvicorn.run path is gone
 
 
 def test_watch_stop_keys_never_raises_with_exited_server():
@@ -347,7 +567,7 @@ def test_main_no_subcommand_defaults_to_serve(tmp_path, monkeypatch):
         seen["cmd"] = args.cmd
         return 42
     monkeypatch.setattr(cli_mod, "cmd_serve", _fake_serve)
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     assert cli_mod.main(["--config", cfg]) == 42
     assert seen["cmd"] == "serve"
 
@@ -356,7 +576,7 @@ def test_main_login_dispatch(tmp_path, monkeypatch):
     import deepseaport.cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "cmd_login", lambda args: 7)
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     assert cli_mod.main(["--config", cfg, "login", "--email", "a@x.com"]) == 7
 
 
@@ -364,7 +584,7 @@ def test_main_chat_dispatch(tmp_path, monkeypatch):
     import deepseaport.cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "cmd_chat", lambda args: 8)
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     assert cli_mod.main(["--config", cfg, "chat", "--prompt", "hi"]) == 8
 
 
@@ -383,7 +603,7 @@ def test_main_unknown_cmd_returns_1(monkeypatch):
 def test_main_waf_models_accounts_dispatch(tmp_path, monkeypatch):
     import deepseaport.cli as cli_mod
 
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "cmd_waf", lambda args: 11)
     assert cli_mod.main(["--config", cfg, "waf"]) == 11
     monkeypatch.setattr(cli_mod, "cmd_models", lambda args: 12)
@@ -415,7 +635,7 @@ def test_login_upsert_path_uses_tmp_config(tmp_path, monkeypatch):
     """Second login for same email updates token, keeps single account."""
     import deepseaport.cli as cli_mod
 
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": []})
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda email, password, settings: ("first-tok", False, ""))
     assert cli_main(["--config", cfg, "login", "--email", "e@x.com", "--password", "pw"]) == 0
@@ -431,7 +651,7 @@ def test_login_upsert_path_uses_tmp_config(tmp_path, monkeypatch):
 
 def test_unblock_single_identifier_only(tmp_path):
     future = time.time() + 3600
-    cfg = _write_cfg(tmp_path, {"keys": [], "accounts": [
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [
         {"email": "a@x.com", "token": "t1", "banned": True, "banned_until": future},
         {"email": "b@x.com", "token": "t2", "banned": True, "banned_until": future},
     ]})
@@ -440,3 +660,124 @@ def test_unblock_single_identifier_only(tmp_path):
     by_email = {a.email: a for a in s.accounts}
     assert by_email["a@x.com"].banned is False
     assert by_email["b@x.com"].banned is True
+
+
+# secrets on the command line (C9) ------------------------------------------------
+
+def test_secret_flag_value_warns_about_the_process_list(tmp_path, capsys):
+    """--token/--password expose the value to every same-user process."""
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
+    assert cli_main(["--config", cfg, "accounts", "add",
+                     "--email", "a@x.com", "--token", "tok123"]) == 0
+    out = capsys.readouterr().out
+    assert "process list" in out
+    assert "shell history" in out
+
+
+def test_login_password_flag_value_warns(tmp_path, monkeypatch, capsys):
+    import deepseaport.cli as cli_mod
+
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
+    monkeypatch.setattr(cli_mod, "_obscura_login_token",
+                        lambda e, p, s: ("tok123", False, ""))
+    assert cli_main(["--config", cfg, "login",
+                     "--email", "a@x.com", "--password", "pw"]) == 0
+    assert "process list" in capsys.readouterr().out
+
+
+def test_secret_flags_keep_working_for_scripting(tmp_path):
+    """Non-interactive callers must not be blocked by the prompt path."""
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
+    assert cli_main(["--config", cfg, "accounts", "add", "--email", "a@x.com",
+                     "--password", "pw", "--token", "tok123"]) == 0
+    acc = _load(cfg).accounts[0]
+    assert (acc.password, acc.token) == ("pw", "tok123")
+
+
+def test_missing_secret_flag_prompts_without_echo_on_a_tty(tmp_path, monkeypatch):
+    """No flag + a console -> getpass, so the secret never hits the process list."""
+    import deepseaport.cli as cli_mod
+
+    prompted: list[str] = []
+    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr("getpass.getpass", lambda p="": prompted.append(p) or "tok-typed")
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
+    assert cli_main(["--config", cfg, "accounts", "add", "--email", "a@x.com"]) == 0
+    assert _load(cfg).accounts[0].token == "tok-typed"
+    assert any("Token" in p for p in prompted)
+
+
+def test_missing_secret_flag_does_not_prompt_when_headless(tmp_path, monkeypatch):
+    """Pipes/CI: no flag and no console means no prompt, as before."""
+    import deepseaport.cli as cli_mod
+
+    called: list[str] = []
+    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: False)
+    monkeypatch.setattr("getpass.getpass", lambda p="": called.append(p) or "nope")
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
+    assert cli_main(["--config", cfg, "accounts", "add", "--email", "a@x.com"]) == 0
+    assert called == []
+    assert _load(cfg).accounts[0].token == ""
+
+
+def test_password_and_token_help_mention_the_risk(capsys):
+    """--password had no help at all; both must document the exposure."""
+    import deepseaport.cli as cli_mod
+
+    seen = []
+    for argv in (["accounts", "add", "--help"], ["login", "--help"]):
+        with pytest.raises(SystemExit) as exc:
+            cli_mod.main(argv)
+        assert exc.value.code == 0
+        seen.append(capsys.readouterr().out)
+    add_help, login_help = seen
+    assert "process list" in add_help and "shell history" in add_help
+    assert "process list" in login_help  # --password used to have no help at all
+
+
+# headless tty probe (C10) --------------------------------------------------------
+
+def test_cmd_serve_survives_missing_stdin(monkeypatch, tmp_path):
+    """sys.stdin is None under pythonw.exe: the old bare .isatty() raised."""
+    import sys as _sys
+
+    import deepseaport.cli as cli_mod
+
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [
+        {"email": "a@x.com", "token": "t1"}]})
+    monkeypatch.setattr(_sys, "stdin", None)
+    served = {}
+
+    def _serve(s, a):
+        served["ran"] = True
+        return 0
+
+    monkeypatch.setattr(cli_mod, "_run_server", _serve)
+    args = argparse.Namespace(config=cfg, host="", port=0, workers=1,
+                              no_tui=False, cmd="serve",
+                              provider=None, providers=None)
+    assert cli_mod.cmd_serve(args) == 0
+    # No console to draw on -> straight to the server, no AttributeError.
+    assert served == {"ran": True}
+
+
+def test_cmd_serve_still_opens_tui_on_a_real_tty(monkeypatch, tmp_path):
+    import sys as _sys
+
+    import deepseaport.cli as cli_mod
+    import deepseaport.tui as tui_mod
+
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [
+        {"email": "a@x.com", "token": "t1"}]})
+
+    class _Tty:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(_sys, "stdin", _Tty())
+    monkeypatch.setattr(tui_mod, "provider_menu", lambda s: None)
+    monkeypatch.setattr(tui_mod, "main_menu", lambda *a, **k: 0)
+    args = argparse.Namespace(config=cfg, host="", port=0, workers=1,
+                              no_tui=False, cmd="serve",
+                              provider=None, providers=None)
+    assert cli_mod.cmd_serve(args) == 0

@@ -11,8 +11,9 @@ import types
 
 import pytest
 
-from deepseaport import auth
-from deepseaport.auth import (
+from support import settings
+from deepseaport.providers.deepseek import auth
+from deepseaport.providers.deepseek.auth import (
     BrowserLogin,
     LoginResult,
     _collapse,
@@ -25,10 +26,16 @@ from deepseaport.auth import (
 from deepseaport.config import Settings
 
 
-def _settings(**kw):
-    base = {"obscura_bin": "dummy-obscura", "obscura_profile": "dummy-profile"}
-    base.update(kw)
-    return Settings(**base)
+# Default kwargs differ per file; the shared base dict lives in
+# support.py. Every list here is rebuilt per call on purpose.
+
+
+def _settings(**kw) -> Settings:
+    kw.setdefault("obscura_bin", "dummy-obscura")
+    kw.setdefault("obscura_profile", "dummy-profile")
+    kw.setdefault("log_level", "INFO")
+    kw.setdefault("warmup_on_startup", True)
+    return settings(**kw)
 
 
 def _text_result(text):
@@ -403,7 +410,7 @@ def test_run_timeout_detail(monkeypatch):
 # --- browser_login dispatch ---
 
 def test_browser_login_real_preferred_normalized(monkeypatch):
-    import deepseaport.real_browser as rb
+    import deepseaport.providers.deepseek.real_browser as rb
 
     raw = json.dumps({"value": "x" * 64, "__version": "0"})
     monkeypatch.setattr(rb, "login_with_real_browser", lambda *a, **k: (raw, False, "home"))
@@ -413,7 +420,7 @@ def test_browser_login_real_preferred_normalized(monkeypatch):
 
 
 def test_browser_login_real_none_falls_back(monkeypatch):
-    import deepseaport.real_browser as rb
+    import deepseaport.providers.deepseek.real_browser as rb
 
     monkeypatch.setattr(rb, "login_with_real_browser", lambda *a, **k: None)
 
@@ -426,7 +433,7 @@ def test_browser_login_real_none_falls_back(monkeypatch):
 
 
 def test_browser_login_real_raises_falls_back(monkeypatch):
-    import deepseaport.real_browser as rb
+    import deepseaport.providers.deepseek.real_browser as rb
 
     def _boom(*a, **k):
         raise RuntimeError("cdp broken")
@@ -440,10 +447,75 @@ def test_browser_login_real_raises_falls_back(monkeypatch):
     assert browser_login("a@x.com", "pw", _settings()).token == "fallback2"
 
 
+def test_browser_login_real_failure_tuple_reaches_obscura(monkeypatch):
+    """F7: a FAILED real-browser login skipped the documented Obscura fallback.
+
+    login_with_real_browser returns a (token, banned, detail) tuple for every
+    attempt, so the old `is not None` check ran the Obscura path only when no
+    browser binary resolved — a captcha / CDP error / 75s no-token timeout
+    ended the login instead of trying the second driver.
+    """
+    import deepseaport.providers.deepseek.real_browser as rb
+
+    monkeypatch.setattr(rb, "login_with_real_browser",
+                        lambda *a, **k: (None, False, "real browser login no token"))
+    seen = {}
+
+    def _fake_run(self, email, password):
+        seen["email"] = email
+        return LoginResult(token="obscura-token", detail="via-mcp")
+
+    monkeypatch.setattr(BrowserLogin, "run", _fake_run)
+    res = browser_login("a@x.com", "pw", _settings())
+    assert res.token == "obscura-token"
+    assert seen["email"] == "a@x.com"
+
+
+def test_browser_login_real_captcha_tuple_reaches_obscura(monkeypatch):
+    import deepseaport.providers.deepseek.real_browser as rb
+
+    monkeypatch.setattr(
+        rb, "login_with_real_browser",
+        lambda *a, **k: (None, False, "real browser login captcha (phrase='x')"))
+    monkeypatch.setattr(BrowserLogin, "run",
+                        lambda self, e, p: LoginResult(token="tok-after-captcha"))
+    assert browser_login("a@x.com", "pw", _settings()).token == "tok-after-captcha"
+
+
+def test_browser_login_real_ban_verdict_stops_without_obscura(monkeypatch):
+    # A ban is definitive: another driver cannot recover it, so do not spend a
+    # second browser session on it.
+    import deepseaport.providers.deepseek.real_browser as rb
+
+    monkeypatch.setattr(rb, "login_with_real_browser",
+                        lambda *a, **k: (None, True, "account suspended"))
+
+    def _boom(self, email, password):
+        raise AssertionError("a definitive ban must not re-run the Obscura driver")
+
+    monkeypatch.setattr(BrowserLogin, "run", _boom)
+    res = browser_login("a@x.com", "pw", _settings())
+    assert res.banned is True and res.token is None
+
+
+def test_browser_login_real_token_stops_without_obscura(monkeypatch):
+    import deepseaport.providers.deepseek.real_browser as rb
+
+    monkeypatch.setattr(rb, "login_with_real_browser",
+                        lambda *a, **k: ("t" * 64, False, "home"))
+
+    def _boom(self, email, password):
+        raise AssertionError("a token from the real browser must be used as-is")
+
+    monkeypatch.setattr(BrowserLogin, "run", _boom)
+    res = browser_login("a@x.com", "pw", _settings())
+    assert res.token == "t" * 64
+
+
 # --- real_browser ---
 
 def test_real_browser_clean():
-    from deepseaport.real_browser import _clean
+    from deepseaport.providers.deepseek.real_browser import _clean
 
     assert _clean("  a\n\t b   c ") == "a b c"
     assert _clean(None) == ""
@@ -470,7 +542,7 @@ def _ws_module(monkeypatch):
 
 
 def test_real_browser_call_no_ws(monkeypatch):
-    from deepseaport.real_browser import RealBrowser
+    from deepseaport.providers.deepseek.real_browser import RealBrowser
 
     _ws_module(monkeypatch)
     rb = RealBrowser.__new__(RealBrowser)
@@ -481,7 +553,7 @@ def test_real_browser_call_no_ws(monkeypatch):
 
 
 def test_real_browser_call_cdp_error(monkeypatch):
-    from deepseaport.real_browser import RealBrowser
+    from deepseaport.providers.deepseek.real_browser import RealBrowser
 
     fake_mod = _ws_module(monkeypatch)
 
@@ -500,7 +572,7 @@ def test_real_browser_call_cdp_error(monkeypatch):
 
 
 def test_real_browser_call_timeout(monkeypatch):
-    from deepseaport.real_browser import RealBrowser
+    from deepseaport.providers.deepseek.real_browser import RealBrowser
 
     fake_mod = _ws_module(monkeypatch)
     exc = fake_mod.WebSocketTimeoutException
@@ -520,7 +592,7 @@ def test_real_browser_call_timeout(monkeypatch):
 
 
 def test_real_browser_call_success_skips_events(monkeypatch):
-    from deepseaport.real_browser import RealBrowser
+    from deepseaport.providers.deepseek.real_browser import RealBrowser
 
     _ws_module(monkeypatch)
     msgs = ["not-json", json.dumps({"id": 999, "result": {"x": 1}})]
@@ -544,7 +616,7 @@ def test_real_browser_call_success_skips_events(monkeypatch):
 
 
 def test_real_browser_evaluate_exception_details(monkeypatch):
-    from deepseaport.real_browser import RealBrowser
+    from deepseaport.providers.deepseek.real_browser import RealBrowser
 
     rb = RealBrowser.__new__(RealBrowser)
     monkeypatch.setattr(rb, "call", lambda *a, **k: {"exceptionDetails": {"text": "bad js"}})
@@ -553,7 +625,7 @@ def test_real_browser_evaluate_exception_details(monkeypatch):
 
 
 def test_real_browser_evaluate_success(monkeypatch):
-    from deepseaport.real_browser import RealBrowser
+    from deepseaport.providers.deepseek.real_browser import RealBrowser
 
     rb = RealBrowser.__new__(RealBrowser)
     monkeypatch.setattr(rb, "call", lambda *a, **k: {"result": {"value": 42}})
@@ -561,7 +633,7 @@ def test_real_browser_evaluate_success(monkeypatch):
 
 
 def test_real_browser_fill_credentials_nofields(monkeypatch):
-    from deepseaport.real_browser import RealBrowser
+    from deepseaport.providers.deepseek.real_browser import RealBrowser
 
     rb = RealBrowser.__new__(RealBrowser)
     monkeypatch.setattr(rb, "evaluate", lambda *a, **k: "NOFIELDS")
@@ -570,7 +642,7 @@ def test_real_browser_fill_credentials_nofields(monkeypatch):
 
 
 def test_real_browser_fill_credentials_ok(monkeypatch):
-    from deepseaport.real_browser import RealBrowser
+    from deepseaport.providers.deepseek.real_browser import RealBrowser
 
     rb = RealBrowser.__new__(RealBrowser)
     monkeypatch.setattr(rb, "evaluate", lambda *a, **k: "FILLED")
@@ -578,7 +650,7 @@ def test_real_browser_fill_credentials_ok(monkeypatch):
 
 
 def test_real_browser_click_login_nobtn(monkeypatch):
-    from deepseaport.real_browser import RealBrowser
+    from deepseaport.providers.deepseek.real_browser import RealBrowser
 
     rb = RealBrowser.__new__(RealBrowser)
     monkeypatch.setattr(rb, "evaluate", lambda *a, **k: "NOBTN")
@@ -587,7 +659,7 @@ def test_real_browser_click_login_nobtn(monkeypatch):
 
 
 def test_real_browser_snapshot_bad_json(monkeypatch):
-    from deepseaport.real_browser import RealBrowser
+    from deepseaport.providers.deepseek.real_browser import RealBrowser
 
     rb = RealBrowser.__new__(RealBrowser)
     monkeypatch.setattr(rb, "evaluate", lambda *a, **k: "{{bad")
@@ -595,7 +667,7 @@ def test_real_browser_snapshot_bad_json(monkeypatch):
 
 
 def _stub_login_rb(monkeypatch, snaps, timeout=5.0):
-    from deepseaport.real_browser import RealBrowser
+    from deepseaport.providers.deepseek.real_browser import RealBrowser
 
     rb = RealBrowser.__new__(RealBrowser)
     rb.timeout = timeout
@@ -621,7 +693,7 @@ def _stub_login_rb(monkeypatch, snaps, timeout=5.0):
 
     monkeypatch.setattr(rb, "evaluate", _eval)
     monkeypatch.setattr(rb, "snapshot", _snap)
-    monkeypatch.setattr("deepseaport.real_browser.time.sleep", lambda *a, **k: None)
+    monkeypatch.setattr("deepseaport.providers.deepseek.real_browser.time.sleep", lambda *a, **k: None)
     return rb
 
 
@@ -629,6 +701,59 @@ def test_real_browser_login_captcha(monkeypatch):
     rb = _stub_login_rb(monkeypatch, [{"url": "u", "token": None, "body": "home", "captcha_visible": True}])
     tok, banned, detail = rb.login("a@x.com", "pw")
     assert tok is None and banned is False
+    assert "captcha" in detail
+
+
+def test_real_browser_login_captcha_phrase_without_overlay(monkeypatch):
+    """Text-only challenge: no #cf-overlay/iframe, so `captcha_visible` is False.
+
+    Pre-change the loop only read that flag, so a "Slide to verify" page was
+    never recognised: it burned the full 75s login timeout and returned
+    "no token", which sets the wrong (generic) login backoff. login_policy's
+    LOGIN_CAPTCHA_PHRASES is the documented shared source of truth.
+    """
+    from deepseaport.providers.deepseek.login_policy import LOGIN_CAPTCHA_PHRASES
+
+    rb = _stub_login_rb(monkeypatch, [{"url": "u", "token": None, "body": "home",
+                                       "captcha_visible": False}])
+    polls = {"n": 0}
+
+    def _snap():
+        polls["n"] += 1
+        return {"url": "u", "token": None, "body": "Slide to verify",
+                "captcha_visible": False}
+
+    monkeypatch.setattr(rb, "snapshot", _snap)
+    tok, banned, detail = rb.login("a@x.com", "pw")
+    assert tok is None and banned is False
+    assert "captcha" in detail
+    assert "slide to verify" in detail
+    # Returned on the first poll: no full-timeout burn.
+    assert polls["n"] == 1
+    assert any(p in "slide to verify" for p in LOGIN_CAPTCHA_PHRASES)
+
+
+def test_real_browser_login_captcha_phrase_wins_over_ban_flag(monkeypatch):
+    rb = _stub_login_rb(monkeypatch, [
+        {"url": "u", "token": None, "body": "account muted",
+         "captcha_visible": False},
+        {"url": "u", "token": None, "body": "just a moment",
+         "captcha_visible": False},
+    ])
+    it = {"i": 0}
+
+    def _snap():
+        it["i"] += 1
+        return ({"url": "u", "token": None, "body": "account muted",
+                 "captcha_visible": False} if it["i"] == 1 else
+                {"url": "u", "token": None, "body": "just a moment",
+                 "captcha_visible": False})
+
+    monkeypatch.setattr(rb, "snapshot", _snap)
+    tok, banned, detail = rb.login("a@x.com", "pw")
+    assert tok is None
+    # The ban hint observed on an earlier snapshot is preserved on the way out.
+    assert banned is True
     assert "captcha" in detail
 
 
@@ -647,7 +772,7 @@ def test_real_browser_login_rejected(monkeypatch):
 
 def test_real_browser_login_timeout(monkeypatch):
     rb = _stub_login_rb(monkeypatch, [{"url": "u", "token": None, "body": "home"}], timeout=0.0)
-    import deepseaport.real_browser as rbm
+    import deepseaport.providers.deepseek.real_browser as rbm
 
     monkeypatch.setattr(rbm.time, "monotonic", lambda: 100.0)
     tok, banned, detail = rb.login("a@x.com", "pw")
@@ -656,14 +781,14 @@ def test_real_browser_login_timeout(monkeypatch):
 
 
 def test_login_with_real_browser_no_binary(monkeypatch):
-    import deepseaport.real_browser as rbm
+    import deepseaport.providers.deepseek.real_browser as rbm
 
     monkeypatch.setattr(rbm, "resolve_browser", lambda value: "")
     assert rbm.login_with_real_browser("a@x.com", "pw", _settings()) is None
 
 
 def test_login_with_real_browser_start_exception(monkeypatch):
-    import deepseaport.real_browser as rbm
+    import deepseaport.providers.deepseek.real_browser as rbm
 
     monkeypatch.setattr(rbm, "resolve_browser", lambda value: "/bin/chrome")
     monkeypatch.setattr(rbm.RealBrowser, "start", lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
@@ -674,7 +799,7 @@ def test_login_with_real_browser_start_exception(monkeypatch):
 
 
 def test_login_with_real_browser_headless_flag(monkeypatch):
-    import deepseaport.real_browser as rbm
+    import deepseaport.providers.deepseek.real_browser as rbm
 
     seen = {}
     real_init = rbm.RealBrowser.__init__
@@ -699,7 +824,7 @@ def test_login_with_real_browser_headless_flag(monkeypatch):
 # --- mcp_client ---
 
 def _mcp_client_new(**over):
-    from deepseaport import mcp_client as mc
+    from deepseaport.core import mcp_client as mc
 
     c = mc.McpClient.__new__(mc.McpClient)
     import queue as _q
@@ -782,7 +907,7 @@ def test_mcp_send_timeout(monkeypatch):
     # never answer: box.get raises Empty
     monkeypatch.setattr(queue.Queue, "get", lambda self, timeout=None: (_ for _ in ()).throw(queue.Empty()))
     with pytest.raises(TimeoutError, match="timed out"):
-        c._send("tools/list", timeout=0.01)
+        c._send("tools/list")
 
 
 def test_mcp_send_error_in_msg():
@@ -803,7 +928,7 @@ def test_mcp_send_error_in_msg():
 
     c.proc.stdin.write = _write_and_respond
     with pytest.raises(RuntimeError, match="bad"):
-        c._send("tools/list", timeout=2.0)
+        c._send("tools/list")
 
 
 def test_mcp_send_success():
@@ -814,7 +939,7 @@ def test_mcp_send_success():
         c._pending[mid].put({"result": {"ok": 1}})
 
     c.proc.stdin.write = _write_and_respond
-    assert c._send("tools/list", timeout=2.0) == {"ok": 1}
+    assert c._send("tools/list") == {"ok": 1}
 
 
 def test_mcp_send_none_on_death():
@@ -826,7 +951,7 @@ def test_mcp_send_none_on_death():
 
     c.proc.stdin.write = _write_and_respond
     with pytest.raises(RuntimeError, match="failed"):
-        c._send("tools/list", timeout=2.0)
+        c._send("tools/list")
 
 
 def test_mcp_read_loop_routes_and_wakes():
@@ -882,14 +1007,14 @@ def test_mcp_context_manager_closes():
 # --- browser_paths ---
 
 def test_resolve_browser_empty():
-    from deepseaport.browser_paths import resolve_browser
+    from deepseaport.core.browser_paths import resolve_browser
 
     assert resolve_browser("") == ""
     assert resolve_browser("   ") == ""
 
 
 def test_resolve_browser_auto_uses_discover(monkeypatch):
-    import deepseaport.browser_paths as bp
+    import deepseaport.core.browser_paths as bp
 
     monkeypatch.setattr(bp, "discover_browser", lambda: "/found/chrome")
     assert bp.resolve_browser("auto") == "/found/chrome"
@@ -897,7 +1022,7 @@ def test_resolve_browser_auto_uses_discover(monkeypatch):
 
 
 def test_resolve_browser_exact_file(tmp_path):
-    from deepseaport.browser_paths import resolve_browser
+    from deepseaport.core.browser_paths import resolve_browser
 
     f = tmp_path / "chrome.exe"
     f.write_text("x")
@@ -905,7 +1030,7 @@ def test_resolve_browser_exact_file(tmp_path):
 
 
 def test_resolve_browser_via_which(monkeypatch):
-    import deepseaport.browser_paths as bp
+    import deepseaport.core.browser_paths as bp
 
     monkeypatch.setattr(bp.Path, "is_file", lambda self: False)
     monkeypatch.setattr(bp.shutil, "which", lambda cmd: "/usr/bin/chrome" if cmd == "mychrome" else None)
@@ -913,7 +1038,7 @@ def test_resolve_browser_via_which(monkeypatch):
 
 
 def test_resolve_browser_missing(monkeypatch):
-    import deepseaport.browser_paths as bp
+    import deepseaport.core.browser_paths as bp
 
     monkeypatch.setattr(bp.Path, "is_file", lambda self: False)
     monkeypatch.setattr(bp.shutil, "which", lambda cmd: None)
@@ -921,14 +1046,14 @@ def test_resolve_browser_missing(monkeypatch):
 
 
 def test_discover_browser_path_hit(monkeypatch):
-    import deepseaport.browser_paths as bp
+    import deepseaport.core.browser_paths as bp
 
     monkeypatch.setattr(bp.shutil, "which", lambda cmd: "/usr/bin/helium" if cmd == "helium" else None)
     assert bp.discover_browser() == "/usr/bin/helium"
 
 
 def test_discover_browser_candidates_fallback(monkeypatch):
-    import deepseaport.browser_paths as bp
+    import deepseaport.core.browser_paths as bp
 
     monkeypatch.setattr(bp.shutil, "which", lambda cmd: None)
     monkeypatch.setattr(bp, "_candidates", lambda: ["/c1/chrome", "/c2/chrome"])
@@ -941,7 +1066,7 @@ def test_discover_browser_candidates_fallback(monkeypatch):
 
 
 def test_discover_browser_none(monkeypatch):
-    import deepseaport.browser_paths as bp
+    import deepseaport.core.browser_paths as bp
 
     monkeypatch.setattr(bp.shutil, "which", lambda cmd: None)
     monkeypatch.setattr(bp, "_candidates", lambda: [])

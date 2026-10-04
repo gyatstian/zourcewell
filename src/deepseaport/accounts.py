@@ -10,17 +10,78 @@ import asyncio
 import logging
 import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator
 
-from .config import AccountConfig
+from .config import AccountConfig, account_identity
 from .core.tokens import extract_token
 
 logger = logging.getLogger("deepseaport.accounts")
 
 COOLDOWN_SECONDS = 120
 _POLL_INTERVAL = 0.05
+
+# Historical wording of the pool errors, kept as the fallback so a pool with
+# no accounts and no label still says exactly what it always said:
+#   "no DeepSeek accounts in pool"
+#   "no DeepSeek account free (busy or cooldown)"
+DEFAULT_PROVIDER_LABEL = "DeepSeek"
+# Provider id assumed when nothing else is known: the migration target for
+# accounts with no provider in config, and the fallback when the registry
+# cannot answer. Must match the value AccountConfig normalizes an empty
+# provider to.
+DEFAULT_PROVIDER_ID = "deepseek"
+
+
+def provider_label(provider_id: object = None) -> str:
+    """Human label for a provider id, for user-facing pool errors.
+
+    Registry ``display_name`` when the provider is registered ("DeepSeek",
+    "Qwen", "opencode"), else the normalized id. Empty/None resolves to
+    "DeepSeek" so the default deployment -- and any pool that cannot name its
+    provider -- keeps the historical message byte-for-byte.
+
+    Single home for this mapping: ``server_concurrency._acquire_slot_or_499``
+    and the pool itself both route through here instead of hardcoding one
+    upstream's name into provider-neutral code.
+    """
+    key = str(provider_id or "").strip().lower() or "deepseek"
+    try:
+        from .core import registry as _reg
+
+        name = str(getattr(_reg.get(key), "display_name", "") or "").strip()
+        if name:
+            return name
+    except Exception:
+        pass
+    return DEFAULT_PROVIDER_LABEL if key == "deepseek" else key
+
+
+def pool_provider_label(pool) -> str:
+    """Provider label for a pool-like object (never raises, never empty).
+
+    Tolerates duck-typed pools and plain fakes. ``provider_label`` (already a
+    human label) wins as-is; a bare ``provider``/``provider_id`` is treated as
+    an id and resolved through :func:`provider_label`, so a fake carrying
+    ``provider="qwen"`` yields "Qwen", not "qwen". Anything else falls back to
+    the historical DeepSeek default.
+    """
+    try:
+        ready = str(getattr(pool, "provider_label", None) or "").strip()
+    except Exception:
+        ready = ""
+    if ready:
+        return ready
+    for attr in ("provider", "provider_id"):
+        try:
+            raw = getattr(pool, attr, None)
+        except Exception:
+            continue
+        if callable(raw):
+            continue
+        pid = str(raw or "").strip()
+        if pid:
+            return provider_label(pid)
+    return DEFAULT_PROVIDER_LABEL
 
 
 def _acquire_remaining(deadline: float) -> float:
@@ -95,17 +156,14 @@ def _matches(cfg: AccountConfig, identifier: str) -> bool:
 
 def _is_duplicate(a: AccountConfig, b: AccountConfig) -> bool:
     # Same email/mobile/token in different providers is a distinct account.
-    a_provider = (getattr(a, "provider", "deepseek") or "deepseek").strip().lower()
-    b_provider = (getattr(b, "provider", "deepseek") or "deepseek").strip().lower()
+    # The identity rule itself lives in config.account_identity: load_settings
+    # dedupes with it (see _dedupe_accounts), and two definitions of "same
+    # account" is how a duplicate gets through one gate and fails the other.
+    a_provider, a_keys = account_identity(a)
+    b_provider, b_keys = account_identity(b)
     if a_provider != b_provider:
         return False
-    if a.email and b.email and _norm(a.email) == _norm(b.email):
-        return True
-    if a.mobile and b.mobile and a.mobile.strip() == b.mobile.strip():
-        return True
-    if a.token and b.token and a.token.strip() == b.token.strip():
-        return True
-    return False
+    return bool(a_keys & b_keys)
 
 
 @dataclass
@@ -231,10 +289,6 @@ class PooledAccount:
         }
 
 
-def _current_matches(cfg: AccountConfig, current: str) -> bool:
-    return bool(current) and _matches(cfg, current)
-
-
 def sync_current_from_settings(pool: AccountPool, settings) -> bool:
     """Copy settings.active_account into pool. Clears stale selection.
 
@@ -267,10 +321,65 @@ def account_has_token(settings, identifier: str) -> bool:
     return False
 
 
+def configured_provider_id(settings) -> str:
+    """The configured selected provider id, lowercased and never empty.
+
+    Thin lazy wrapper over ``core.pools.selected_provider`` so the callers that
+    bind a new account to the configured provider (the route and the CLI) share
+    one fallback chain. The import stays inside the function because
+    ``core.pools`` reaches back into this module (``pools.make_pool`` imports
+    ``..accounts``).
+    """
+    from .core import pools
+
+    return pools.selected_provider(settings)
+
+
+def usable_provider(pid: object) -> str:
+    """A registered provider id, coercing an unregistered CONFIGURED one.
+
+    For the fallback binding only (the selected provider, when the caller
+    expressed no choice of its own). Same contract as
+    ``server_routes._usable_provider``, kept here so the HTTP route and the
+    CLI/TUI add paths cannot drift again. ``settings.provider`` is not
+    registry-validated on load, so a junk id (hand-edited config.json or
+    DEEPSEAPORT_PROVIDER) would otherwise be persisted onto every account
+    added without an explicit provider. Coerce to the registry default rather
+    than refusing the add - the caller is trying to store a credential, and
+    the misconfiguration is named in the log instead of blocking the recovery.
+    A *registered* id is returned untouched, so a legitimate non-default
+    provider selection still wins.
+
+    Never applied to an explicitly chosen provider: the CLI and the TUI accept
+    an id the registry does not know (registered later by a plugin-style
+    deployment), so that call belongs to the operator.
+
+    ``core.registry`` is imported lazily, the way the route does it: it must
+    not be pulled in at ``accounts`` import time (cycle risk with
+    ``deepseaport.server``), and a registry that cannot be imported must not
+    break account storage.
+    """
+    candidate = str(pid or "").strip().lower()
+    try:
+        from .core import registry as _reg
+    except Exception:
+        # Cannot answer "is it registered": keep the configured id rather than
+        # blocking the store (and fall back when there was none).
+        return candidate or DEFAULT_PROVIDER_ID
+    if candidate and _reg.get(candidate) is not None:
+        return candidate
+    try:
+        fallback = str(_reg.default().id)
+    except Exception:
+        fallback = DEFAULT_PROVIDER_ID
+    if candidate:
+        logger.warning("configured provider '%s' is not registered; "
+                       "storing the new account as '%s'", candidate, fallback)
+    return fallback
+
+
 def add_account(settings, pool: "AccountPool", cfg: AccountConfig) -> PooledAccount:
     """Add cfg to pool + settings and make it CURRENT. Raises ValueError on dup."""
-    if not getattr(cfg, "provider", ""):
-        cfg.provider = getattr(settings, "provider", "deepseek") or "deepseek"
     item = pool.add(cfg)
     settings.accounts.append(cfg)
     # New account becomes CURRENT (default) immediately.
@@ -331,11 +440,48 @@ def ban_label_for(ban_map: dict, identifier: str) -> tuple[bool, float | None]:
 
 class AccountPool:
     def __init__(self, accounts: list[AccountConfig] | None = None,
-                 current: str | None = None) -> None:
+                 current: str | None = None,
+                 provider: str | None = None) -> None:
         self._items: list[PooledAccount] = [PooledAccount(cfg=a) for a in (accounts or [])]
         self._cursor = 0
         self._guard = threading.Lock()
         self._current: str = (current or "").strip()
+        # Optional explicit label. Normally omitted (``pools.make_pool`` does
+        # not pass one) and the id is then derived from the member accounts'
+        # own ``provider`` field -- the same field ``pools._provider_of`` /
+        # ``accounts_for_provider`` build the pool from. An explicit value is
+        # only needed to name the provider of a pool that is EMPTY, where no
+        # member can answer the question.
+        self._provider_id: str = (provider or "").strip().lower()
+
+    @property
+    def provider_id(self) -> str:
+        """Provider id this pool serves (explicit, else a member's, else deepseek).
+
+        Read-only view; ``threading.Lock`` is not reentrant, so callers that
+        already hold ``_guard`` must not use this (see ``_next_ordered``).
+        """
+        if self._provider_id:
+            return self._provider_id
+        with self._guard:
+            for item in self._items:
+                pid = str(getattr(item.cfg, "provider", "") or "").strip().lower()
+                if pid:
+                    return pid
+        return "deepseek"
+
+    @property
+    def provider_label(self) -> str:
+        """Human label for :attr:`provider_id` ("DeepSeek", "Qwen", ...)."""
+        return provider_label(self.provider_id)
+
+    def no_accounts_error(self) -> str:
+        """"no <label> accounts in pool" -- 503 text, same shape as before."""
+        return f"no {self.provider_label} accounts in pool"
+
+    def no_free_error(self) -> str:
+        """"no <label> account free (busy or cooldown)" -- 429/timeout text."""
+        return f"no {self.provider_label} account free (busy or cooldown)"
 
     @property
     def current(self) -> str:
@@ -381,7 +527,17 @@ class AccountPool:
         with self._guard:
             for item in self._items:
                 if _is_duplicate(item.cfg, cfg):
-                    raise ValueError(f"account already in pool: {item.identifier}")
+                    # NEVER item.identifier: for a token-only account that is
+                    # ``token[:10] + "..."`` (config.AccountConfig.identifier),
+                    # and this ValueError is surfaced verbatim as the HTTP 409
+                    # detail on POST /v1/accounts. Same rule as
+                    # server_routes._reject_token_shaped_identifier -- nothing
+                    # derived from the token reaches a response. The email or
+                    # mobile number is the identity the operator typed and is
+                    # already echoed in URLs by design.
+                    raise ValueError("account already in pool: "
+                                     + (item.cfg.email or item.cfg.mobile
+                                        or "a token-only account with no identifier"))
             item = PooledAccount(cfg=cfg)
             self._items.append(item)
             logger.info("account added: %s (pool=%d)", item.identifier, len(self._items))
@@ -463,10 +619,21 @@ class AccountPool:
 
         Single source for acquire()/aacquire() rotation, CURRENT pinning, and
         failover ordering. Raises ValueError when the pool is empty.
+
+        The empty check and the snapshot are two separate guarded reads on
+        purpose: :attr:`provider_id` needs ``_guard`` to look at the members,
+        and ``_guard`` is a plain (non-reentrant) Lock, so resolving the label
+        inside the ``with`` would self-deadlock on the empty-pool error path.
+        An account added between the two reads simply takes the normal path.
         """
         with self._guard:
             if not self._items:
-                raise ValueError("no DeepSeek accounts in pool")
+                empty = True
+            else:
+                empty = False
+        if empty:
+            raise ValueError(self.no_accounts_error())
+        with self._guard:
             snapshot = list(self._items)
             cur = self._current
             start = self._cursor % len(snapshot)
@@ -515,7 +682,9 @@ class AccountPool:
         is considered (sticky: concurrent requests queue on it instead of
         spreading to other accounts). Busy is per-account lock state.
         Raises ValueError when pool empty, TimeoutError when all busy/cooldown
-        for longer than timeout.
+        for longer than timeout. Both messages name the pool's provider
+        (:attr:`provider_label`); only the wording is provider-aware, the
+        exception TYPES are the frozen contract callers branch on.
         """
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
@@ -523,7 +692,7 @@ class AccountPool:
             if got is not None:
                 return got
             if time.monotonic() >= deadline:
-                raise TimeoutError("no DeepSeek account free (busy or cooldown)")
+                raise TimeoutError(self.no_free_error())
             # Event-driven: wake immediately on release(), else re-poll after
             # _POLL_INTERVAL (same timeout/behavior as the old time.sleep).
             remaining = _acquire_remaining(deadline)
@@ -547,17 +716,8 @@ class AccountPool:
             if got is not None:
                 return got
             if time.monotonic() >= deadline:
-                raise TimeoutError("no DeepSeek account free (busy or cooldown)")
+                raise TimeoutError(self.no_free_error())
             await asyncio.sleep(_acquire_remaining(deadline))
-
-    @contextmanager
-    def slot(self, timeout: float = 60, allow_failover: bool = True) -> Iterator[PooledAccount]:
-        """`with pool.slot() as acc:` auto-release. Simple use path."""
-        item = self.acquire(timeout=timeout, allow_failover=allow_failover)
-        try:
-            yield item
-        finally:
-            self.release(item)
 
     @staticmethod
     def release(item: PooledAccount) -> None:
@@ -608,8 +768,7 @@ class AccountPool:
 
 
 def check_ban_for_token(token: str, timeout: int = BAN_CHECK_TIMEOUT,
-                        provider: str = "deepseek",
-                        headers: dict | None = None) -> tuple[bool, float | None]:
+                        provider: str = "deepseek") -> tuple[bool, float | None]:
     """Best-effort ban probe for one token. Never raises; (False, None) on skip/fail.
 
     Routes through ``Provider.probe_ban`` (registry) so non-DeepSeek accounts
@@ -633,26 +792,20 @@ def check_ban_for_token(token: str, timeout: int = BAN_CHECK_TIMEOUT,
         if prov is None:
             prov = _reg.get("deepseek")
             pid = "deepseek" if prov is not None else pid
+        headers: dict
+        if pid == "deepseek":
+            try:
+                from .providers.deepseek.protocol import bridge_headers as _bh
+                headers = _bh(bearer=tok)
+            except Exception:
+                headers = {"Authorization": f"Bearer {tok}"}
+        else:
+            headers = {"Authorization": f"Bearer {tok}"}
         if prov is None:
             # Registry unavailable: narrow legacy direct DeepSeek path.
             from .providers.deepseek import client as _DS
 
-            if headers is None:
-                try:
-                    from .providers.deepseek.protocol import bridge_headers as _bh
-                    headers = _bh(bearer=tok)
-                except Exception:
-                    headers = {"Authorization": f"Bearer {tok}"}
             return _DS.check_ban(headers, timeout=timeout)
-        if headers is None:
-            if pid == "deepseek":
-                try:
-                    from .providers.deepseek.protocol import bridge_headers as _bh
-                    headers = _bh(bearer=tok)
-                except Exception:
-                    headers = {"Authorization": f"Bearer {tok}"}
-            else:
-                headers = {"Authorization": f"Bearer {tok}"}
         return prov.probe_ban(headers, timeout=timeout)
     except Exception as exc:
         logger.debug("ban check ignored: %s", exc)

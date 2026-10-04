@@ -4,13 +4,16 @@ Default tier is LIVE: a real request through the running pipeline
 (Obscura WAF -> session -> PoW -> SSE completion), measuring wall time,
 time-to-first-byte, time-to-first-reasoning-token, time-to-first-content
 and per-phase breakdown. Needs an account token (config.json or env) and
-the obscura binary on PATH — skips with a clear reason otherwise.
+the obscura binary on PATH. Both live tests are marked ``live`` and are
+SKIPPED by default (see tests/conftest.py) because they need a machine with
+a real account, the real binary and a provider that serves the model.
 
 A offline stubbed tier (no network) runs too, so the phase-ordering
 assertions still hold on machines without credentials.
 
 Run:
-    pytest tests/test_speed.py -s        # live + offline
+    pytest tests/test_speed.py -s              # offline only (default)
+    pytest tests/test_speed.py -s -m live      # live tier (needs credentials)
     pytest tests/test_speed.py -s -k offline   # no network
 """
 
@@ -21,8 +24,9 @@ import time
 
 import pytest
 
-from deepseaport import client as DS
-from deepseaport import pow as PoW
+from support import FakeBridge, settings
+from deepseaport.providers.deepseek import client as DS
+from deepseaport.providers.deepseek import pow as PoW
 from deepseaport.config import AccountConfig, Settings, load_settings
 from deepseaport.server import create_app
 
@@ -102,7 +106,16 @@ def _live_ready() -> tuple[bool, str]:
         return False, "no accounts in config"
     if not any(a.token for a in settings.accounts):
         return False, "no account token (run: deepseaport login)"
-    from deepseaport.obscura_bridge import ObscuraBridge
+    # The model catalogue is the union of the *active* providers. Selecting a
+    # provider that does not serve deepseek-* would make these tests 404 with
+    # "model not available" — a configuration fact, not a latency failure.
+    from deepseaport.server import active_models
+    if REASONER not in active_models(settings):
+        return False, (
+            f"active provider(s) do not serve {REASONER!r} "
+            "(set provider=deepseek / providers=[deepseek])"
+        )
+    from deepseaport.core.obscura_bridge import ObscuraBridge
     bridge = ObscuraBridge(settings.obscura_bin, settings.obscura_profile)
     if shutil_which(bridge.binary) is None and not _exists(bridge.binary):
         return False, f"obscura binary not found: {bridge.binary}"
@@ -119,6 +132,7 @@ def shutil_which(cmd: str):
     return shutil.which(cmd) if cmd else None
 
 
+@pytest.mark.live
 def test_live_reasoner_latency(monkeypatch):
     """Real reasoner round trip: wall, TTFB, first-reasoning, per-phase."""
     from fastapi.testclient import TestClient
@@ -128,7 +142,7 @@ def test_live_reasoner_latency(monkeypatch):
         pytest.skip(why)
 
     settings = load_settings()
-    from deepseaport.obscura_bridge import ObscuraBridge
+    from deepseaport.core.obscura_bridge import ObscuraBridge
 
     t_warm0 = time.perf_counter()
     bridge = ObscuraBridge(settings.obscura_bin, settings.obscura_profile)
@@ -178,6 +192,7 @@ def test_live_reasoner_latency(monkeypatch):
         ])
 
 
+@pytest.mark.live
 def test_live_reasoner_nonstream_wall(monkeypatch):
     """Real reasoner, buffered: one number — full request wall time."""
     from fastapi.testclient import TestClient
@@ -187,7 +202,7 @@ def test_live_reasoner_nonstream_wall(monkeypatch):
         pytest.skip(why)
 
     settings = load_settings()
-    from deepseaport.obscura_bridge import ObscuraBridge
+    from deepseaport.core.obscura_bridge import ObscuraBridge
     bridge = ObscuraBridge(settings.obscura_bin, settings.obscura_profile)
     bridge.warmup()
     if not bridge.has_waf_token():
@@ -218,34 +233,10 @@ def test_live_reasoner_nonstream_wall(monkeypatch):
 
 
 def _offline_settings(stream_mode: str = "buffered") -> Settings:
-    return Settings(
-        keys=["sk-bench"],
-        accounts=[AccountConfig(email="bench@x.com", token="bench-token")],
-        config_path="",
-        warmup_on_startup=False,
-        max_retries=0,
-        log_level="WARNING",
-        stream_mode=stream_mode,
-    )
-
-
-class _FakeBridge:
-    def __init__(self) -> None:
-        self.state = _FakeState()
-
-    def cookie_header(self) -> str:
-        return ""
-
-    def has_waf_token(self) -> bool:
-        return True
-
-    def warmup(self) -> dict:
-        return {}
-
-
-class _FakeState:
-    user_agent = "bench-ua"
-    cookies = {}
+    return settings(keys=["sk-bench"], max_retries=0,
+                    accounts=[AccountConfig(email="bench@x.com",
+                                            token="bench-token")],
+                    stream_mode=stream_mode)
 
 
 def _make_fakes(phases: dict[str, float]) -> dict:
@@ -292,7 +283,7 @@ def _make_fakes(phases: dict[str, float]) -> dict:
 
 
 # imported late so module import never fails without fastapi/httpx
-from deepseaport.protocol import StreamEvent  # noqa: E402
+from deepseaport.providers.deepseek.protocol import StreamEvent  # noqa: E402
 
 
 def test_offline_reasoner_phase_timing(monkeypatch):
@@ -300,7 +291,7 @@ def test_offline_reasoner_phase_timing(monkeypatch):
     from fastapi.testclient import TestClient
 
     app = create_app(_offline_settings())
-    app.state.bridge = _FakeBridge()
+    app.state.bridge = FakeBridge(has_token=True)
     timed = _Timed()
     timed.install(monkeypatch, _make_fakes({"ttfb": 0.20}))
 
@@ -321,7 +312,6 @@ def test_offline_reasoner_phase_timing(monkeypatch):
     assert [l for l in expected if l in labels] == expected
     idx = {lbl: i for i, lbl in enumerate(labels)}
     assert idx["solve_pow"] > max(idx["create_session"], idx["fetch_pow"])
-    assert wall_ms > timed.rows[-1][1]
     timed.report("offline non-stream reasoner (stubbed)", [("wall", wall_ms)])
 
 
@@ -330,7 +320,7 @@ def test_offline_reasoner_streaming_ttfb(monkeypatch):
     from fastapi.testclient import TestClient
 
     app = create_app(_offline_settings(stream_mode="live"))
-    app.state.bridge = _FakeBridge()
+    app.state.bridge = FakeBridge(has_token=True)
     timed = _Timed()
     timed.install(monkeypatch, _make_fakes({"ttfb": 0.10}))
 

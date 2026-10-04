@@ -7,12 +7,12 @@ import time
 import pytest
 
 import deepseaport.accounts as A
+from support import settings
 from deepseaport.accounts import (
     AccountPool,
     PooledAccount,
     _ban_cache_key,
     _ban_targets,
-    _current_matches,
     _is_duplicate,
     _matches,
     _norm,
@@ -38,8 +38,14 @@ def _cfg(email="", token="", mobile="", **kw):
     return AccountConfig(email=email, token=token, mobile=mobile, **kw)
 
 
-def _settings(*cfgs, active=""):
-    return Settings(accounts=list(cfgs), active_account=active, config_path="")
+# Default kwargs differ per file; the shared base dict lives in
+# support.py. Every list here is rebuilt per call on purpose.
+
+
+def _settings(*cfgs, active="") -> Settings:
+    return settings(accounts=list(cfgs), active_account=active,
+                    config_path="", log_level="INFO",
+                    warmup_on_startup=True)
 
 
 @pytest.fixture(autouse=True)
@@ -172,13 +178,6 @@ def test_status_keys():
 
 # --- module helpers ---
 
-def test_current_matches():
-    cfg = _cfg(email="a@x.com")
-    assert _current_matches(cfg, "A@X.com") is True
-    assert _current_matches(cfg, "") is False
-    assert _current_matches(cfg, "b@x.com") is False
-
-
 def test_sync_current_stale_clears():
     s = _settings(_cfg(email="a@x.com", token="t"), active="stale@x.com")
     pool = AccountPool(s.accounts, current=s.active_account)
@@ -240,14 +239,14 @@ def test_ban_label_for():
 
 # --- AccountPool behaviour ---
 
-def test_slot_releases_lock():
+def test_release_lets_the_slot_be_reused():
     pool = AccountPool([_cfg(email="a@x.com", token="t")])
-    with pool.slot(timeout=1) as item:
-        assert item.busy is True
+    item = pool.acquire(timeout=1)
+    assert item.busy is True
+    AccountPool.release(item)
     assert item.busy is False
     # reusable right away
-    with pool.slot(timeout=1):
-        pass
+    AccountPool.release(pool.acquire(timeout=1))
 
 
 def test_release_unknown_no_raise():
@@ -330,7 +329,7 @@ def test_aacquire_no_failover_pins_current():
 def test_check_ban_short_token_no_network(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("network must not be called")
-    monkeypatch.setattr("deepseaport.client.check_ban", _boom)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.check_ban", _boom)
     assert check_ban_for_token("t1") == (False, None)
     assert check_ban_for_token("") == (False, None)
 
@@ -343,7 +342,7 @@ def test_check_ban_long_token_calls_client(monkeypatch):
         assert "x" * 32 in str(headers.get("Authorization", ""))
         return True, 999.0
 
-    monkeypatch.setattr("deepseaport.client.check_ban", _fake)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.check_ban", _fake)
     assert check_ban_for_token(LONG) == (True, 999.0)
     assert seen["timeout"] == 12
 
@@ -352,7 +351,7 @@ def test_check_ban_exception_returns_false_none(monkeypatch):
     def _boom(headers, timeout=12):
         raise RuntimeError("offline")
 
-    monkeypatch.setattr("deepseaport.client.check_ban", _boom)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.check_ban", _boom)
     assert check_ban_for_token(LONG) == (False, None)
 
 
@@ -408,7 +407,7 @@ def test_get_cached_returns_persisted_plus_cached_no_network(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("no network allowed")
 
-    monkeypatch.setattr("deepseaport.client.check_ban", _boom)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.check_ban", _boom)
     out = get_cached_ban_labels([persisted, live])
     assert out["p@x.com"] is None
     assert out["live@x.com"] == 42.0

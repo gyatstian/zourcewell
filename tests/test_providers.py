@@ -87,12 +87,6 @@ def test_prepare_unknown_model_404():
     assert exc.value.status_code == 404
 
 
-def test_alias_identity_preserved():
-    import deepseaport.client as C
-    from deepseaport.providers.deepseek import client as I
-    assert C is I
-
-
 def test_registry_models_load_registered_owned_by():
     provider = registry.get("deepseek")
     assert provider is not None

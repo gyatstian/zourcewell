@@ -21,14 +21,11 @@ import time
 from dataclasses import dataclass
 
 from ...core import mcp_client
+from ...core.engine import scrub_upstream_text
 from ...config import Settings
 from .login_policy import (
-    COOKIE_SELECTOR,
     EMAIL_SELECTOR,
     EMAIL_WAIT_TIMEOUT,
-    LOGIN_BAN_PHRASES,
-    LOGIN_CAPTCHA_PHRASES,
-    LOGIN_CREDENTIAL_PHRASES,
     LOGIN_FALLBACK_SELECTOR,
     LOGIN_TIMEOUT,
     MARK_COOKIE as _MARK_COOKIE,
@@ -36,11 +33,11 @@ from .login_policy import (
     PAGE_PROBE as _PAGE_PROBE,
     PASSWORD_SELECTOR,
     POLL_BACKOFF,
+    POLL_MAX,
+    POLL_START,
     COOKIE_DISMISS_DELAY_MCP,
     REACT_COMMIT_DELAY,
     SIGN_IN_URL,
-    _POLL_MAX,
-    _POLL_START,
     classify_page_state,
     collapse_text as _collapse,
     parse_ban_until,
@@ -51,9 +48,9 @@ from ...core.tokens import extract_token
 logger = logging.getLogger("deepseaport.auth")
 
 # Page policy (selectors, phrase lists, visibility/snapshot JS, poll/timeout
-# constants, classify helpers) lives in ``login_policy``; names above are
-# re-exported here for backward compat (``auth.classify_page_state``,
-# ``auth._collapse``, phrase lists, probes, etc.).
+# constants, classify helpers) lives in ``login_policy``; the names imported
+# above are the ones this driver actually uses. Phrase lists are reached through
+# ``classify_page_state``, never re-bound here.
 #
 # The sign-in page ships a hidden ``#cf-overlay`` containing the literal text
 # "One more step before you proceed...". Monitoring raw body.innerText made
@@ -241,18 +238,18 @@ class BrowserLogin:
                       {"key": "Enter", "selector": PASSWORD_SELECTOR})
         except Exception as exc:
             detail = f"login form interaction failed (page refs changed?) for {email}: {exc}"
-            logger.warning(detail)
+            logger.warning(scrub_upstream_text(detail, 500))
             return LoginResult(detail=detail)
 
         deadline = time.monotonic() + LOGIN_TIMEOUT
-        delay = _POLL_START
+        delay = POLL_START
         ban_streak = 0
         last_url = ""
         last_body = ""
         last_error = ""
         while time.monotonic() < deadline:
             time.sleep(min(delay, max(0.05, deadline - time.monotonic())))
-            delay = min(_POLL_MAX, delay * POLL_BACKOFF)
+            delay = min(POLL_MAX, delay * POLL_BACKOFF)
             try:
                 page = _json_eval(client, _PAGE_PROBE)
             except Exception as exc:
@@ -275,12 +272,12 @@ class BrowserLogin:
             if kind == "captcha":
                 detail = (f"login captcha for {email} (phrase={phrase!r} "
                           f"url={last_url}): {_collapse(body, 300)}")
-                logger.info(detail)
+                logger.info(scrub_upstream_text(detail, 500))
                 return LoginResult(detail=detail)
             if kind == "credential":
                 detail = (f"login credential error for {email} (phrase={phrase!r} "
                           f"url={last_url}): {_collapse(body, 300)}")
-                logger.info(detail)
+                logger.info(scrub_upstream_text(detail, 500))
                 return LoginResult(detail=detail)
             token = extract_token(page.get("tok"))
             if not token:
@@ -290,7 +287,7 @@ class BrowserLogin:
 
         diag = (f"no token; last_url={last_url}; "
                 f"last_error={last_error or 'none'}; body={_collapse(last_body, 800)}")
-        logger.info("login failed for %s: %s", email, diag)
+        logger.info("login failed for %s: %s", email, scrub_upstream_text(diag, 800))
         return LoginResult(detail=diag)
 
 
@@ -298,8 +295,14 @@ def browser_login(email: str, password: str, settings: Settings) -> LoginResult:
     """Public entry point used by CLI/TUI/server refresh paths.
 
     A configured real browser (``browser_bin``) is preferred because it can
-    initialize Shumei's device-id SDK. When it is absent/unset, fall back to
-    the Obscura no-render flow (still useful on systems without a GUI browser).
+    initialize Shumei's device-id SDK. ARCHITECTURE.md's "real browser first,
+    falls back to Obscura" means falls back on FAILURE, not only on absence:
+    the real driver returns a ``(token, banned, detail)`` tuple for every
+    attempt, so an old ``is not None`` check ran the Obscura path only when no
+    browser binary resolved. A captcha, a CDP error or a 75s no-token timeout
+    therefore ended the login instead of trying the second driver (and set the
+    wrong login backoff). Only a produced token or a definitive ban verdict
+    (a ban cannot be recovered by retrying with another driver) stops here.
     """
     try:
         from .real_browser import login_with_real_browser
@@ -309,10 +312,13 @@ def browser_login(email: str, password: str, settings: Settings) -> LoginResult:
         logger.debug("real browser login unavailable: %s", exc)
     if real is not None:
         token, banned, detail = real
-        # Real-browser localStorage returns the full JSON wrapper; normalize
-        # before it can leak into an Authorization header.
-        return LoginResult(token=extract_token(token) or None,
-                           banned=banned, detail=detail)
+        if token or banned:
+            # Real-browser localStorage returns the full JSON wrapper; normalize
+            # before it can leak into an Authorization header.
+            return LoginResult(token=extract_token(token) or None,
+                               banned=banned, detail=detail)
+        logger.info("real browser login produced no token for %s, falling back "
+                    "to the Obscura driver: %s", email, (detail or "")[:200])
     return BrowserLogin(settings).run(email, password)
 
 

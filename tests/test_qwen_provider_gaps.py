@@ -295,14 +295,74 @@ def test_parse_tool_call_surfaced_as_content():
 
 
 def test_parse_usage_event():
+    # completion_tokens is preferred over total_tokens: build_usage feeds this
+    # number into completion_tokens, so preferring the (input+output) total
+    # would charge the prompt as output.
     line = ('data: {"choices":[{"delta":{"content":"a"}}],'
             ' "usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}')
-    assert [(e.kind, e.text) for e in _evs(line)] == [("content", "a"), ("usage", "3")]
+    assert [(e.kind, e.text) for e in _evs(line)] == [("content", "a"), ("usage", "2")]
 
 
 def test_parse_status_finished_no_content():
     line = 'data: {"choices":[{"delta":{"status":"finished","content":""}}]}'
     assert [(e.kind, e.text) for e in _evs(line)] == [("finished", "")]
+
+
+def test_parse_finished_chunk_still_emits_chunk_usage():
+    # Pre-change: the finished branch yielded and RETURNED, aborting the whole
+    # parse and skipping the chunk-level usage block -> the run reported no
+    # usage at all for a stream whose only usage rode on the finished chunk.
+    line = ('data: {"choices":[{"delta":{"status":"finished","content":""}}],'
+            '"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}')
+    assert [(e.kind, e.text) for e in _evs(line)] == [("usage", "20"), ("finished", "")]
+    # Usage must come FIRST: core.engine.drain_attempt / transport.pump_sse
+    # stop reading at the finished event, so a trailing usage event is lost.
+
+
+def test_parse_finished_chunk_emits_per_choice_usage():
+    # usage documented inside the choice object (module docstring); the parser
+    # only ever read the chunk-level block.
+    line = ('data: {"choices":[{"delta":{"status":"finished","content":""},'
+            '"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}]}')
+    assert [(e.kind, e.text) for e in _evs(line)] == [("usage", "20"), ("finished", "")]
+
+
+def test_parse_multi_choice_usage_is_summed():
+    line = ('data: {"choices":[{"delta":{"content":"a"},'
+            '"usage":{"output_tokens":5,"total_tokens":5}},'
+            '{"delta":{"content":"b"},"usage":{"output_tokens":7,"total_tokens":7}}]}')
+    assert [(e.kind, e.text) for e in _evs(line)] == [
+        ("content", "a"), ("content", "b"), ("usage", "12")]
+
+
+def test_parse_chunk_usage_wins_over_per_choice():
+    line = ('data: {"choices":[{"delta":{"content":"a"},'
+            '"usage":{"output_tokens":5}}],'
+            '"usage":{"output_tokens":9,"total_tokens":11}}')
+    assert [(e.kind, e.text) for e in _evs(line)] == [("content", "a"), ("usage", "9")]
+
+
+def test_parse_tail_content_after_finished_delta_not_lost():
+    # Same-chunk tail choice: the finished delta must not abort the loop, or
+    # the trailing content choice disappears from the assembled answer.
+    line = ('data: {"choices":[{"delta":{"status":"finished","content":""}},'
+            '{"delta":{"phase":"answer","content":"tail"}}]}')
+    assert [(e.kind, e.text) for e in _evs(line)] == [
+        ("content", "tail"), ("finished", "")]
+    # Next line after the finished line is still surfaced (stateless parser).
+    parser = QP.QwenStreamParser()
+    assert [e.kind for e in parser.feed(
+        'data: {"choices":[{"delta":{"status":"finished"}}]}')] == ["finished"]
+    assert [(e.kind, e.text) for e in parser.feed(
+        'data: {"choices":[{"delta":{"phase":"answer","content":"tail"}}]}')] == [
+        ("content", "tail")]
+
+
+def test_parse_thinking_after_finished_delta_not_lost():
+    line = ('data: {"choices":[{"delta":{"status":"finished"}},'
+            '{"delta":{"phase":"think","content":"hmm"}}]}')
+    assert [(e.kind, e.text) for e in _evs(line)] == [
+        ("thinking", "hmm"), ("finished", "")]
 
 
 def test_parse_error_envelope():
@@ -320,13 +380,34 @@ def test_parse_error_details_key():
 
 
 def test_parse_usage_live_keys():
+    # output_tokens is the completion count -> preferred over the (input+output)
+    # total_tokens. build_usage counts this as completion_tokens.
     line = 'data: {"usage":{"input_tokens":5,"output_tokens":7,"total_tokens":12}}'
-    assert [(e.kind, e.text) for e in _evs(line)] == [("usage", "12")]
+    assert [(e.kind, e.text) for e in _evs(line)] == [("usage", "7")]
 
 
 def test_parse_usage_output_tokens_fallback():
     line = 'data: {"usage":{"input_tokens":5,"output_tokens":7}}'
     assert [(e.kind, e.text) for e in _evs(line)] == [("usage", "7")]
+
+
+def test_parse_usage_total_tokens_last_resort():
+    # No output/completion key: total_tokens is better than nothing.
+    line = 'data: {"usage":{"input_tokens":5,"total_tokens":12}}'
+    assert [(e.kind, e.text) for e in _evs(line)] == [("usage", "12")]
+
+
+def test_parse_usage_unusable_output_falls_through():
+    # A null/garbage output_tokens must not swallow the usable total.
+    line = 'data: {"usage":{"input_tokens":5,"output_tokens":null,"total_tokens":12}}'
+    assert [(e.kind, e.text) for e in _evs(line)] == [("usage", "12")]
+    line = 'data: {"usage":{"output_tokens":"n/a","total_tokens":"12"}}'
+    assert [(e.kind, e.text) for e in _evs(line)] == [("usage", "12")]
+
+
+def test_parse_usage_empty_object_no_event():
+    assert _evs('data: {"usage":{}}') == []
+    assert _evs('data: {"usage":"nope"}') == []
 
 
 def test_parse_done_and_done_marker():
@@ -445,6 +526,74 @@ def test_stream_completion_200_json_success_false(monkeypatch):
     assert resp.closed is True
 
 
+# 403 mapping / ban classification (Qwen's WAF is 200 + text/html, never 403) ---
+
+
+_SUSPENDED_BODY = ("Due to violation of user policies, your account has been "
+                   "suspended")
+
+
+def test_stream_completion_403_is_not_labelled_waf(monkeypatch):
+    # Pre-change: the shared transport mapped every 403 to HTTP_403_WAF, so a
+    # real Qwen 403 (a suspension body) was classified as WAF -> re-primes and
+    # a pointless 502, no cooldown, no failover.
+    resp = _FakeResp(403, text=_SUSPENDED_BODY, content_type="application/json",
+                     lines=[])
+    _sess(monkeypatch, post=resp)
+    events = list(QC.stream_completion({"h": "1"}, {"prompt": "hi"}))
+    assert len(events) == 1
+    assert events[0].kind == "error"
+    assert events[0].code == "HTTP_403"
+    assert events[0].code != "HTTP_403_WAF"
+    assert "suspended" in events[0].message
+    assert resp.closed is True
+
+
+def test_qwen_403_suspension_body_classifies_as_ban():
+    # End to end through the string the retry/terminal tables see.
+    err = f"HTTP_403: {_SUSPENDED_BODY}"
+    assert QCS.classify_error(err) is QCS.RetryKind.BAN
+    # ... and the WAF retry branch must not claim it.
+    assert QCS.classify_error(err) is not QCS.RetryKind.WAF
+    # Terminal ladder: BAN is registered, so the account is failed over.
+    assert QCS._TERMINAL_HANDLERS[QCS.RetryKind.BAN] is QCS._terminal_ban
+
+
+def test_qwen_ban_checked_before_waf_families():
+    assert QCS.classify_error("HTTP_403: user is muted") is QCS.RetryKind.BAN
+    assert QCS.classify_error("HTTP_401: account suspended") is QCS.RetryKind.BAN
+    assert QCS.classify_error("restricted account") is QCS.RetryKind.BAN
+    # No ban wording -> the WAF / 401 / rate-limit families are unchanged.
+    assert QCS.classify_error(
+        "HTTP_403_WAF: blocked by WAF") is QCS.RetryKind.WAF
+    assert QCS.classify_error(
+        "WAF_CHALLENGE: Qwen completions returned the Aliyun WAF challenge page "
+        "(200 text/html) — warm up the bridge and retry") is QCS.RetryKind.WAF
+    assert QCS.classify_error("aliyun_waf_aa challenge") is QCS.RetryKind.WAF
+    assert QCS.classify_error("HTTP_401: Unauthorized") is QCS.RetryKind.INVALID_TOKEN
+    assert QCS.classify_error(
+        "quota_limit: high demand") is QCS.RetryKind.RATE_LIMIT
+    assert QCS.classify_error("HTTP_422: bad field") is QCS.RetryKind.UPSTREAM_INVALID
+    assert QCS.classify_error("upstream timed out") is QCS.RetryKind.OVERLOAD
+    assert QCS.classify_error("weird boom") is QCS.RetryKind.UPSTREAM
+
+
+def test_qwen_200_text_html_waf_challenge_still_waf(monkeypatch):
+    # The real Qwen WAF shape (200 + HTML) must keep its own detection path.
+    resp = _FakeResp(200, content_type="text/html", lines=[])
+    _sess(monkeypatch, post=resp)
+    events = list(QC.stream_completion({"h": "1"}, {"prompt": "hi"}))
+    assert [e.code for e in events] == ["WAF_CHALLENGE"]
+    assert QCS.classify_error(events[0].code + ": " + events[0].message) is (
+        QCS.RetryKind.WAF)
+    # Body markers on a drained (non-HTML-content-type) 200 line.
+    resp2 = _FakeResp(200, content_type="text/plain", lines=[
+        "<html>aliyun_waf_aa</html>", 'data: {"choices":[]}'])
+    _sess(monkeypatch, post=resp2)
+    events2 = list(QC.stream_completion({"h": "1"}, {"prompt": "hi"}))
+    assert [e.code for e in events2] == ["WAF_CHALLENGE"]
+
+
 def test_with_chat_id_unit():
     base = QP.CHAT_COMPLETIONS_URL
     assert QC._with_chat_id(base, {"chat_id": "a b/c"}) == f"{base}?chat_id=a%20b%2Fc"
@@ -471,20 +620,6 @@ def test_stream_completion_bare_url_without_chat_id(monkeypatch):
     events = list(QC.stream_completion({"h": "1"}, {"prompt": "hi"}))
     assert calls == [QP.CHAT_COMPLETIONS_URL]
     assert [e.kind for e in events] == ["finished"]
-
-
-def test_stop_completion_chat_id_query(monkeypatch):
-    calls = _recording_post(monkeypatch, _FakeResp(200))
-    QC.stop_completion({"h": "1"}, {"chat_id": "stop-1"})
-    assert calls == [f"{QP.CHAT_COMPLETIONS_STOP_URL}?chat_id=stop-1"]
-    calls.clear()
-    QC.stop_completion({"h": "1"}, {"prompt": "x"})
-    assert calls == [QP.CHAT_COMPLETIONS_STOP_URL]
-
-
-def test_stop_completion_swallows_exception(monkeypatch):
-    _sess(monkeypatch, post_exc=RuntimeError("net down"))
-    QC.stop_completion({"h": "1"}, {"chat_id": "stop-1"})  # must not raise
 
 
 def test_signin_success(monkeypatch):

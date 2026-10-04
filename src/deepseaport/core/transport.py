@@ -7,7 +7,8 @@ changes here — caps (20k/4k) and truncations are preserved verbatim.
 Ownership:
 - This module owns HTTP-level concerns: content-type checks, .text vs
   iter_lines draining (stream=True leaves .text/.json() empty), 422
-  detail surfacing, HTTP_403_WAF mapping, and the warning log shape.
+  detail surfacing, the injectable 403/forbidden -> event-code mapping
+  (default: DeepSeek's HTTP_403_WAF), and the warning log shape.
 - SSE line/event parsing lives in sse_parser.py.
 - Ban-envelope mapping (_biz_error/_ban_stream_event) stays in client.py;
   this module only moves the byte-handling primitives so client.py keeps
@@ -118,10 +119,28 @@ def enrich_422_body(body: str) -> str:
     return body
 
 
-def http_error_code(status_code: Any) -> str:
-    """Map HTTP status to event code: 403 -> HTTP_403_WAF, else HTTP_<n>."""
-    # AWS-WAF mapping reused from the DeepSeek path (403 always means WAF challenge).
-    return "HTTP_403_WAF" if status_code == 403 else f"HTTP_{status_code}"
+# Per-provider 403 -> event-code mapping (see http_error_code).
+_DEEPSEEK_FORBIDDEN: dict[int, str] = {403: "HTTP_403_WAF"}
+
+
+def http_error_code(status_code: Any,
+                    forbidden: dict[int, str] | None = None) -> str:
+    """Map an HTTP status to an event code.
+
+    The 403 meaning is per-provider (PROVIDERS.md: these web APIs differ), so
+    the mapping is injectable instead of hardcoded here. ``forbidden=None``
+    keeps the historical DeepSeek default (403 -> ``HTTP_403_WAF``; a DeepSeek
+    403 is always the AWS-WAF challenge), and a 1-arg call is unchanged.
+    Qwen passes an empty mapping: its WAF answers 200 + text/html (see
+    providers/qwen/protocol.py), so a 403 there is a real upstream status
+    (e.g. a suspension body) and must stay a plain ``HTTP_403``.
+    """
+    table = _DEEPSEEK_FORBIDDEN if forbidden is None else forbidden
+    try:
+        code = (table or {}).get(int(status_code))
+    except (TypeError, ValueError):
+        code = None
+    return code or f"HTTP_{status_code}"
 
 
 def describe_payload(payload: Any) -> tuple[list[str], int]:
@@ -135,21 +154,35 @@ def describe_payload(payload: Any) -> tuple[list[str], int]:
 
 
 def log_http_error(status_code: Any, ctype: str, body: str, payload: Any) -> None:
-    """Emit the completion warning with payload shape (preserved format)."""
+    """Emit the completion warning with payload shape (preserved format).
+
+    The body is de-tokenized here because this fires on EVERY non-200, and the
+    request that provoked the error is precisely the one carrying the account's
+    bearer token -- an upstream that echoes the ``Authorization`` header it was
+    given puts it in the log here. The ``%.500s`` that used to bound this was a
+    length guard, not a secret guard, so the bound is the scrubber's now and the
+    format string no longer needs a length of its own.
+    """
+    from .engine import scrub_upstream_text
+
     payload_keys, prompt_len = describe_payload(payload)
-    logger.warning("completion HTTP %s (ct=%s) body=%.500s payload_keys=%s prompt_len=%d",
-                   status_code, ctype, body, payload_keys, prompt_len)
+    logger.warning("completion HTTP %s (ct=%s) body=%s payload_keys=%s prompt_len=%d",
+                   status_code, ctype, scrub_upstream_text(body, 500),
+                   payload_keys, prompt_len)
 
 
-def build_http_error_event(resp: Any, payload: Any) -> StreamEvent:
+def build_http_error_event(resp: Any, payload: Any,
+                           forbidden: dict[int, str] | None = None) -> StreamEvent:
     """Full non-200 mapping: drain body, enrich 422, log, return error event.
 
-    Caller owns resp.close()/yield (lifecycle stays in client.py so the
-    client._SESSION monkeypatch hook keeps working).
+    ``forbidden`` forwards the provider-specific 403 mapping to
+    :func:`http_error_code` (None = the DeepSeek default). Caller owns
+    resp.close()/yield (lifecycle stays in client.py so the client._SESSION
+    monkeypatch hook keeps working).
     """
     ctype, body = read_error_body(resp)
     body = enrich_422_body(body)
-    code = http_error_code(resp.status_code)
+    code = http_error_code(resp.status_code, forbidden)
     log_http_error(resp.status_code, ctype, body, payload)
     return StreamEvent(kind="error", code=code, message=body)
 

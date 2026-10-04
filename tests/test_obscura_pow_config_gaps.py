@@ -13,7 +13,7 @@ from subprocess import CompletedProcess
 
 import pytest
 
-from deepseaport import pow as PoW
+from deepseaport.providers.deepseek import pow as PoW
 from deepseaport.config import (
     DEFAULT_PORT,
     AccountConfig,
@@ -22,18 +22,26 @@ from deepseaport.config import (
     _default_config_path,
     load_settings,
 )
-from deepseaport.obscura_bridge import (
+from deepseaport.core.obscura_bridge import (
     ObscuraBridge,
     WafState,
     _profile_key,
     get_default_bridge,
     register_default_bridge,
 )
-from deepseaport.tokens import extract_token
+from deepseaport.core.tokens import extract_token
 
 
 def _bridge(tmp_path, name="prof", **kw):
     return ObscuraBridge(binary="fake-obscura", profile=str(tmp_path / name), **kw)
+
+
+# Bounded wait for the leader/follower handshake in the singleflight test. NOT
+# an assertion bound: it exists so a lost signal FAILS instead of hanging, and
+# so a fake subprocess that never gets released still unwinds. Far above what
+# is actually waited on (a local function call plus a dict update), so a slow
+# scheduler on a loaded runner cannot turn it red.
+_WARMUP_HANDSHAKE_TIMEOUT = 10.0
 
 
 _CONFIG_ENV_KEYS = [
@@ -119,14 +127,14 @@ def test_profile_key_different_profiles_different_keys(tmp_path):
 
 
 def test_discover_path_hit(monkeypatch):
-    monkeypatch.setattr("deepseaport.obscura_bridge.shutil.which",
+    monkeypatch.setattr("deepseaport.core.obscura_bridge.shutil.which",
                         lambda name: "/usr/bin/obscura" if name == "obscura" else None)
     assert ObscuraBridge._discover() == "/usr/bin/obscura"
 
 
 def test_discover_local_glob_hit(monkeypatch, tmp_path):
     (tmp_path / "obscura").write_text("x", encoding="utf-8")
-    monkeypatch.setattr("deepseaport.obscura_bridge.shutil.which", lambda name: None)
+    monkeypatch.setattr("deepseaport.core.obscura_bridge.shutil.which", lambda name: None)
     monkeypatch.setattr(ObscuraBridge, "_search_roots",
                         staticmethod(lambda: [tmp_path]))
     found = ObscuraBridge._discover()
@@ -134,7 +142,7 @@ def test_discover_local_glob_hit(monkeypatch, tmp_path):
 
 
 def test_discover_fallback(monkeypatch):
-    monkeypatch.setattr("deepseaport.obscura_bridge.shutil.which", lambda name: None)
+    monkeypatch.setattr("deepseaport.core.obscura_bridge.shutil.which", lambda name: None)
     monkeypatch.setattr(ObscuraBridge, "_search_roots", staticmethod(lambda: []))
     assert ObscuraBridge._discover() == "obscura"
 
@@ -146,7 +154,7 @@ def test_version_exception_returns_unavailable(monkeypatch, tmp_path):
     b = _bridge(tmp_path, "ver")
     def _boom(*a, **k):
         raise RuntimeError("boom")
-    monkeypatch.setattr("deepseaport.obscura_bridge.subprocess.run", _boom)
+    monkeypatch.setattr("deepseaport.core.obscura_bridge.subprocess.run", _boom)
     assert b.version().startswith("unavailable:")
 
 
@@ -232,34 +240,83 @@ def test_warmup_ua_reuse_no_fetch(tmp_path):
     assert b.state.user_agent == "cached-ua"
 
 
-def test_warmup_follower_shares_leader(tmp_path):
+def test_warmup_follower_shares_leader(tmp_path, monkeypatch):
+    """A concurrent warmup joins the in-flight leader instead of spawning a
+    second browser (one --storage-dir, one cookie jar).
+
+    Both halves of this used to be clocks, and both were coin flips. The
+    `sleep(0.3)` inside the fake only had to be "long enough" for the follower
+    to arrive, and the `sleep(0.05)` between the two `start()` calls had to be
+    "long enough" for the leader to reach its singleflight branch -- 50ms is
+    the same order as `server_concurrency._CANCEL_POLL_SECONDS`, so on a loaded
+    runner the follower could arrive first and become the leader itself, and
+    `runs["n"] == 1` would fail with nothing broken.
+
+    Now both orderings are signals. `in_run` proves the leader is inside the
+    subprocess (i.e. past the singleflight branch, holding the inflight flag),
+    and spying `_follower_wait_budget` proves the second caller has already
+    been classified as a follower -- that function is reached only after that
+    classification. Releasing the leader before the follower signal would be
+    the only way this could flake, and the assert stops it there.
+    """
+    from deepseaport.core import obscura_bridge as bridge_mod
+
     b = _bridge(tmp_path, "single")
     b.state = WafState(cookies={}, user_agent="ua-preset", warmed=False)
     b._last_warmup_ok = 0.0
     dump = json.dumps([{"name": "aws-waf-token", "value": "slowtok"}])
     runs = {"n": 0}
+    in_run = threading.Event()
+    release = threading.Event()
+    followed = threading.Event()
+    watcher_errors: list[str] = []
 
     def slow_run(*a, **k):
         runs["n"] += 1
-        time.sleep(0.3)
+        in_run.set()
+        # Park instead of sleeping 0.3s: the leader has to stay inside the
+        # subprocess until the follower has been observed, and a fixed sleep
+        # can only ever guess at that. Bounded so a lost signal fails rather
+        # than hangs.
+        release.wait(_WARMUP_HANDSHAKE_TIMEOUT)
         return CompletedProcess(a, 0, stdout=dump, stderr="")
 
     b._run = slow_run  # type: ignore[method-assign]
     results: dict = {}
+
+    # Only the follower path consults the budget, so this is a precise
+    # "caller 2 saw the leader's inflight flag" signal.
+    real_budget = bridge_mod._follower_wait_budget
+
+    def _spy_budget(timeout):
+        followed.set()
+        return real_budget(timeout)
+
+    monkeypatch.setattr(bridge_mod, "_follower_wait_budget", _spy_budget)
 
     def call(idx):
         results[idx] = b.warmup()
 
     t1 = threading.Thread(target=call, args=(1,))
     t2 = threading.Thread(target=call, args=(2,))
+
     t1.start()
-    time.sleep(0.05)
+    if not in_run.wait(_WARMUP_HANDSHAKE_TIMEOUT):
+        watcher_errors.append("leader never reached the subprocess")
     t2.start()
-    t1.join(5)
-    t2.join(5)
+    if not followed.wait(_WARMUP_HANDSHAKE_TIMEOUT):
+        watcher_errors.append("second caller was never classified a follower")
+    # Unconditional: a leader left parked would pin a non-daemon thread and
+    # hang the suite instead of failing this test.
+    release.set()
+    t1.join(_WARMUP_HANDSHAKE_TIMEOUT)
+    t2.join(_WARMUP_HANDSHAKE_TIMEOUT)
+
+    assert not watcher_errors, watcher_errors
+    assert not t1.is_alive() and not t2.is_alive(), "warmup thread did not finish"
     assert results[1] == {"aws-waf-token": "slowtok"}
     assert results[2] == {"aws-waf-token": "slowtok"}
-    assert runs["n"] == 1
+    assert runs["n"] == 1, f"the follower spawned its own browser: {runs['n']} runs"
 
 
 def test_register_default_bridge_roundtrip(tmp_path):
@@ -292,7 +349,7 @@ def test_pow_solve_wrong_algorithm_raises():
 def test_pow_solve_propagates_engine_error(monkeypatch):
     def _boom():
         raise FileNotFoundError("no wasm")
-    monkeypatch.setattr("deepseaport.pow._get_engine_module", _boom)
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow._get_engine_module", _boom)
     with pytest.raises(FileNotFoundError):
         PoW.solve(PoW.ALGORITHM, "c", "s", 1, 1)
 
@@ -301,10 +358,57 @@ def test_pow_wasm_path_caching_same():
     assert PoW.wasm_path() is PoW.wasm_path()
 
 
+def test_pow_wasm_name_traversal_rejected(monkeypatch):
+    """F8: DEEPSEAPORT_WASM_NAME was concatenated onto DATA_DIR unguarded.
+
+    The file is then instantiated and executed by wasmtime, so an env var must
+    not be able to point the write outside the data dir. The upstream asset is
+    content-hash-named, so a plain filename is the only acceptable value.
+    """
+    for bad in ("../../evil.wasm", "..", "../x.wasm", "sub/dir.wasm",
+                "sub\\dir.wasm", "C:evil.wasm", "", "   ", "a..b.wasm"):
+        monkeypatch.setattr(PoW, "WASM_NAME", bad)
+        monkeypatch.setattr(PoW, "_WASM_PATH", None)
+        with pytest.raises(RuntimeError, match="unsafe DEEPSEAPORT_WASM_NAME"):
+            PoW.wasm_path()
+    # A legitimate hash-named file still resolves inside DATA_DIR.
+    monkeypatch.setattr(PoW, "WASM_NAME", "sha3_wasm_bg.7b9ca65ddd.wasm")
+    monkeypatch.setattr(PoW, "_WASM_PATH", None)
+    path = PoW.wasm_path()
+    assert path.name == "sha3_wasm_bg.7b9ca65ddd.wasm"
+    assert path.parent == PoW.DATA_DIR
+    assert PoW.validated_wasm_name("sha3_wasm_bg.7b9ca65ddd.wasm") == (
+        "sha3_wasm_bg.7b9ca65ddd.wasm")
+
+
+def test_pow_wasm_url_override_warns_loudly(monkeypatch, tmp_path, caplog):
+    """The download is only checked for size + magic, then executed."""
+    monkeypatch.setenv("DEEPSEAPORT_WASM_URL", "https://evil.example/x.wasm")
+    monkeypatch.setattr(PoW, "_warned_wasm_url", False)
+    existing = tmp_path / "w.wasm"
+    existing.write_bytes(b"x" * 2000)
+    monkeypatch.setattr(PoW, "wasm_path", lambda: existing)
+    monkeypatch.setattr("curl_cffi.requests.get",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("existing file must not download")))
+    with caplog.at_level("WARNING", logger="deepseaport.pow"):
+        PoW.ensure_wasm()
+    assert any("DEEPSEAPORT_WASM_URL" in r.getMessage()
+               and "https://evil.example/x.wasm" in r.getMessage()
+               for r in caplog.records)
+    # No override -> no warning.
+    caplog.clear()
+    monkeypatch.delenv("DEEPSEAPORT_WASM_URL", raising=False)
+    monkeypatch.setattr(PoW, "_warned_wasm_url", False)
+    with caplog.at_level("WARNING", logger="deepseaport.pow"):
+        PoW.ensure_wasm()
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
 def test_pow_ensure_wasm_skips_download(monkeypatch, tmp_path):
     target = tmp_path / "wasm.bin"
     target.write_bytes(b"x" * 2000)
-    monkeypatch.setattr("deepseaport.pow.wasm_path", lambda: target)
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.wasm_path", lambda: target)
 
     def _boom(*a, **k):
         raise AssertionError("download must not be called")
@@ -313,10 +417,54 @@ def test_pow_ensure_wasm_skips_download(monkeypatch, tmp_path):
     assert PoW.ensure_wasm() == target
 
 
+def test_obscura_profile_dir_is_owner_only(tmp_path):
+    """F9: mkdir() used the umask (0755 on POSIX) and left the cookie jar
+    (aws-waf-token) world-readable."""
+    import os
+    import stat
+
+    from deepseaport.core import obscura_bridge as OB
+
+    profile = tmp_path / "prof-0700"
+    OB.secure_dir(str(profile), "obscura profile")
+    assert profile.is_dir()
+    # POSIX modes are a no-op on Windows; the ACL warning is what covers it.
+    if os.name != "nt":
+        mode = stat.S_IMODE(profile.stat().st_mode)
+        assert mode == 0o700, oct(mode)
+    # Idempotent + never raises on an existing dir.
+    OB.secure_dir(str(profile), "obscura profile")
+    OB.secure_dir(str(tmp_path / "prof-missing-parent" / "x"), "obscura profile")
+    assert (tmp_path / "prof-missing-parent" / "x").is_dir()
+
+
+def test_obscura_bridge_constructor_tightens_profile(tmp_path):
+    import os
+    import stat
+
+    from deepseaport.core import obscura_bridge as OB
+
+    profile = tmp_path / "prof-ctor"
+    bridge = _bridge(tmp_path, name="prof-ctor")
+    assert bridge.profile == str(profile)
+    assert profile.is_dir()
+    if os.name != "nt":
+        assert stat.S_IMODE(profile.stat().st_mode) == 0o700
+
+
+def test_obscura_secure_dir_never_raises(tmp_path, monkeypatch):
+    from deepseaport.core import obscura_bridge as OB
+
+    monkeypatch.setattr(OB.Path, "mkdir",
+                        lambda *a, **k: (_ for _ in ()).throw(PermissionError(
+                            "WinError 5")))
+    OB.secure_dir(str(tmp_path / "nope"), "obscura profile")  # must not raise
+
+
 def test_pow_get_engine_module_cache_hit(monkeypatch, tmp_path):
     wp = tmp_path / "m.wasm"
     wp.write_bytes(b"\x00asm1234")
-    monkeypatch.setattr("deepseaport.pow.wasm_path", lambda: wp)
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.wasm_path", lambda: wp)
     orig_e, orig_m, orig_k = PoW._ENGINE, PoW._MODULE, PoW._MODULE_KEY
     PoW._ENGINE = None
     PoW._MODULE = None

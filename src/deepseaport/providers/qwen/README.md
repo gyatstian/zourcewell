@@ -21,7 +21,7 @@ All on `https://chat.qwen.ai` unless noted. `BASE` overridable via
 | `/api/v2/chats/new` | POST | yes | `{chatId:"", models:[m], project_id, timestamp, chat_type, chat_mode:"normal"}` → `{success:true, data:{id}}`; WAF-gated |
 | `/api/v2/chats/{id}` | DELETE | yes | delete chat (JS-grep); WAF-gated |
 | `/api/v2/chat/completions?chat_id=<chat_id>` | POST | yes | `?chat_id=` query param REQUIRED (missing → `RequestValidationError: Field 'query -> chat_id': Field required`); needs `X-Accel-Buffering: no`; WAF-gated |
-| `/api/v2/chat/completions/stop` | POST | yes | `{chat_id,...}` (JS-grep); optional best-effort helper |
+| `/api/v2/chat/completions/stop` | POST | yes | `{chat_id,...}` (JS-grep); endpoint constant `protocol.CHAT_COMPLETIONS_STOP_URL` is kept as documented protocol surface, but the `client.stop_completion` helper that called it is **gone** (zero callers in `src/`) — so nothing in deepseaport stops a completion upstream today |
 | `/api/v2/chat/completions?chat_id=..&message_id=..` | GET | yes | stream resume (`responseType:"stream"`) — **NOT implemented**, `# TODO(unverified)` |
 
 ## Login (live-verified)
@@ -131,8 +131,8 @@ data: {"choices":[{"delta":{"content":"","role":"assistant","status":"finished",
 | `response.created` | start marker (`chat_id`, `parent_id` = user msg fid, `response_id`) | ignore |
 | `response.info` (`action:"skip_think"`) | ignore | ignore |
 | `response.stopped` | turn finished (JS-grep, not seen live) | ignored here (a final choices/usage line may follow) |
-| `choices:[{delta:{content,phase,role,status,extra,lang_code,function_call,function_id,name,mcp_name}}]` | content chunk | map by `delta.phase` (below); FINISH = `delta.status == "finished"` (empty content) → finished event, stop that chunk, no empty content emit |
-| `usage` on the choices line or usage-only line | token counts `input_tokens`/`output_tokens`/`total_tokens` | best-effort usage event (prefer `total_tokens`) |
+| `choices:[{delta:{content,phase,role,status,extra,lang_code,function_call,function_id,name,mcp_name}}]` | content chunk | map by `delta.phase` (below); FINISH = `delta.status == "finished"` (empty content) → record the finish and still read the chunk's `usage`, then emit usage **before** finished (the consumer stops reading at `finished`); a choice after the finished delta is still mapped, and no empty content is emitted |
+| `usage` on the choices line, on the finished chunk, per choice object, or a usage-only line | token counts `input_tokens`/`output_tokens`/`total_tokens` | best-effort usage event carrying the **completion** count: `output_tokens` first, then `completion_tokens`, `total_tokens` only as a last resort — `core.openai.build_usage` treats the emitted number as `completion_tokens`, and Qwen's `total_tokens` is input+output, so preferring it would charge the prompt as output (a live 832/1/833 sample reported 833 completion tokens instead of 1) |
 | `error` (`{code,details}` or `{code,message}` or string) | error, e.g. `{"error":{"code":"quota_limit","details":"The service is currently experiencing high demand..."}}` — message key is **`details`** | error event (code from `code` then `type`) |
 | `done:true` | finished | finished event |
 | plaintext `data: [DONE]` | finished (handled, not observed live — stream simply ends after the finished chunk) | finished event |
@@ -166,14 +166,17 @@ Solved jar via obscura `fetch https://chat.qwen.ai/ --dump cookies`
 (`acw_tc` 64-char + `x-ap`/`sca`/`cna`/`tfstk`/`isg`) is required;
 `prime_qwen_bridge()` harvests it, `prime_waf()` is bare fallback.
 `False` from `prime_waf()` with a fake `<JWT>` is envelope-miss only —
-harvest still lands. Completions send `X-Accel-Buffering: no` like the web.
+the harvest still lands. Completions send `X-Accel-Buffering: no` like the web.
 
 Client detection: content-type `text/html` OR body lines containing
 `aliyun_waf`/`AliyunCaptcha`/`nc-container` → emits error event code
-**`WAF_CHALLENGE`**. Engine recovery mirrors DeepSeek's WAF retry minus PoW:
-release the account slot, qwen-host solved fetch + `prime_waf`, recreate the
-chat, retry (`_recover_waf`). DeepSeek-host `bridge.warmup()` is skipped for
-qwen (never plants qwen cookies, WinError5 noise on Windows).
+**`WAF_CHALLENGE`** (`protocol.is_waf_challenge` for the content-type half,
+`protocol.is_waf_body` for the drained-body half). Engine recovery
+mirrors DeepSeek's WAF retry minus PoW: release the account slot, qwen-host
+solved fetch + `prime_waf`, recreate the chat, retry
+(`completion_service._refresh_waf_without_account_lock`). DeepSeek-host
+`bridge.warmup()` is skipped for qwen (never plants qwen cookies, WinError5
+noise on Windows).
 
 ## Models (verified live, unauth catalogue)
 
@@ -196,6 +199,24 @@ qwen (never plants qwen cookies, WinError5 noise on Windows).
 | `http_422` / `http_400` / `unprocessable` | UPSTREAM_INVALID | no | 502 |
 | generic ban words (`P.is_ban_error_text`) / `restricted` | BAN | no (failover) | 403 + mark banned |
 | anything else | UPSTREAM | no | 502 |
+
+**The `403` row is the fallback, not the answer — read the ban row first.**
+A Qwen 403 reaches `classify_error` as a plain `HTTP_403`, not
+`HTTP_403_WAF` (`core.transport.http_error_code` is called with an empty
+`forbidden` table for this provider; see "The 403 meaning is per-provider" in
+`PROVIDERS.md` for why). A bare `403` with no ban wording still falls into the
+substring WAF branch, but the ban check runs first, so a body that says the
+account is suspended routes to **BAN** — 403 + cooldown + failover — not to a
+WAF re-prime and a 502:
+
+```
+HTTP_403: your account has been suspended   -> RetryKind.BAN
+HTTP_403: blocked                            -> RetryKind.WAF   (fallback)
+```
+
+This matters because the two providers' WAFs differ: DeepSeek's 403 *is* the
+AWS-WAF challenge and must be `HTTP_403_WAF`, while Qwen's WAF answers 200 +
+`text/html` and leaves a real 403 to mean what it says.
 
 Ban envelope shape is **UNVERIFIED**: no suspended-account payload has been
 captured, so the verdict is best-effort — explicit mute/ban flags plus generic
@@ -226,8 +247,9 @@ Stream error envelope message key is `details`
   servers racing one `--storage-dir`, not ACL (ACL is FullControl; a manual
   `fetch chat.qwen.ai` succeeds). Kill the stale server before retrying.
 - `prime_waf()` returning `False` with a fake `<JWT>` is envelope-miss
-  only — the `acw_tc` harvest still lands. Test with `prime_noauth`
-  (`base_headers()` empty) → `True`.
+  only — the `acw_tc` harvest still lands (`prime_waf` calls
+  `_harvest_waf_cookies` *before* parsing the envelope, precisely so it does).
+  To test the prime without a JWT, call it with `base_headers()` emptied.
 - `prime_qwen_bridge()` is the real fix; `prime_waf()` is bare fallback.
 
 ## UNVERIFIED / TODO

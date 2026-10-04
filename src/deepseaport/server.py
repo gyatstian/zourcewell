@@ -8,114 +8,54 @@ buffered full text at FINISHED and emitted as OpenAI tool_call deltas.
 
 The endpoints live in ``deepseaport.server_routes``, the completion/retry
 engine in ``deepseaport.providers.deepseek.completion_service``, and the
-executors + lifecycle in ``deepseaport.server_concurrency``. This module
-keeps ``create_app`` as thin wiring and re-exports every historical name
-for backward compatibility (tests + provider compat seams).
+executors + lifecycle in ``deepseaport.server_concurrency``. This module is
+thin wiring only: ``create_app``, the model catalogue, log configuration,
+and the three monkeypatch seams the route layer deliberately looks up here.
+Everything else is imported from the module that owns it.
 """
 
 from __future__ import annotations
 
-import asyncio  # noqa: F401  (re-exported: historical surface)
-import json  # noqa: F401  (re-exported: historical surface)
 import logging
 import os
-import threading  # noqa: F401  (re-exported: historical surface)
-import time  # noqa: F401  (re-exported: historical surface)
-import uuid  # noqa: F401  (re-exported: historical surface)
-from concurrent.futures import ThreadPoolExecutor  # noqa: F401
-from contextlib import asynccontextmanager  # noqa: F401
 
-from fastapi import FastAPI, Header, HTTPException, Request  # noqa: F401
-from fastapi.responses import JSONResponse, StreamingResponse  # noqa: F401
+from fastapi import FastAPI
 
-from .providers.deepseek import client as DS  # noqa: F401
-from .providers.deepseek import pow as PoW  # noqa: F401
-from .providers.deepseek import protocol as P  # noqa: F401
+from . import __version__
 from .providers.deepseek.models import MODELS_SPEC
-from .accounts import AccountPool, PooledAccount  # noqa: F401
-from .config import AccountConfig, Settings, load_settings
-from .core.obscura_bridge import ObscuraBridge, register_default_bridge  # noqa: F401
-from .core.tools import (
-    looks_truncated_tool_attempt,  # noqa: F401
-    parse_tool_calls,  # noqa: F401
-    render_prompt,  # noqa: F401
-    tool_reminder_prompt,  # noqa: F401
-    tool_system_prompt,  # noqa: F401
-)
+from .config import Settings, load_settings
+from .server_concurrency import apply_log_level, lifespan
+from .server_routes import _pool, register_routes
 
-# --- Re-exports from the split modules (historical public surface) ---------
-# FROZEN COMPAT SURFACE (F5): tests + cli/chat_ui/dry_run/tui import
-# MODELS, active_models, _pool, _prepare, _complete_with_failover_sync,
-# _openai_response, parse_tool_calls and the executor/lifecycle names below
-# directly from deepseaport.server, and monkeypatch deepseaport.server._pool /
-# deepseaport.server.parse_tool_calls / completion_service fns. Do not remove
-# or rename these re-exports; add new names only. Canonical logic lives in
-# server_routes (routes/pools/_prepare), core.registry (catalogue),
-# core.openai (response shaping), providers.* (completion engine).
-# Order matters only for readability; all names are importable from
-# deepseaport.server exactly as before the split. The completion/stream
-# engine lives in providers.deepseek.completion_service; this module holds
-# no engine logic, only create_app + catalogue + compat aliases.
-from .core.openai import _openai_response  # noqa: F401
-from .providers.deepseek.completion_service import (
-    _AttemptOutcome,  # noqa: F401
-    _TOKEN_REFRESH_BAN_HINT,  # noqa: F401
-    _TOKEN_REFRESH_INFLIGHT,  # noqa: F401
-    _TOKEN_REFRESH_LOCK,  # noqa: F401
-    _app_settings,  # noqa: F401
-    _attempt,  # noqa: F401
-    _ban_403_for_item,  # noqa: F401
-    _complete_with_failover_sync,  # noqa: F401
-    _delete_session_bg,  # noqa: F401
-    _ensure_token,  # noqa: F401
-    _header_from_challenge,  # noqa: F401
-    _headers,  # noqa: F401
-    _is_ban_http_exception,  # noqa: F401
-    _is_invalid_token_error,  # noqa: F401
-    _is_transient_overload,  # noqa: F401
-    _probe_ban,  # noqa: F401
-    _refresh_token_via_obscura,  # noqa: F401
-    _refresh_waf_without_account_lock,  # noqa: F401
-    _run_completion,  # noqa: F401
-    _run_completion_core,  # noqa: F401
-    _session_and_challenge,  # noqa: F401
-    _solve,  # noqa: F401
-    _stream_completion,  # noqa: F401
-    _switch_current_after_ban_failover,  # noqa: F401
-)
-from .server_concurrency import (
-    FAILOVER_ACQUIRE_TIMEOUT,  # noqa: F401
-    INVALID_TOKEN_COOLDOWN_SECONDS,  # noqa: F401
-    _CHALLENGE_EXECUTOR,  # noqa: F401
-    _CLEANUP_EXECUTOR,  # noqa: F401
-    _CONSUMER_GRACE_SECONDS,  # noqa: F401
-    _DEFAULT_POOL_SIZE,  # noqa: F401
-    _STREAM_EXECUTOR,  # noqa: F401
-    _StreamCancelled,  # noqa: F401
-    _acquire_slot_or_499,  # noqa: F401
-    _await_cancelable,  # noqa: F401
-    _startup_warm,  # noqa: F401
-    _watch_disconnect,  # noqa: F401
-    apply_log_level,
-    lifespan,
-)
-from .server_routes import _check_auth, _pool, _prepare, register_routes  # noqa: F401
-
-# Frozen test/import seam: `from deepseaport.server import X` must keep working
-# for every name above plus MODELS/active_models/create_app/app. __all__ pins
-# the surface so refactors do not silently drop a monkeypatch target.
-__all__ = [
-    "MODELS", "active_models", "create_app", "app", "register_routes",
-    "_check_auth", "_pool", "_prepare",
-    "_openai_response", "_complete_with_failover_sync", "_run_completion",
-    "_run_completion_core", "_stream_completion", "_attempt",
-    "parse_tool_calls", "render_prompt",
-    "AccountPool", "PooledAccount", "AccountConfig", "Settings",
-    "load_settings", "apply_log_level", "lifespan",
-]
+# Three names stay reachable as attributes of THIS module, not for
+# backward compatibility but because the route layer resolves them through
+# it on purpose:
+#   _pool          -- server_routes._pool_for / _pool delegate the
+#                     single-provider path here, so patching one function
+#                     covers every pool entry point;
+#   _openai_response / parse_tool_calls -- the response shim and the tool
+#                     parser the routes substitute in tests.
+# They are re-pointed at the owning module if that indirection is ever
+# dropped; nothing else re-exports anything.
+from .core.openai import _openai_response
+from .core.tools import parse_tool_calls
 
 logger = logging.getLogger("deepseaport.server")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+# Log format for the process-owning entry point (create_app). It used to run at
+# import time, which made `import deepseaport.server` mutate process-global
+# logging for every embedder, test run and CLI import that never serves a
+# request. ``logging.basicConfig`` keeps its "only if the root logger has no
+# handlers" contract, so a host that configured logging itself (or chat_ui,
+# which forces the root level to ERROR) is left alone; ``force=True`` is the
+# opt-in for callers that want deepseaport's format to win.
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+
+def configure_logging(level: int = logging.INFO, *, force: bool = False) -> None:
+    """Install the deepseaport console log format (no-op when already set up)."""
+    logging.basicConfig(level=level, format=LOG_FORMAT, force=force)
+
 
 # Derived from the DeepSeek provider catalogue, kept as a plain dict for
 # backwards compatibility (tests assert exact tuple values and iteration).
@@ -142,7 +82,15 @@ def active_models(settings=None) -> dict[str, tuple[bool, bool, str]]:
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    app = FastAPI(title="deepseaport", version="0.1.0", lifespan=lifespan)
+    # Process-owning entry point: this is where the process decides it wants
+    # console logging, so importing this module stays side-effect free.
+    configure_logging()
+    # No /docs, /redoc or /openapi.json: those are an unauthenticated,
+    # machine-readable inventory of every route (including the account CRUD
+    # surface and the {identifier} path shape) on a local-first bridge that
+    # holds a credential store. The live routes are the only surface we expose.
+    app = FastAPI(title="deepseaport", version=__version__, lifespan=lifespan,
+                  docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings or load_settings()
     apply_log_level(getattr(app.state.settings, "log_level", "INFO"))
     # One registry for every mode; `pool` stays as an explicit override seam.
@@ -150,16 +98,3 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.pool = None
     register_routes(app)
     return app
-
-
-def __getattr__(name: str):
-    # Lazy `deepseaport.server.app`: importing this module used to build a
-    # FastAPI app + load_settings() (disk I/O) as a side effect, slowing
-    # every `import` (cli, tests, tools) and surprising embedders. Resolve
-    # on first attribute access so `server:app` / `from .server import app`
-    # keep working (PEP 562) with no import-time cost.
-    if name == "app":
-        _app = create_app()
-        globals()["app"] = _app
-        return _app
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

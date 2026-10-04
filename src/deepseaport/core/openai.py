@@ -9,6 +9,7 @@ otherwise the real parser is used. An explicit ``parse_fn`` overrides both.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -47,7 +48,6 @@ def build_usage(prep: dict, content: str, thinking: str,
     except (TypeError, ValueError):
         ct = 0
     if not ct:
-        ct = estimate_tokens((content or "") + (thinking or ""))
         # content+thinking concatenated then //4 would undercount by the
         # join; estimate them separately would double the max(1,·) floor —
         # use the sum of lengths instead.
@@ -57,15 +57,6 @@ def build_usage(prep: dict, content: str, thinking: str,
             ct = 1
     return {"prompt_tokens": pt, "completion_tokens": ct,
             "total_tokens": pt + ct}
-
-
-def should_emit_usage(prep: dict) -> bool:
-    """True when the client asked for stream usage (OpenAI stream_options)."""
-    try:
-        opts = prep.get("stream_options") or {}
-        return bool(isinstance(opts, dict) and opts.get("include_usage"))
-    except Exception:
-        return False
 
 
 def format_miss_trail(diagnostics: list[dict] | None,
@@ -94,12 +85,6 @@ def format_miss_trail(diagnostics: list[dict] | None,
         return trail
     except Exception:
         return "diagnostics unavailable"
-
-
-def _miss_summary(diagnostics: list[dict] | None,
-                  valid: set[str] | None = None) -> str:
-    """Backward-compat alias for :func:`format_miss_trail`."""
-    return format_miss_trail(diagnostics, valid)
 
 
 def _resolve_parse_fn(explicit=None):
@@ -148,11 +133,45 @@ def _log_tool_miss(prep: dict, content: str, where: str = "response") -> None:
             kwargs["max_args_chars"] = limit
         res = _ex(content or "", tools, **kwargs)
         valid = _valid_names(tools)
-        summary = _miss_summary(res.diagnostics, valid)
+        summary = format_miss_trail(res.diagnostics, valid)
         logger.warning(
             "tool-call miss (%s) model=%s forgiving=%s %s preview=%.300s",
             where, prep.get("model"), forgiving, summary,
             (content or "")[:300])
+    except Exception:
+        logger.debug("no tool call parsed %s model=%s preview=%.200s",
+                     where, prep.get("model"), (content or "")[:200])
+
+
+async def _alog_tool_miss(prep: dict, content: str,
+                          diagnostics: list[dict] | None = None,
+                          *, where: str = "stream") -> None:
+    """Async twin of :func:`_log_tool_miss` for the streaming parse path.
+
+    Same warning-level miss log with the diagnostics trail. Takes the
+    ``diagnostics`` the stream parse already produced; when it has none (the
+    parse ran through a monkeypatched seam) it re-runs ``parse_tool_calls_ex``
+    for logging only, exactly like the sync helper. The parse itself stays on
+    the caller's off-thread call, so this stays off the event loop. Never
+    raises.
+    """
+    try:
+        from .tools import _valid_names
+        from .tools.parser import parse_tool_calls_ex as _ex
+
+        limit = prep.get("tool_args_max_chars")
+        forgiving = bool(prep.get("forgiving_toolcalls", False))
+        tools = prep.get("tools") or []
+        if diagnostics is None:
+            kwargs: dict = {"forgiving": forgiving}
+            if limit:
+                kwargs["max_args_chars"] = limit
+            res = await asyncio.to_thread(_ex, content or "", tools, **kwargs)
+            diagnostics = res.diagnostics
+        summary = format_miss_trail(diagnostics, _valid_names(tools))
+        logger.warning(
+            "tool-call miss (%s) model=%s forgiving=%s %s preview=%.300s",
+            where, prep.get("model"), forgiving, summary, (content or "")[:300])
     except Exception:
         logger.debug("no tool call parsed %s model=%s preview=%.200s",
                      where, prep.get("model"), (content or "")[:200])
@@ -180,17 +199,18 @@ def _openai_response(prep: dict, result: dict, parse_fn=None) -> dict:
     limit = prep.get("tool_args_max_chars")
     forgiving = bool(prep.get("forgiving_toolcalls", False))
     _dropped: list[int] | None = None
-    _diagnostics: list[dict] | None = None
     if prep["tools"]:
         if parse_tool_calls is _real_parse:
             # Unpatched production path: single parse returns calls + the
-            # drop/diagnostics trail (no double-parse cost).
+            # drop trail (no double-parse cost). ``diagnostics`` from the same
+            # result is NOT captured here: the miss log re-runs the parser via
+            # _log_tool_miss, so an unused local only looked like it did work.
             kwargs: dict = {"forgiving": forgiving}
             if limit:
                 kwargs["max_args_chars"] = limit
             res = _real_ex(result["content"], prep["tools"], **kwargs)
             calls, remaining = res.calls, res.rest
-            _dropped, _diagnostics = res.dropped, res.diagnostics
+            _dropped = res.dropped
         else:
             if limit:
                 calls, remaining = parse_tool_calls(
@@ -218,8 +238,8 @@ def _openai_response(prep: dict, result: dict, parse_fn=None) -> dict:
         # attempt means the reply was cut mid-call; report OpenAI's length
         # signal so the harness can retry/split instead of showing raw markup.
         finish = "length"
-    pt = estimate_tokens(str(prep.get("prompt", "") or ""))
-    ct = result.get("usage_total") or max(1, (len(result["content"]) + len(result["thinking"])) // 4)
+    # Both token counts are computed once inside build_usage (single estimate
+    # formula); do not recompute them here.
     usage = build_usage(prep, result.get("content", ""), result.get("thinking", ""),
                         result.get("usage_total"))
     return {"id": cid, "object": "chat.completion", "created": created, "model": prep["model"],

@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 from deepseaport.config import AccountConfig, Settings
 from deepseaport.core import registry
 from deepseaport.core.provider import ModelSpec, Provider
+from support import settings
+from functools import partial
 from deepseaport.server import create_app
 
 
@@ -27,10 +29,9 @@ class _FakeProvider(Provider):
         yield b"data: [DONE]\n\n"
 
 
-def _settings(**kw) -> Settings:
-    base = dict(accounts=[], provider="deepseek", config_path="")
-    base.update(kw)
-    return Settings(**base)
+# Default kwargs differ per file; the shared base dict lives in
+# support.py. Every list here is rebuilt per call on purpose.
+_settings = partial(settings, log_level="INFO", warmup_on_startup=True)
 
 
 def _fake_settings() -> Settings:
@@ -46,10 +47,15 @@ def _body(**kw) -> dict:
     return body
 
 
+def _register_fake() -> None:
+    fake = _FakeProvider()
+    registry._REGISTRY[registry._key(fake)] = fake
+
+
 def test_nonstream_dispatches_through_provider(monkeypatch):
     import deepseaport.providers.deepseek.completion_service as CS
 
-    registry.register(_FakeProvider())
+    _register_fake()
     try:
         app = create_app(_fake_settings())
 
@@ -65,7 +71,7 @@ def test_nonstream_dispatches_through_provider(monkeypatch):
 
 
 def test_stream_dispatches_through_provider():
-    registry.register(_FakeProvider())
+    _register_fake()
     try:
         app = create_app(_fake_settings())
         resp = TestClient(app).post("/v1/chat/completions", json=_body(stream=True))
@@ -102,7 +108,19 @@ def test_unknown_provider_fallback():
                      "messages": [{"role": "user", "content": "hi"}]}, s)
     assert prep["provider"] == "deepseek"
     pool = _pool_for(app, "deepseek")
-    assert [r["identifier"] for r in pool.status()] == ["a@x.com"]
+    # Model resolution still falls back to deepseek (above), but the pool must
+    # NOT. The rule the account routes and accounts.usable_provider already
+    # follow: an unregistered provider id never BORROWS another provider's
+    # accounts. That lend handed provider X a pool of provider Y's credentials
+    # -- a Qwen ES256 JWT replayed to chat.deepseek.com as a userToken. No
+    # bound accounts means no pool, not a cross-provider borrow.
+    #
+    # Reaching here needs a hand-built Settings, which load_settings now makes
+    # unreachable: it names the bad id and substitutes deepseek at load time
+    # (tests/test_config_integrity.py). What matters here is that nothing
+    # downstream re-opens the borrow.
+    assert [r["identifier"] for r in pool.status()] == [], (
+        "an unregistered selected provider still borrowed the deepseek account")
 
 
 def test_resolved_ids():

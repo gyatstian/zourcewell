@@ -9,9 +9,8 @@ from ..common import (
     _FENCED_BLOCK_RE,
     _LOOSE_JSON_MISS,
     _balanced_json,
-    _clean_rest,
+    _finish,
     _loads_json_lenient,
-    _normalize_calls,
 )
 
 logger = logging.getLogger("deepseaport.tools")
@@ -60,13 +59,10 @@ def try_parse_fence(text, valid_or_none, limit_args, forgiving_on,
             elif isinstance(obj, dict) and isinstance(obj.get("function"), dict):
                 raw = [obj]
             if raw:
-                calls, dropped = _normalize_calls(raw, valid_or_none, limit_args)
-                if diagnostics is not None:
-                    diagnostics.append({"format": "fence", "matched": bool(calls),
-                                        "kept": len(calls), "dropped": list(dropped),
-                                        "raw": len(raw)})
-                if calls:
-                    rest = _clean_rest(text[:m.start()] + text[m.end():], forgiving_on)
-                    return calls, rest
+                hit = _finish(raw, valid_or_none, limit_args, "fence",
+                              forgiving_on, diagnostics=diagnostics,
+                              on_hit=lambda: text[:m.start()] + text[m.end():])
+                if hit[0]:
+                    return hit
             inner_pos = obj_start + len(obj_text)
     return None, None

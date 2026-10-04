@@ -8,7 +8,9 @@ import json
 import logging
 import os
 import struct
+import tempfile
 import threading
+import time
 from pathlib import Path
 
 from ...config import DATA_DIR
@@ -17,7 +19,10 @@ logger = logging.getLogger("deepseaport.pow")
 
 # Env overrides for rotation survival without code change. Defaults preserve
 # current pinned behaviour; setting DEEPSEAPORT_WASM_URL lets ops point at a
-# rotated hash without waiting for a release.
+# rotated hash without waiting for a release. The filename is joined onto
+# DATA_DIR, so it is validated (no separators, no "..") before use, and an
+# overridden URL is logged loudly: whatever is fetched from it is validated
+# only by size + "\0asm" magic and then INSTANTIATED and executed by wasmtime.
 WASM_NAME = os.environ.get(
     "DEEPSEAPORT_WASM_NAME", "sha3_wasm_bg.7b9ca65ddd.wasm")
 WASM_URL = os.environ.get(
@@ -26,6 +31,8 @@ WASM_URL = os.environ.get(
 ALGORITHM = "DeepSeekHashV1"
 # WebAssembly modules start with the magic bytes b"\0asm" (then version 1).
 _WASM_MAGIC = b"\x00asm"
+# Warn once per process about the remote-code override, not on every solve.
+_warned_wasm_url = False
 
 # Cached compiled wasm: Engine + Module are thread-safe/shareable, while
 # Store/instance stay per-call. Recompiling per request cost 100-300ms.
@@ -37,18 +44,65 @@ _LINKER = None
 _LINKER_LOCK = threading.Lock()
 _WASM_PATH: Path | None = None
 
+
+def validated_wasm_name(name: str | None = None) -> str:
+    """Return WASM_NAME, rejecting anything that escapes DATA_DIR.
+
+    The upstream asset is content-hash-named (``sha3_wasm_bg.<hash>.wasm``) and
+    is joined onto DATA_DIR, so a plain filename is the only acceptable value.
+    A separator or ``..`` in DEEPSEAPORT_WASM_NAME would otherwise let an env
+    var point the download/write outside DATA_DIR (and the module is
+    instantiated + executed afterwards, so a planted file runs code).
+    """
+    raw = str(WASM_NAME if name is None else name).strip()
+    if (not raw or raw in (".", "..") or "/" in raw or "\\" in raw
+            or ".." in raw or ":" in raw or "\0" in raw):
+        raise RuntimeError(
+            f"refusing unsafe DEEPSEAPORT_WASM_NAME {raw!r}: expected a plain "
+            "filename (no path separator, no '..') resolved inside the data dir")
+    return raw
+
+
 # DATA_DIR is resolved once at import from the environment; it never changes
 # for a process. Cache the joined path to avoid a mkdir syscall per request.
 def wasm_path() -> Path:
     global _WASM_PATH
     if _WASM_PATH is None:
+        name = validated_wasm_name()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        _WASM_PATH = DATA_DIR / WASM_NAME
+        _WASM_PATH = DATA_DIR / name
     return _WASM_PATH
+
+
+def _warn_wasm_url_override() -> None:
+    """Loud, once-per-process warning when the wasm URL is env-overridden.
+
+    The download is only checked for size + ``\\0asm`` magic, so a pinned digest
+    is the real control and an operator override is an explicit trust decision.
+    """
+    global _warned_wasm_url
+    if _warned_wasm_url:
+        return
+    try:
+        if not os.environ.get("DEEPSEAPORT_WASM_URL", "").strip():
+            return
+    except Exception:
+        return
+    _warned_wasm_url = True
+    try:
+        override = str(os.environ.get("DEEPSEAPORT_WASM_URL", "") or "").strip()
+        logger.warning(
+            "DEEPSEAPORT_WASM_URL is overridden (%s): the PoW wasm is fetched "
+            "from that URL instead of the pinned upstream host. The module is "
+            "only checked for size and \\0asm magic, then executed by wasmtime "
+            "— only do this for a hash you trust.", override)
+    except Exception:
+        pass
 
 
 def ensure_wasm(cookies: str = "", user_agent: str = "") -> Path:
     """Return local wasm path, downloading it (WAF cookies help) if missing."""
+    _warn_wasm_url_override()
     path = wasm_path()
     if path.exists() and path.stat().st_size > 1000:
         return path
@@ -69,9 +123,38 @@ def ensure_wasm(cookies: str = "", user_agent: str = "") -> Path:
         raise RuntimeError(
             f"PoW wasm download is not a wasm module "
             f"(magic={content[:4]!r}, {len(content)} bytes)")
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(content)
-    os.replace(tmp, path)
+    # Unique temp name per call, same technique as Settings.save: two callers
+    # can both pass the exists() check above, and a shared "<name>.tmp" made the
+    # loser's os.replace fail (FileNotFoundError once the file was already
+    # moved, PermissionError on Windows while the winner still held it open) and
+    # left a stale .tmp behind. Each caller owns its own file; the loser's
+    # failure is harmless because the winner left a valid wasm in place.
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                    dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+        replaced = False
+        last_err: OSError | None = None
+        for attempt in range(4):
+            try:
+                os.replace(tmp_name, path)
+                replaced = True
+                break
+            except PermissionError as exc:
+                # Transient AV/indexer locks block the rename for a few ms.
+                last_err = exc
+                time.sleep(0.05 * (attempt + 1))
+            except OSError as exc:
+                last_err = exc
+                break
+        if not replaced:
+            raise RuntimeError(f"PoW wasm install failed ({last_err}): {path}")
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
     logger.info("downloaded PoW wasm (%d bytes)", len(content))
     return path
 

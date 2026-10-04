@@ -56,8 +56,11 @@ def test_cooldown_failover():
         pool.acquire(timeout=0.2)
     # Clear one -> works again.
     assert pool.clear_cooldown("a@x.com") == 1
-    with pool.slot(timeout=1) as item2:
+    item2 = pool.acquire(timeout=1)
+    try:
         assert item2.cfg.email == "a@x.com"
+    finally:
+        AccountPool.release(item2)
 
 
 def test_busy_failover_and_timeout():
@@ -74,8 +77,7 @@ def test_busy_failover_and_timeout():
     finally:
         AccountPool.release(first)
     # After release, acquire works.
-    with pool.slot(timeout=1):
-        pass
+    AccountPool.release(pool.acquire(timeout=1))
 
 
 def test_remove_in_flight_safe():
@@ -99,8 +101,11 @@ def test_status_shape_and_round_robin():
     assert all({"busy", "cooldown_remaining", "uses"} <= set(r) for r in rows)
     seen = set()
     for _ in range(4):
-        with pool.slot(timeout=1) as item:
+        item = pool.acquire(timeout=1)
+        try:
             seen.add(item.cfg.email)
+        finally:
+            AccountPool.release(item)
     assert seen == {"a@x.com", "b@x.com"}
 
 
@@ -171,20 +176,29 @@ def test_current_preferred_then_failover():
     pool = AccountPool([_cfg("a@x.com"), _cfg("b@x.com")])
     assert pool.set_current("b@x.com") is True
     assert pool.current == "b@x.com"
-    with pool.slot(timeout=1) as item:
+    item = pool.acquire(timeout=1)
+    try:
         assert item.cfg.email == "b@x.com"
+    finally:
+        AccountPool.release(item)
     # Busy preferred -> fail over to other.
     held = pool.acquire(timeout=1)
     assert held.cfg.email == "b@x.com"
     try:
-        with pool.slot(timeout=1) as item2:
+        item2 = pool.acquire(timeout=1)
+        try:
             assert item2.cfg.email == "a@x.com"
+        finally:
+            AccountPool.release(item2)
     finally:
         AccountPool.release(held)
     # Cooldown preferred -> fail over.
     AccountPool.mark_bad(pool.get("b@x.com"), seconds=60)
-    with pool.slot(timeout=1) as item3:
+    item3 = pool.acquire(timeout=1)
+    try:
         assert item3.cfg.email == "a@x.com"
+    finally:
+        AccountPool.release(item3)
 
 
 def test_current_invalid_and_remove_clears():

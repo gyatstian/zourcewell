@@ -1,8 +1,11 @@
 """First-class provider abstraction: model catalogue and account/auth seams.
 
-A provider describes one upstream (DeepSeek today) as data plus delegating
-methods. The completion engine is intentionally left in ``deepseaport.server``
-for this phase; provider methods late-import it so monkeypatch seams survive.
+A provider describes one upstream (``deepseek``, ``qwen``, ``opencode``) as data
+plus delegating methods. The shared completion mechanics live in
+``core.engine``; this module has no default engine and never references
+``deepseaport.server``. ``complete``, ``complete_request`` and
+``stream_response`` all raise ``NotImplementedError``, so every provider must
+override all three and delegate to its own ``completion_service``.
 """
 
 from __future__ import annotations
@@ -86,9 +89,13 @@ class Provider(ABC):
         """Run one blocking completion through the existing engine (delegates)."""
         raise NotImplementedError
 
-    async def stream(self, app, pool, item, prep):
-        """Async generator of completion deltas (providers may not stream)."""
-        raise NotImplementedError
+    # NOTE: there is deliberately no `stream()` here. It used to sit beside
+    # `stream_response()` with a near-identical signature and has never been
+    # called by anything -- all three shipped providers override
+    # `stream_response`, and that is the name the route layer uses. A template
+    # author reading the ABC would have had to guess which of the two to
+    # implement. If a future provider genuinely needs a second streaming seam,
+    # add it then, with a caller.
 
     def complete_request(self, app, pool, prep, item, cancel_event):
         """Blocking completion. No default engine: override per provider."""

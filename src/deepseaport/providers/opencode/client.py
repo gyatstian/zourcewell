@@ -30,10 +30,11 @@ logger = logging.getLogger("deepseaport.client")
 DEFAULT_TIMEOUT = 180
 
 # Sentinel: caller did not choose a native tool allowlist -> use the
-# gatekeeper-minimal bash+read pair (historical behaviour). Pass an explicit
-# None to omit the `tools` key entirely (plain chat; live-verified on
-# opencode 1.18.32: tool-less passes via agent defaults, only an explicit
-# all-false allowlist triggers the free-tier FreeTierError envelope).
+# gatekeeper-minimal declared pair (bash declared-but-denied + read; see
+# protocol.NATIVE_TOOLS_MINIMAL). Pass an explicit None to omit the `tools`
+# key entirely (plain chat; live-verified on opencode 1.18.32: tool-less
+# passes via agent defaults, only an explicit all-false allowlist triggers
+# the free-tier FreeTierError envelope).
 _DEFAULT_TOOLS: object = object()
 
 
@@ -147,9 +148,10 @@ def send_message(session_id: str, provider_id: str, model_id: str,
     code prefix for the classifier). Empty agent replies surface as
     ``OPENCODE_EMPTY`` so the engine retries once on a fresh session.
     ``tools`` selects the per-message native allowlist: the default keeps
-    the gatekeeper-minimal bash+read pair (everything else hidden so
-    pi-harness tools with the same names, via the DSML prompt, stay
-    unambiguous); an explicit None omits the key (plain chat, no pi tools).
+    the gatekeeper-minimal declared pair (bash declared but denied, read
+    allowed; everything else hidden so pi-harness tools with the same
+    names, via the DSML prompt, stay unambiguous); an explicit None omits
+    the key (plain chat, no pi tools).
     """
     body = P.message_payload(
         provider_id, model_id, agent, prompt,
@@ -560,33 +562,3 @@ def stream_message(session_id: str, provider_id: str, model_id: str,
     raise RuntimeError(
         f"OPENCODE_EMPTY: empty completion for {provider_id}/{model_id} "
         "(live stream ended without an assistant message)")
-
-
-def list_provider_models(timeout: float = 20) -> list[str]:
-    """Best-effort ``provider/model`` ids from GET /config/providers.
-
-    Used for diagnostics; the chat path does not depend on it (model ids
-    pass through). [] on any failure, never raises.
-    """
-    try:
-        status, data = _request("GET", "/config/providers", timeout=timeout)
-        if status != 200:
-            return []
-        providers = data.get("providers")
-        if not isinstance(providers, list):
-            return []
-        out: list[str] = []
-        for prov in providers:
-            if not isinstance(prov, dict):
-                continue
-            pid = str(prov.get("id") or "").strip()
-            models = prov.get("models")
-            if not pid or not isinstance(models, dict):
-                continue
-            for mid in models:
-                mid = str(mid or "").strip()
-                if mid:
-                    out.append(f"{pid}/{mid}")
-        return out
-    except Exception:
-        return []

@@ -18,6 +18,7 @@ to disk — inspection happens on the terminal and in the reply content.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import itertools
 import json
@@ -27,8 +28,9 @@ import time
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import StreamingResponse
 
+from . import __version__
 from .config import Settings
-from .server_routes import _check_auth, _prepare, build_models_list
+from .server_routes import _check_auth, _prepare, build_models_list, install_body_limit
 
 # Serializes the multi-line request dumps so concurrent requests never
 # interleave mid-block. Counter stays monotonic across requests.
@@ -153,8 +155,16 @@ def _openai_dry_sse(cid: str, created: int, model: str, content: str,
 
 def create_dry_app(settings: Settings | None = None) -> FastAPI:
     """FastAPI app with the dry-run surface. No lifespan, no bridge, no pool."""
-    app = FastAPI(title="deepseaport-dry-run", version="0.1.0")
+    # No /docs, /redoc or /openapi.json: a machine-readable route inventory on
+    # a local-first bridge is credential-store recon, and the dry surface has
+    # nothing a user needs Swagger for.
+    app = FastAPI(title="deepseaport-dry-run", version=__version__,
+                  docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings or Settings(config_path="")
+    # Same 8 MB ceiling as the live app: this app never calls register_routes,
+    # and without the guard it echoed and printed an unbounded body to the
+    # terminal (dry run exists to print the body).
+    install_body_limit(app)
 
     @app.get("/health")
     async def health():
@@ -193,8 +203,12 @@ def create_dry_app(settings: Settings | None = None) -> FastAPI:
         prep = _prepare(body, settings_)
         num = next(_REQUEST_IDS)
         # Terminal always gets the full dump; the flag only gates how much
-        # of it is sent back to the requesting client.
-        _print_dry_run(num, body, prep)
+        # of it is sent back to the requesting client. Off the event loop:
+        # json.dumps(indent=2) plus a flushing print on an 8 MB body blocks
+        # every other connection (including the SSE one) for the whole dump.
+        # _print_dry_run stays sync at module level: the TUI/CLI call it
+        # directly, and _PRINT_LOCK still serializes concurrent dumps.
+        await asyncio.to_thread(_print_dry_run, num, body, prep)
         send = bool(getattr(settings_, "send_dry_run_to_frontend", True))
         content = _dry_content(num, body, prep, send)
         cid = f"dryrun-{num:04d}"
@@ -213,8 +227,11 @@ def run_dry_run(settings: Settings, args=None) -> int:
     import uvicorn
 
     from .server_runner import (
+        UVICORN_LIMIT_CONCURRENCY,
+        UVICORN_TIMEOUT_KEEP_ALIVE,
         _resolve_bind_host,
         _watch_stop_keys,
+        lan_exposure_notice,
     )
 
     try:
@@ -228,16 +245,37 @@ def run_dry_run(settings: Settings, args=None) -> int:
     log_level = str(getattr(settings, "log_level", "info")).lower()
     print()
     print(f"  Dry run live at http://127.0.0.1:{port} (bind {host}:{port})")
+    # Printed, not logged: dry run is the mode that echoes the ENTIRE raw
+    # request body and the formatted prompt back to the caller
+    # (send_dry_run_to_frontend defaults to true, so the dump is also the
+    # reply content). A non-loopback bind with no keys means anyone on the
+    # LAN can POST a body and read the whole formatted prompt back, so this
+    # path needs the same warning serve already printed.
+    notice = lan_exposure_notice(settings, host, port)
+    if notice:
+        print(f"  {notice}")
     print("  No browser, no accounts, no DeepSeek. POST /v1/chat/completions to")
     print("  see the raw body + formatted prompt here and as the reply content.")
     print("  Press Ctrl+C or Esc to stop and return to menu.")
     print()
     config = uvicorn.Config(app, host=host, port=int(port),
-                            log_level=log_level, access_log=False)
+                            log_level=log_level, access_log=False,
+                            limit_concurrency=UVICORN_LIMIT_CONCURRENCY,
+                            timeout_keep_alive=UVICORN_TIMEOUT_KEEP_ALIVE)
     server = uvicorn.Server(config)
-    threading.Thread(target=_watch_stop_keys, args=(server,), daemon=True).start()
+    stop_keys = threading.Event()
+    watcher = threading.Thread(target=_watch_stop_keys, args=(server, stop_keys),
+                               daemon=True)
+    watcher.start()
     try:
         server.run()
     except KeyboardInterrupt:
         print("\nDry run stopped (Ctrl+C), back to menu.")
+    finally:
+        # See _watch_stop_keys: uvicorn's failed bind sys.exit(3)s without
+        # setting should_exit, which would leave this thread draining the
+        # console and eating main-menu keystrokes. Joined (not just signalled)
+        # so it is gone before this call returns; see _run_server.
+        stop_keys.set()
+        watcher.join(timeout=1.0)
     return 0

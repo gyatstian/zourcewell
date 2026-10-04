@@ -13,16 +13,20 @@ Handlers look up the completion/stream entry points through a deferred
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
+import re
 import threading
 import time
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from .accounts import AccountPool
+from . import __version__
+from .accounts import AccountPool, provider_label, usable_provider as _usable_provider
 from .config import AccountConfig, Settings
 from .core import pools
+from .core.engine import scrub_upstream_text
 from .core.obscura_bridge import ObscuraBridge
 from .server_concurrency import (
     _StreamCancelled,
@@ -30,6 +34,45 @@ from .server_concurrency import (
     _watch_disconnect,
 )
 from .core.tools import render_prompt, tool_reminder_prompt, tool_system_prompt
+
+# Body-size ceiling for every route. Enforced from Content-Length AND from the
+# bytes that actually arrive, so a chunked request cannot skip it (see
+# install_body_limit below). 8 MB is far above any real chat request (a large
+# agentic tool result is ~1 MB of JSON) and still small enough that a single
+# client cannot pin a worker on a JSON parse.
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
+
+# Tool schemas are serialized verbatim into the system prompt, so the tool
+# count bounds prompt size and upstream context cost. 128 covers a big MCP
+# server (Claude Code ships ~15, pi/opencode harnesses up to ~60) with room
+# to spare; the old uncapped list let a client inflate the prompt arbitrarily
+# at the cost of a full re-render per request.
+MAX_TOOLS_PER_REQUEST = 128
+
+# POST /v1/accounts caps. Each accepted call appends to settings.accounts and
+# rewrites the entire config file (Settings.save: mkstemp + fsync +
+# os.replace), so an unbounded endpoint is a disk-write amplifier sitting on
+# the credential store. Limits are generous for real credentials: identifiers
+# are emails/phone numbers, secrets are provider tokens.
+MAX_ACCOUNTS = 64
+MAX_IDENTIFIER_CHARS = 512
+MAX_SECRET_CHARS = 4096
+
+# Same shape rule as cli._valid_provider_id: provider ids are lowercase
+# alnum/dash, so anything else is a typo or junk that no pool can ever match.
+_PROVIDER_ID_RE = re.compile(r"^[a-z0-9-]+$")
+
+# A path/body segment this long and this opaque cannot be an account
+# identifier: AccountConfig.identifier is an email, a mobile number, or
+# token[:10] + "..." (config.AccountConfig.identifier), all far shorter. 32+
+# chars of [A-Za-z0-9_-] is a full userToken (64 chars) or junk. Rejected at the
+# HTTP edge so a bearer token never reaches a URL (access logs, proxy logs,
+# Referer chains) or a log line, while accounts._matches keeps full-token
+# matching for the CLI/local callers that need it.
+_TOKEN_SHAPED_RE = re.compile(r"^[A-Za-z0-9_-]{32,}$")
+
+# Cap on what a rejected request may put in the log, on top of redaction.
+_MAX_LOGGED_PATH_CHARS = 200
 
 
 def _server():
@@ -41,7 +84,173 @@ def _server():
 logger = logging.getLogger("deepseaport.server")
 
 
+class _BodyOverLimit(HTTPException):
+    """413 raised from the receive wrapper once the running total crosses the cap.
+
+    Deliberately an ``HTTPException``: FastAPI wraps the whole request-body
+    parse in ``except HTTPException: raise`` and relabels anything else as a
+    400 "There was an error parsing the body", so an abort signal has to BE an
+    HTTPException to reach the client as the 413 it is.
+    """
+
+    def __init__(self, seen: int) -> None:
+        super().__init__(status_code=413, detail=_too_large_detail(seen))
+        self.seen = seen
+
+
+def _too_large_detail(length: int) -> str:
+    """One detail string for both 413 paths (declared length or bytes seen)."""
+    return (f"request body too large: {length} bytes exceeds the "
+            f"{MAX_REQUEST_BYTES} byte limit")
+
+
+def _too_large(length: int) -> JSONResponse:
+    return JSONResponse(status_code=413,
+                        content={"detail": _too_large_detail(length)})
+
+
+def _redact_path(path: str) -> str:
+    """Path with every token-shaped segment replaced and the rest bounded.
+
+    The raw path is never logged: accounts._matches accepts a full bearer token
+    as an identifier, so ``DELETE /v1/accounts/<token>`` would otherwise write
+    a live credential into the log before routing and before _check_auth.
+    """
+    parts = [("<redacted>" if _TOKEN_SHAPED_RE.match(seg) else seg[:64])
+             for seg in str(path or "").split("/")]
+    out = "/".join(parts)
+    if len(out) > _MAX_LOGGED_PATH_CHARS:
+        return out[:_MAX_LOGGED_PATH_CHARS] + "..."
+    return out
+
+
+def _log_target(scope) -> str:
+    """What to log instead of the raw path: route template, else redacted path.
+
+    ``scope["route"]`` is set by the router (FastAPI's APIRoute.matches), so it
+    is available when a streamed body is aborted mid-parse - by then the route
+    is matched - and absent on the Content-Length fast path, which runs before
+    routing.
+    """
+    method = str(scope.get("method") or "?")
+    template = getattr(scope.get("route"), "path", None)
+    if template:
+        return f"{method} {template}"
+    return f"{method} {_redact_path(scope.get('path') or '')}"
+
+
+def _log_oversized(scope, length: int) -> None:
+    logger.warning("rejecting %s: body %d bytes > %d",
+                   _log_target(scope), length, MAX_REQUEST_BYTES)
+
+
+def _declared_length(scope) -> int | None:
+    """Content-Length as an int, or None when absent or unparseable."""
+    for key, value in scope.get("headers") or ():
+        if key == b"content-length":
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+class BodyLimitMiddleware:
+    """413 above MAX_REQUEST_BYTES, with or without a declared Content-Length.
+
+    Two layers, because a chunked request declares nothing:
+
+    * Content-Length fast path - reject before the body is read at all, so an
+      oversized declared body is never materialized or JSON-parsed. The body
+      stream is handed to the app untouched, so every normal request takes zero
+      extra hops.
+    * Receive wrapper - with ``Transfer-Encoding: chunked`` there is no
+      Content-Length to check, and FastAPI materializes + parses the whole body
+      to bind ``body: dict`` before _check_auth runs, so one unauthenticated
+      client could force an unbounded parse. The wrapper only COUNTS the bytes
+      the app pulls (it never buffers them and never touches
+      ``http.disconnect``), and aborts the read with ``_BodyOverLimit`` on the
+      first chunk that crosses the cap, so the parse stops there. The rest of
+      the body is deliberately not drained: the 413 is on the wire before the
+      client finishes sending, and the server reaps the connection through its
+      normal keep-alive teardown.
+
+    Pure ASGI (not ``@app.middleware("http")``) because only the raw receive
+    callable can be wrapped this way, and because starlette's
+    ``BaseHTTPMiddleware`` reaches the server's receive through private,
+    version-specific plumbing.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = _declared_length(scope)
+        if declared is not None and declared > MAX_REQUEST_BYTES:
+            _log_oversized(scope, declared)
+            await _too_large(declared)(scope, receive, send)
+            return
+        if declared is not None:
+            # Declared and within the cap: byte-exact, nothing to wrap.
+            await self.app(scope, receive, send)
+            return
+        seen = 0
+        started = False
+
+        async def _send(message) -> None:
+            nonlocal started
+            if message.get("type") == "http.response.start":
+                started = True
+            await send(message)
+
+        async def _counting_receive() -> dict:
+            nonlocal seen
+            message = await receive()
+            if message.get("type") == "http.request":
+                seen += len(message.get("body") or b"")
+                if seen > MAX_REQUEST_BYTES:
+                    # Logged at the point of detection, which is the only place
+                    # that sees both the running total and the already-matched
+                    # route template: starlette's exception middleware answers
+                    # the HTTPException itself, so the abort never reaches the
+                    # handler below.
+                    _log_oversized(scope, seen)
+                    raise _BodyOverLimit(seen)
+            return message
+
+        try:
+            await self.app(scope, _counting_receive, _send)
+        except _BodyOverLimit as exc:
+            if started:
+                # A response is already on the wire (never happens for the
+                # parse-then-reject paths, but a second one would corrupt the
+                # stream): surface it instead of appending to the response.
+                raise
+            # Fallback for an app that does not turn HTTPException into a
+            # response itself. FastAPI's own exception middleware gets there
+            # first and produces the identical body.
+            await _too_large(exc.seen)(scope, receive, send)
+
+
+def install_body_limit(app: FastAPI) -> None:
+    """Install the MAX_REQUEST_BYTES ceiling on ``app`` (idempotent per app).
+
+    Module-level so the dry-run app gets it too: create_dry_app builds its own
+    FastAPI and never calls register_routes, which is how it ended up echoing
+    and printing an unbounded body to the terminal.
+    """
+    if getattr(app.state, "deepseaport_body_limit", False):
+        return
+    app.state.deepseaport_body_limit = True
+    app.add_middleware(BodyLimitMiddleware)
+
+
 def register_routes(app: FastAPI) -> None:
+    install_body_limit(app)
+
     @app.get("/health")
     async def health():
         # Liveness stays 200/ok:true so existing pollers (_wait_for_server,
@@ -86,12 +295,24 @@ def register_routes(app: FastAPI) -> None:
             current = None
         waf = bool(bridge.has_waf_token()) if bridge else False
         ready = bool(total > 0 and with_token > 0 and with_token > banned)
-        return {"ok": True, "ready": ready, "waf": waf,
+        # `current` is a boolean, not the identifier it used to be:
+        # pool.current / settings.active_account carry AccountConfig.identifier
+        # (an email, a phone number, or token[:10] + "...") and this route is
+        # deliberately unauthenticated (server_runner._wait_for_server and
+        # uptime checks only read the status code). Pollers need presence, not
+        # identity; /v1/accounts serves the identity behind the API key.
+        return {"ok": True, "ready": ready, "waf": waf, "version": __version__,
                 "accounts": total, "accounts_with_token": with_token,
-                "banned": banned, "pool": pool_size, "current": current}
+                "banned": banned, "pool": pool_size, "current": bool(current)}
 
     @app.get("/v1/waf/status")
-    async def waf_status():
+    async def waf_status(authorization: str = Header(default="")):
+        # Auth-gated: the payload names the absolute obscura binary path, the
+        # absolute profile path and the WAF cookie names, which is exactly the
+        # reconnaissance a LAN scanner wants (filesystem layout + which
+        # session cookies unlock the upstream). Nothing polls this route
+        # (_wait_for_server uses /health), so gating it costs no readiness.
+        _check_auth(app.state.settings, authorization)
         bridge: ObscuraBridge | None = getattr(app.state, "bridge", None)
         if bridge is None:
             return {"warmed": False, "error": "bridge not initialised yet"}
@@ -100,7 +321,11 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/v1/models")
     async def list_models():
         settings: Settings = app.state.settings
-        return {"object": "list", "data": build_models_list(settings)}
+        # openapi_url is None, so before this the running server exposed no
+        # version at all: a user genuinely could not ask what they were talking
+        # to. Same single source as server.py/dry_run.py's FastAPI(version=...).
+        return {"object": "list", "version": __version__,
+                "data": build_models_list(settings)}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: dict, request: Request,
@@ -171,6 +396,28 @@ def register_routes(app: FastAPI) -> None:
                     provider.complete_request, app, pool, prep, item, cancel_event)
             except _StreamCancelled:
                 raise HTTPException(status_code=499, detail="client disconnected")
+            except HTTPException:
+                # A decision already made upstream (404 model, 429 no free
+                # account, 503 no accounts). Keep its status; only the
+                # catch-all below rewrites anything.
+                raise
+            except Exception as exc:
+                # A provider client's own RuntimeError ("create_session: no id
+                # (HTTP 500): <raw body>", "pow challenge: bad shape: <raw
+                # body>") used to escape the route entirely: the client got a
+                # 500 and uvicorn wrote the traceback -- raw upstream body
+                # included -- to the server log. The engine already maps every
+                # upstream failure it recognises onto a scrubbed 502
+                # (``core.engine.raise_upstream``); this is the same shape for
+                # the failures that never reached it. Scrubbed before the
+                # truncation, per the core contract, and the log line is scrubbed
+                # too, so no unredacted upstream text reaches either.
+                logger.warning("unhandled %s from %s: %s", type(exc).__name__,
+                               getattr(provider, "id", "?"),
+                               scrub_upstream_text(exc, 500))
+                raise HTTPException(status_code=502, detail=(
+                    f"{provider_label(getattr(provider, 'id', ''))} upstream "
+                    f"error: {scrub_upstream_text(exc, 800)}")) from exc
         finally:
             watcher.cancel()
         return _server()._openai_response(prep, result)
@@ -180,7 +427,7 @@ def register_routes(app: FastAPI) -> None:
         settings: Settings = app.state.settings
         _check_auth(settings, authorization)
         pid = (provider or "").strip()
-        pool = _pool_for_request(app, pid)
+        pool = _pool_for(app, pid)
         data = await asyncio.to_thread(pool.status)
         return {"object": "list", "current": pool.current or None, "data": data}
 
@@ -188,19 +435,31 @@ def register_routes(app: FastAPI) -> None:
     async def select_account(body: dict | None = None,
                              authorization: str = Header(default="")):
         settings: Settings = app.state.settings
-        _check_auth(settings, authorization)
         ident = ((body or {}).get("identifier") or "").strip() if isinstance(body, dict) else ""
+        # Ahead of _check_auth (see _reject_token_shaped_identifier): a token
+        # never reaches a code path that could echo, log or persist it.
+        _reject_token_shaped_identifier(ident)
+        _check_auth(settings, authorization)
         pool = _server()._pool(app)
         if not ident or ident.lower() in ("none", "all", "auto"):
-            settings.active_account = ""
-            pool.set_current(None)
-            await asyncio.to_thread(settings.save)
+
+            # Only persist an actual change. An empty body used to assign ""
+            # and run a full Settings.save (mkstemp + fsync + os.replace) on
+            # every call, so a UI polling select turned into a config write
+            # storm. Clear the pool whenever either side still holds a
+            # selection, so drift is repaired without a redundant write.
+            if settings.active_account or pool.current:
+                settings.active_account = ""
+                pool.set_current(None)
+                await asyncio.to_thread(settings.save)
             return {"ok": True, "current": None}
         ok = await asyncio.to_thread(pool.set_current, ident)
         if not ok:
             raise HTTPException(status_code=404, detail=f"account not found: {ident}")
-        settings.active_account = pool.current
-        await asyncio.to_thread(settings.save)
+        # Same no-op rule for the named path: re-selecting CURRENT is a read.
+        if settings.active_account != pool.current:
+            settings.active_account = pool.current
+            await asyncio.to_thread(settings.save)
         return {"ok": True, "current": pool.current}
 
     @app.post("/v1/accounts", status_code=201)
@@ -208,19 +467,40 @@ def register_routes(app: FastAPI) -> None:
         from .accounts import TOKEN_HELP, extract_token
         settings: Settings = app.state.settings
         _check_auth(settings, authorization)
+        fields = {name: str((body or {}).get(name) or "")
+                  for name in ("email", "mobile", "password", "token")}
+        _reject_oversized_fields(fields)
         pid = str((body.get("provider") if isinstance(body, dict) else "") or provider or "").strip()
-        cfg = AccountConfig(email=str(body.get("email") or ""),
-                            mobile=str(body.get("mobile") or ""),
-                            password=str(body.get("password") or ""),
-                            token=extract_token(str(body.get("token") or "")))
+        if pid:
+            # cfg.provider used to be assigned unvalidated, so a junk id
+            # persisted into config.json as an account no pool, login or ban
+            # check can ever match.
+            _reject_unknown_provider(pid)
+        cfg = AccountConfig(email=fields["email"], mobile=fields["mobile"],
+                            password=fields["password"],
+                            token=extract_token(fields["token"]))
         if not (cfg.email or cfg.mobile or cfg.token):
             raise HTTPException(status_code=400,
                                 detail="email, mobile, or token required. " + TOKEN_HELP)
         if pid:
             cfg.provider = pid
         else:
-            cfg.provider = pools.selected_provider(settings)
-        pool = _pool_for_request(app, pid)
+            # Validated too: the configured selected provider is not
+            # registry-checked on load, and the junk id used to be persisted
+            # onto every account added without an explicit provider.
+            cfg.provider = _usable_provider(pools.selected_provider(settings))
+        # Per PROVIDER, not per config: pools.account_for_provider partitions
+        # the list, so a 3-provider deployment with 22 accounts each was hitting
+        # this cap at 64 with every single pool nowhere near full. Counted after
+        # cfg.provider is resolved, because that is the pool this account lands
+        # in (and it is the value _usable_provider already coerced).
+        if len(pools.accounts_for_provider(settings, cfg.provider)) >= MAX_ACCOUNTS:
+            raise HTTPException(
+                status_code=409,
+                detail=(f"account limit reached for provider "
+                        f"'{cfg.provider}' ({MAX_ACCOUNTS}): delete an account, "
+                        "or give this deployment its own config file"))
+        pool = _pool_for(app, pid)
         try:
             from .accounts import add_account as _add
             item = await asyncio.to_thread(_add, settings, pool, cfg)
@@ -238,13 +518,20 @@ def register_routes(app: FastAPI) -> None:
                                 authorization: str = Header(default="")):
         from .accounts import TOKEN_HELP, extract_token, set_account_token
         settings: Settings = app.state.settings
+        _reject_token_shaped_identifier(identifier)
         _check_auth(settings, authorization)
+        # Same ceiling as POST /v1/accounts, on the same field: this token is
+        # persisted verbatim by set_account_token and rewritten by every later
+        # save, so an uncapped body lets a caller store megabytes of junk in
+        # the credential store. Pure predicate, so calling it on a second route
+        # is safe; it only raises.
+        _reject_oversized_fields({"token": str((body or {}).get("token") or "")})
         token = extract_token(str((body or {}).get("token") or ""))
         if not token:
             raise HTTPException(status_code=400,
                                 detail="token required (raw value or full JSON). " + TOKEN_HELP)
         pid = str((body.get("provider") if isinstance(body, dict) else "") or provider or "").strip()
-        pool = _pool_for_request(app, pid)
+        pool = _pool_for(app, pid)
         item = await asyncio.to_thread(pool.get, identifier)
         if item is None:
             raise HTTPException(status_code=404, detail=f"account not found: {identifier}")
@@ -260,11 +547,13 @@ def register_routes(app: FastAPI) -> None:
     async def delete_account(identifier: str, provider: str = "", authorization: str = Header(default="")):
         from .accounts import remove_account
         settings: Settings = app.state.settings
+        _reject_token_shaped_identifier(identifier)
         _check_auth(settings, authorization)
         pid = (provider or "").strip()
-        pool = _pool_for_request(app, pid)
+        pool = _pool_for(app, pid)
         removed = await asyncio.to_thread(pool.remove, identifier)
         if not removed:
+            # A non-secret identifier: safe (and useful) to echo back.
             raise HTTPException(status_code=404, detail=f"account not found: {identifier}")
         await asyncio.to_thread(remove_account, settings, identifier)
         await asyncio.to_thread(settings.save)
@@ -274,21 +563,112 @@ def register_routes(app: FastAPI) -> None:
     async def unblock_accounts(body: dict | None = None, provider: str = "",
                               authorization: str = Header(default="")):
         settings: Settings = app.state.settings
-        _check_auth(settings, authorization)
         identifier = (body or {}).get("identifier") if isinstance(body, dict) else None
+        # Same edge rule as the path routes: unblock's identifier arrives in
+        # the body, but it lands in the same matcher, so a full token is not an
+        # accepted identifier over HTTP either.
+        _reject_token_shaped_identifier(identifier)
+        _check_auth(settings, authorization)
         pid = str((body.get("provider") if isinstance(body, dict) else "") or provider or "").strip()
-        pool = _pool_for_request(app, pid)
+        pool = _pool_for(app, pid)
         cleared = await asyncio.to_thread(pool.clear_cooldown, identifier)
         # Persist the ban-flag clear so labels survive the next restart too.
         await asyncio.to_thread(settings.save)
         return {"ok": True, "cleared": cleared}
 
 
+def _reject_oversized_fields(fields: dict) -> None:
+    """400 on any POST /v1/accounts field above its documented char cap.
+
+    Fields are persisted verbatim and rewritten by every later Settings.save,
+    so an uncapped field lets a caller store megabytes of junk in an email or
+    password that no code path will ever read.
+    """
+    limits = {"email": MAX_IDENTIFIER_CHARS, "mobile": MAX_IDENTIFIER_CHARS,
+              "password": MAX_SECRET_CHARS, "token": MAX_SECRET_CHARS}
+    for name, value in (fields or {}).items():
+        cap = limits.get(name, MAX_SECRET_CHARS)
+        if len(value) > cap:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"{name} too long: {len(value)} chars exceeds the "
+                        f"{cap} char limit"))
+
+
+def _reject_unknown_provider(pid: str) -> None:
+    """400 unless ``pid`` is a registered provider id (shape + membership).
+
+    The registry is the authority on "known provider"; the shape rule mirrors
+    ``cli._valid_provider_id`` so a junk id is rejected for its own reason
+    rather than as an unknown provider. Imported lazily, the way
+    ``server.active_models`` does it: ``core.registry`` must not be pulled in
+    at server_routes import time, where it would risk a cycle with
+    ``deepseaport.server``.
+    """
+    from .core import registry as _registry
+    candidate = str(pid or "").strip().lower()
+    if _PROVIDER_ID_RE.match(candidate) and _registry.get(candidate) is not None:
+        return
+    try:
+        known = ", ".join(sorted(_registry.registered())) or "none"
+    except Exception:
+        known = "unavailable"
+    raise HTTPException(status_code=400,
+                        detail=f"unknown provider '{pid}' (known: {known})")
+
+
+def _reject_token_shaped_identifier(identifier) -> None:
+    """400 when an HTTP-supplied identifier is a full bearer token, not an id.
+
+    Applied at the HTTP edge only: ``accounts._matches`` deliberately accepts a
+    full token (the CLI deletes and selects accounts locally), but a URL is the
+    wrong place for a credential - it lands in access logs, proxy logs and
+    Referer headers, and the old 404 detail echoed it straight back to the
+    caller. The message never quotes the value.
+    """
+    if not _TOKEN_SHAPED_RE.match(str(identifier or "").strip()):
+        return
+    raise HTTPException(status_code=400, detail=(
+        "account identifier looks like a bearer token, not an account "
+        "identifier. Use the account's email, mobile number, or identifier (the "
+        "'abcdef0123...' form GET /v1/accounts returns). Tokens are not "
+        "accepted in a URL because URLs end up in access logs, proxy logs "
+        "and Referer headers."))
+
+
+def _key_matches(token: str, keys) -> bool:
+    """Constant-time membership test for an API key; never raises.
+
+    Two things ``hmac.compare_digest`` does not do for free: it refuses
+    non-ASCII ``str`` (TypeError, so a UTF-8 Authorization header would 500
+    instead of 401), and callers that return on the first match leak *which*
+    configured key authenticated through timing. So encode once, compare every
+    key, and report the result at the end.
+    """
+    token_bytes = token.encode("utf-8", "surrogatepass")
+    matched = False
+    for key in keys or ():
+        try:
+            key_bytes = str(key).encode("utf-8", "surrogatepass")
+        except Exception:
+            continue
+        if hmac.compare_digest(token_bytes, key_bytes):
+            matched = True
+    return matched
+
+
 def _check_auth(settings: Settings, authorization: str) -> None:
     if not settings.keys:
+        # Documented local-dev default (tests pin it): no configured key means
+        # no gate. config._normalize_keys is what keeps a blank key from
+        # silently degrading into this state.
         return
     token = (authorization or "").removeprefix("Bearer ").strip()
-    if token not in settings.keys:
+    # An empty presented token is always a miss, never a match: a client that
+    # sends no header must not authenticate against a key that happens to be
+    # "" (load-time normalization makes that unreachable, but this is the gate
+    # that must not depend on that).
+    if not token or not _key_matches(token, settings.keys):
         raise HTTPException(status_code=401, detail="invalid API key")
 
 
@@ -353,7 +733,6 @@ def _pool(app: FastAPI) -> AccountPool:
     ``app.state.pool`` (tests/embedding) still wins for backward compat.
     """
     from .accounts import _matches
-    from .core import registry as _registry
     settings = app.state.settings
 
     injected = getattr(app.state, "pool", None)
@@ -369,11 +748,16 @@ def _pool(app: FastAPI) -> AccountPool:
     cache = _pool_cache(app)
     pool = cache.get(selected)
     if pool is None:
+        # ONLY this provider's accounts, always. The unfiltered
+        # ``list(settings.accounts)`` fallback that used to sit here for an
+        # unregistered id handed provider X a pool of provider Y's credentials:
+        # a bad id on a multi-provider config handed DeepSeek a list of Qwen
+        # ES256 JWTs, replayed to chat.deepseek.com as userTokens. A provider
+        # with no bound account gets an EMPTY pool and a 503 that names it,
+        # which is the rule the sibling sites already follow
+        # (``_reject_unknown_provider`` on the account-POST route,
+        # ``accounts.usable_provider``, ``tests/test_live_smoke.py``).
         accounts = pools.accounts_for_provider(settings, selected)
-        if not accounts and getattr(settings, "accounts", []):
-            if _registry.get(selected) is None:
-                logger.warning("provider '%s' not registered; using all accounts", selected)
-                accounts = list(settings.accounts)
         # current_for returns "" in multi mode: no shared CURRENT there.
         current = pools.current_for(settings, selected)
         if current and not any(_matches(a, current) for a in accounts):
@@ -385,21 +769,6 @@ def _pool(app: FastAPI) -> AccountPool:
         # provider on independent auto-failover (see core.pools.current_for).
         _sync_pool_current(pool, settings)
     return pool
-
-
-def _pool_for_request(app: FastAPI, provider_id) -> AccountPool:
-    """Central pool selection for the account routes (F5).
-
-    Single home for the ``_pool_for(app, pid) if (pid and is_multi) else
-    _server()._pool(app)`` gate that was repeated in every handler. Empty pid
-    or single-provider mode goes through the historical ``_server()._pool``
-    seam so ``monkeypatch.setattr("deepseaport.server._pool", ...)`` keeps
-    working; multi mode with a real pid uses the per-provider registry.
-    """
-    settings = app.state.settings
-    if pools.needs_provider_pool(settings, provider_id):
-        return _pool_for(app, provider_id)
-    return _server()._pool(app)
 
 
 def _catalogue_for(settings) -> dict:
@@ -564,8 +933,46 @@ def _parse_reasoning_effort(body: dict):
         reasoning_effort = None
     if reasoning_effort is not None and reasoning_effort not in (
             "none", "minimal", "low", "medium", "high", "xhigh"):
-        return None, body.get("reasoning_effort")
+        # The resolved local, never body["reasoning_effort"]: the nested
+        # ``reasoning.effort`` spelling is what agent harnesses send, and
+        # returning the flat key made that form lose the warning entirely
+        # (server_routes.py:932 returned None for it). This is the normalized
+        # value (stripped + lowercased), which is the spelling that was
+        # actually compared against the built-in variants above, so the log
+        # quotes exactly the token that was rejected.
+        return None, reasoning_effort
     return reasoning_effort, None
+
+
+# `stream` spellings, mirroring config.py:479-487 (`_bool`): the same
+# truthy/falsy token sets the operator's env and config.json already use, so
+# there is one table in the project rather than one per call site.
+_TRUTHY_TOKENS = ("1", "true", "yes", "on")
+_FALSY_TOKENS = ("0", "false", "no", "off")
+
+
+def _stream_flag(body: dict) -> bool:
+    """Parse the OpenAI ``stream`` field. Unrecognised input keeps the default.
+
+    ``bool(body.get("stream"))`` was wrong for every non-empty string: an
+    agent harness (or a hand-rolled curl) sending ``{"stream": "false"}`` --
+    JSON quoting a boolean, which is how the field arrives from shell wrappers
+    and YAML/ini config layers -- got ``True`` and an SSE body when it asked
+    for JSON. Reading the tokens explicitly keeps those requests non-streaming
+    without turning an odd-but-previously-accepted body into a 400.
+    """
+    raw = body.get("stream")
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        token = raw.strip().lower()
+        if token in _TRUTHY_TOKENS:
+            return True
+        if token in _FALSY_TOKENS:
+            return False
+    # Missing, null, or a token in neither set: fall back to the old default
+    # (no streaming) instead of raising.
+    return False
 
 
 def _extract_passthrough(body: dict) -> dict:
@@ -573,14 +980,18 @@ def _extract_passthrough(body: dict) -> dict:
 
     Upstream payloads (DeepSeek/Qwen completion_payload) carry only
     prompt + thinking/search/model — no temperature/top_p/stop/n/
-    penalties/response_format. stream_options is honored locally: when
-    include_usage is true the streamer emits a final usage chunk.
+    penalties/response_format, and no way to force or serialize parallel tool
+    calls (tools are rendered into the prompt). stream_options is honored
+    locally: when include_usage is true the streamer emits a final usage chunk.
     """
     unsupported: dict = {}
-    if body.get("temperature") is not None:
-        unsupported["temperature"] = body.get("temperature")
-    if body.get("top_p") is not None:
-        unsupported["top_p"] = body.get("top_p")
+    # temperature / top_p / parallel_tool_calls all send the value straight
+    # through when present. The web upstreams have no native tool calling:
+    # tools are serialized into the prompt and parsed back out, so there is
+    # nothing for parallel_tool_calls to switch off. Warn and drop, never echo.
+    for _k in ("temperature", "top_p", "parallel_tool_calls"):
+        if body.get(_k) is not None:
+            unsupported[_k] = body[_k]
     _max_tok = body.get("max_tokens", body.get("max_completion_tokens", None))
     if _max_tok is not None:
         unsupported["max_tokens"] = _max_tok
@@ -599,6 +1010,16 @@ def _extract_passthrough(body: dict) -> dict:
     _rf = body.get("response_format", None)
     if _rf not in (None, {}, {"type": "text"}):
         unsupported["response_format"] = _rf
+    # tool_choice: "none" and "auto" are honored (_decide_use_tools gates
+    # tools on the former), so only the values that ask the bridge to FORCE a
+    # call are reported. Those are the ones a client waits on: with
+    # "required" or a specific function named, a caller expects a tool_call
+    # and the web upstream may answer in prose instead -- previously that
+    # expectation was never told to the user. Reporting them must not change
+    # whether tools are enabled; that stays entirely in _decide_use_tools.
+    _tc = body.get("tool_choice")
+    if isinstance(_tc, dict) or (_tc is not None and _tc not in ("auto", "none")):
+        unsupported["tool_choice"] = _tc
     stream_options = body.get("stream_options") or {}
     if not isinstance(stream_options, dict):
         stream_options = {}
@@ -635,6 +1056,17 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
     thinking, search, model_type = spec.thinking, spec.search, spec.model_type
     tools = body.get("tools") or []
     use_tools = _decide_use_tools(body, settings, tools)
+    if use_tools and len(tools) > MAX_TOOLS_PER_REQUEST:
+        # Counted after the enable_tools/tool_choice gates on purpose: only the
+        # rendered path serializes schemas into the prompt, so gating first
+        # keeps the cap tied to the work it bounds (a gated-off tool list
+        # costs nothing and stays accepted). Checked before the render, which
+        # is the expensive part: every schema is dumped into the system
+        # prompt, and that prompt is what upstream bills and context-limits.
+        raise HTTPException(
+            status_code=400,
+            detail=(f"too many tools: {len(tools)} exceeds the "
+                    f"{MAX_TOOLS_PER_REQUEST} tool limit"))
     tool_args_max_chars, forgiving_toolcalls = _prep_tool_limits(settings)
     prompt = _render_prep_prompt(messages, tools, use_tools,
                                 tool_args_max_chars, settings)
@@ -646,7 +1078,7 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
             "model=%s params=%s (upstream accepts prompt/thinking/search only)",
             model, sorted(unsupported))
     return {
-        "model": model, "stream": bool(body.get("stream", False)),
+        "model": model, "stream": _stream_flag(body),
         "tools": tools if use_tools else [], "prompt": prompt,
         "tool_args_max_chars": tool_args_max_chars,
         "forgiving_toolcalls": forgiving_toolcalls,

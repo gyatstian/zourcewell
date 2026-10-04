@@ -148,9 +148,10 @@ def message_payload(provider_id: str, model_id: str, agent: str, prompt: str,
     allowlist (name -> bool); None omits the key so the serve uses the
     agent defaults (live-verified on opencode 1.18.32: tool-less passes via
     those defaults). Pass :func:`native_tools_minimal` when the harness
-    asked for tools (free-tier gatekeeper needs bash+read effective; an
-    explicit all-false allowlist 403s with "only be used from within
-    OpenCode").
+    asked for tools: the free-tier gatekeeper needs bash+read *declared*
+    (an explicit all-false allowlist 403s with "only be used from within
+    OpenCode") but NOT granted — ``bash`` is declared False so the map
+    cannot override the managed agent's ``bash: "deny"`` permission.
     """
     body = {
         "model": {"providerID": provider_id, "modelID": model_id},
@@ -172,8 +173,18 @@ def message_payload(provider_id: str, model_id: str, agent: str, prompt: str,
 # sees pi's tools (via the DSML prompt) for file edits/writes/globs, and
 # native edit/write/glob/grep would otherwise shadow pi's same-named tools
 # and run in the serve cwd.
+#
+# The declared VALUE must not hand the model native shell access. The
+# managed agent's permission map pins ``bash: "deny"`` (see
+# ``managed_serve.managed_config_content``), but this per-message map
+# OVERRIDES that permission map — so ``bash: True`` silently re-granted a
+# native shell on every tool turn, which is exactly what the managed serve
+# exists to prevent. The gatekeeper only needs the key DECLARED, not granted,
+# hence False. ``read`` stays True: the serve pins ``read: "allow"`` and
+# reads are harmless here (the prompt still routes file access through pi's
+# own tools).
 NATIVE_TOOLS_MINIMAL: dict[str, bool] = {
-    "bash": True,
+    "bash": False,
     "read": True,
     "edit": False,
     "write": False,
@@ -195,7 +206,7 @@ def native_tools_minimal() -> dict[str, bool]:
     try:
         return dict(NATIVE_TOOLS_MINIMAL)
     except Exception:
-        return {"bash": True, "read": True}
+        return {"bash": False, "read": True}
 
 
 def serve_hint() -> str:

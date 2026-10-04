@@ -2,8 +2,8 @@
 
 import json
 
-from deepseaport import protocol as P
-from deepseaport import tools_support as T
+from deepseaport.providers.deepseek import protocol as P
+from deepseaport.core import tools as T
 from deepseaport.server import MODELS
 
 
@@ -192,7 +192,7 @@ def test_system_prompt_forbids_dsml_and_lists_names():
 
 
 def test_prepare_appends_reminder_only_with_tools():
-    from deepseaport.server import _prepare
+    from deepseaport.server_routes import _prepare
     body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}]}
     assert "Reminder" not in _prepare(body)["prompt"]
     body_tools = {**body, "tools": [{"type": "function", "function": {"name": "read"}}]}
@@ -209,7 +209,7 @@ def test_prepare_rejects_malformed_messages_as_400():
     import pytest
     from fastapi import HTTPException
 
-    from deepseaport.server import _prepare
+    from deepseaport.server_routes import _prepare
 
     for bad in ({"role": "user"}, ["hi"], "hello", [["x"]], [None], 123):
         with pytest.raises(HTTPException) as exc_info:
@@ -256,7 +256,7 @@ def test_ban_format_day_month():
 
 
 def test_biz_error_includes_ban_expiry():
-    from deepseaport.client import _biz_error
+    from deepseaport.providers.deepseek.client import _biz_error
     data = {"code": 0, "msg": "", "data": {"biz_code": 5, "biz_msg": "user is muted",
             "biz_data": {"is_muted": 1, "mute_until": 1789555791.11}}}
     err = _biz_error(data)
@@ -282,7 +282,7 @@ def test_ban_check_skips_short_tokens_no_network():
 
 
 def test_extract_token_normalizes_json_shapes():
-    from deepseaport.tokens import extract_token
+    from deepseaport.core.tokens import extract_token
 
     assert extract_token('{"value":null,"__version":"0"}') == ""
     assert extract_token('{"value":"tok64","__version":"0"}') == "tok64"
@@ -299,7 +299,7 @@ def test_account_config_normalizes_token_at_boundary():
 
 
 def test_login_state_uses_visible_text_and_overlay_flag():
-    from deepseaport.auth import classify_page_state
+    from deepseaport.providers.deepseek.auth import classify_page_state
 
     # A healthy sign-in page with no visible challenge is not a captcha.
     assert classify_page_state(
@@ -313,7 +313,7 @@ def test_login_state_uses_visible_text_and_overlay_flag():
 
 
 def test_mcp_tool_iserror_becomes_exception():
-    from deepseaport.auth import _call
+    from deepseaport.providers.deepseek.auth import _call
 
     class _Fake:
         def call(self, name, arguments):
@@ -331,8 +331,8 @@ def test_parse_ban_until_from_human_login_text():
     import datetime as _dt
     import time as _time
 
-    from deepseaport import protocol as P
-    from deepseaport.auth import parse_ban_until
+    from deepseaport.providers.deepseek import protocol as P
+    from deepseaport.providers.deepseek.auth import parse_ban_until
 
     # ponytail: year is always relative (now+2) so this never rots like the old hardcoded 2026 date did.
     year = _dt.datetime.now().year + 2
@@ -376,7 +376,7 @@ def test_settings_roundtrips_persisted_ban(tmp_path):
 
 
 def test_real_browser_disabled_without_configuration(monkeypatch):
-    import deepseaport.real_browser as rb
+    import deepseaport.providers.deepseek.real_browser as rb
     from deepseaport.config import Settings
 
     monkeypatch.setattr(rb, "resolve_browser", lambda value: "")
@@ -396,8 +396,8 @@ def test_settings_roundtrips_browser_fields(tmp_path):
 
 
 def test_real_browser_login_token_is_normalized(monkeypatch):
-    import deepseaport.real_browser as rb
-    from deepseaport.auth import browser_login
+    import deepseaport.providers.deepseek.real_browser as rb
+    from deepseaport.providers.deepseek.auth import browser_login
     from deepseaport.config import Settings
 
     raw = '{"value":"' + ("x" * 64) + '","__version":"0"}'

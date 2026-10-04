@@ -43,6 +43,12 @@ Agentic-harness support:
   parallel calls, stable `call_xxx` ids, `finish_reason: "tool_calls"`.
 - `role: tool` results are folded back into the web prompt, so multi-step
   tool loops work against a model with no native function calling.
+- Parser bounds: `tool_args_max_chars` / `DEEPSEAPORT_MAX_ARGS_CHARS` (default
+  200000) caps the arguments of one call; `forgiving_toolcalls` /
+  `DEEPSEAPORT_FORGIVING_TOOLCALLS` (default off) enables the markup-repair
+  bucket; `DEEPSEAPORT_MAX_BARE_OBJECTS` (default 40) bounds how many JSON
+  objects the parser scans for a bare name+arguments call, and the
+  total-call scan of the forgiving bucket reuses the same number.
 - One in-flight stream per account (DeepSeek limitation) enforced with
   per-account locks + rotation; auto session cleanup; PoW/WAF retry once.
 
@@ -104,10 +110,54 @@ curl -N http://127.0.0.1:5001/v1/chat/completions `
 }
 ```
 
-`provider` (single mode) / `providers` (multi mode, empty = use `provider`
-only) select the upstream (`Settings.provider`/`providers`, env
+`"keys": ["sk-local-dev"]` is a **public example key**. Change it before
+enabling `listen` — with `listen: true` the whole API (including
+`/v1/accounts` CRUD) is reachable from the network and this key is printed in
+this README. See the non-loopback warning below.
+
+Request limits (server-enforced, no config knob for the first three):
+
+- **Body ≤ 8 MB** — a declared `Content-Length` over
+  `MAX_REQUEST_BYTES` is rejected with **413** before the payload is read.
+- **≤ 128 tools per request** — a longer `tools` array is **400**; counted
+  only when tools are actually rendered (`enable_tools` / `tool_choice` on).
+- **≤ 64 accounts** — `POST /v1/accounts` past the cap is **409** (each
+  accepted call rewrites the whole credential file).
+- `"keys": []` (empty or all-blank) means **auth disabled** — every endpoint,
+  account CRUD included, is served without a key. That is the documented
+  local-dev default; `"keys": [""]` is normalized away at load so it can
+  never become this state by accident. A **non-loopback bind** (`listen: true`
+  or `--host 0.0.0.0`) therefore prints a startup warning on all three serve
+  paths, naming the bind it is warning about (`WARNING: serving on
+  <host>:<port> (non-loopback)`), what is reachable (the whole API, `/v1/accounts`
+  CRUD and unmetered chat) and how the gate reads — either the N key(s) in
+  `keys` are the only gate and travel in a plain header on an unencrypted LAN,
+  or `AUTH DISABLED` outright.
+
+### `max_retries` — a knob, but clamped
+
+`max_retries` **is** configurable (`DEEPSEAPORT_MAX_RETRIES`, `config.json`,
+TUI Settings 4 "Retries per failed request", default `1`) — it is not one of
+the fixed limits above. It is clamped to **0–5** at load time: a larger value
+logs a warning and becomes 5, because the counter multiplies upstream work
+(one request costs up to `max_retries` session + PoW + stream attempts, each
+holding an account slot). With `DEEPSEAPORT_MAX_RETRIES` **unset** the clamp is
+runtime-only and is never written back, so a hand-edited value survives a save
+(the loader remembers the pre-clamp number and `save()` writes that back). With
+the env var **set**, the clamp *is* persisted: the env value is the effective
+source and is not owned by `config.json`, so the first save rewrites the file to
+the clamped number — `"max_retries": 7` plus `DEEPSEAPORT_MAX_RETRIES=2` gives
+runtime `2` and on-disk `2`. Keep the two in sync or drop the env var.
+
+`provider` (single mode) / `providers` (multi mode) select the upstream
+(`Settings.provider`/`providers`, env
 `DEEPSEAPORT_PROVIDER`/`DEEPSEAPORT_PROVIDERS`, or `--provider`/`--providers`;
-TUI shows a provider gate first). `accounts[].provider` pins an account to
+TUI shows a provider gate first). Multi mode needs **two or more** ids in
+`providers`; an empty list means "use `provider` only", and a **single** entry
+is ignored — `provider: "deepseek"` + `providers: ["qwen"]` runs deepseek and
+logs a warning naming the ignored id, because taking one entry would flip
+`is_multi()` and switch the whole per-provider pool path on for what reads like
+single-provider setup. `accounts[].provider` pins an account to
 one upstream. `accounts[].mobile` is an alternate identifier;
 `accounts[].token_expires_at` persists Qwen signin expiry (`0` = unknown,
 never blocks).
@@ -117,8 +167,14 @@ whole pool). `chat_model` remembers the last `/model` pick from server-with-chat
 mode (env: `DEEPSEAPORT_CHAT_MODEL`). All remaining behaviour flags
 (`enable_tools`, `warmup_on_startup`, `auto_delete_session`, `max_retries`,
 `parallel_challenge_fetch`, `use_multiple_accounts`, `log_level`,
-`stream_mode`) live in `config.example.json` and are editable from the
-TUI Settings screen. `enable_append` (default `true`, env:
+`stream_mode`, `forgiving_toolcalls`) live in `config.example.json`. Most are
+also editable from the TUI Settings screen — 1 `enable_tools`, 2
+`warmup_on_startup`, 3 `auto_delete_session`, 4 `max_retries`, 5
+`parallel_challenge_fetch`, 7 `log_level`, 8 `stream_mode`, 14
+`use_multiple_accounts`, 18 `forgiving_toolcalls`. Four persisted fields have no
+Settings entry and are `config.json` only: `obscura_profile`, `browser_bin`,
+`browser_headless` and `tool_args_max_chars` (cap at `DEEPSEAPORT_MAX_ARGS_CHARS`,
+default 200000). `enable_append` (default `true`, env:
 `DEEPSEAPORT_ENABLE_APPEND`, TUI Settings 15 "Enable append") gates both:
 when `false`, stored `append_top` / `append_bottom` texts are kept but
 nothing is wrapped into requests. `append_top` / `append_bottom` (env:
@@ -142,7 +198,10 @@ multitasking share one instance. When `false`, requests stick to `CURRENT`
 and queue on it instead.
 
 `"listen": true` serves on `0.0.0.0` (LAN-visible); default `false` binds
-`127.0.0.1` only. `--host` flag overrides both.
+`127.0.0.1` only. `--host` flag overrides both. A non-loopback bind prints a
+warning at startup: the full API is network-reachable, the only gate is
+`keys` travelling in a plain header on an unencrypted LAN (or auth is
+disabled when `keys` is empty). Bind `127.0.0.1` unless you meant this.
 
 You can skip email/password by pasting a `userToken` from a logged-in
 browser (localStorage) into `accounts[].token`. Raw values and the full
@@ -164,24 +223,50 @@ Clear that state with `POST /v1/accounts/unblock` or
 ## Endpoints
 
 - `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`
-- `GET /v1/waf/status` — Obscura binary, profile, WAF cookie state
+- `GET /v1/waf/status` — Obscura binary, profile, WAF cookie state.
+  **Requires the API key** (same Bearer gate as every other `/v1/*` route):
+  the payload names the absolute binary and profile paths plus the WAF cookie
+  names, which is exactly the reconnaissance a LAN scanner wants. `/health`
+  stays unauthenticated on purpose so existing pollers keep working.
 - Accounts: `GET /v1/accounts`, `POST /v1/accounts`,
   `POST /v1/accounts/select`, `PUT /v1/accounts/{identifier}/token`,
   `DELETE /v1/accounts/{identifier}`, `POST /v1/accounts/unblock`
+- `{identifier}` is an **account identifier, never a token**: the account's
+  `email`, its `mobile`, or the `token[:10] + "..."` short form that
+  `GET /v1/accounts` returns. A 32+ character `[A-Za-z0-9_-]` segment is
+  refused with **400** on every identifier route (`{identifier}` on
+  `PUT`/`DELETE`, the `identifier` body field on `select`/`unblock`), ahead of
+  the API-key check, and the 400 never echoes the value back. Reason: a URL
+  ends up in access logs, proxy logs and `Referer` headers, and the old 404
+  detail used to hand the caller a live 64-char bearer token. The same reason
+  is why the **request access log is off on all three serve paths** (plain
+  serve, server-with-chat / multiple servers, dry run); uvicorn's *error* log
+  is unaffected, and any path it does print is redacted and bounded.
+- **No native tool calling upstream**: the web models have no function-calling
+  API, so `tools` schemas are rendered into the prompt and the reply is parsed
+  back out. That is why `enable_tools` must stay on for pi/opencode-style
+  harnesses.
 
 Models (union of the active providers' catalogues; `/v1/models` serves all):
 DeepSeek — `deepseek-flash`, `deepseek-flash-reasoner`,
 `deepseek-flash-search`, `deepseek-flash-reasoner-search` (reasoner models
 return `reasoning_content` alongside `content`); Qwen — `qwen3.7-plus`
-(default), `qwen3.8-max`, `qwen3.8-omni-flash`; opencode (local CLI, no
-accounts) — `opencode/muse-spark-1.3-contributor-free` (default) plus the
-other seven `opencode/*-free` models, and any `provider/model` you
-configured on your own `opencode serve` passes through.
+(default), `qwen3.8-max`, `qwen3.8-omni-flash`;
+opencode (local CLI, no accounts) — 8 static entries, `opencode/muse-spark-1.3-contributor-free`
+(default) first, and any `provider/model` you configured on your own
+`opencode serve` passes through. Seven of the eight carry a `-free` suffix;
+the eighth, `opencode/big-pickle`, does not — it is still served and
+still listed, it just is not named `-free`.
 
 Note: OpenAI params the web upstreams cannot honor (`temperature`, `top_p`,
-`max_tokens`, `stop`, `n`, penalties, `response_format`) are accepted but
-ignored upstream (prompt + thinking/search/model only); the server logs a
-warning per request. `stream_options.include_usage` is honored locally.
+`max_tokens`, `stop`, `n`, penalties, `response_format`, `parallel_tool_calls`)
+are accepted but ignored upstream (prompt + thinking/search/model only — tools
+are serialized into the prompt, so there is nothing to throttle or to switch
+off); the server logs a warning per request. `tool_choice` is honored for
+`"auto"` and `"none"` (the latter disables tools for that turn), but a
+**forcing** value — `"required"` or `{"type":"function",...}` — is warn-and-drop
+like the rest, because the web model may answer in prose where the caller is
+waiting on a `tool_call`. `stream_options.include_usage` is honored locally.
 The opencode provider additionally honors `reasoning_effort`
 (`none/minimal/low/medium/high/xhigh`, also as `reasoning.effort`) as the
 serve message `variant` — the only per-request parameter the serve API
@@ -202,15 +287,137 @@ warn-and-drop like the web providers).
    and model `opencode/muse-spark-1.3-contributor-free`, then work
    normally: pi's tools arrive as DSML text, the model replies with DSML
    `tool_calls`, and the bridge returns OpenAI `tool_calls` for pi to
-   execute. Plain chat sends no native `tools` key at all; tool turns
-   declare only the gatekeeper-minimal bash+read pair (an explicit
-   all-false list is what the free tier 403s).
+   execute. Plain chat sends no native `tools` key at all. A tool turn has to
+   send one — an explicit all-false allowlist is what the free tier 403s — so
+   it declares 14 native keys and grants exactly one, `read`. `bash` is
+   declared with the value `false`: the free-tier gate needs the key
+   *present*, not *granted*. That matters because the per-message `tools` map
+   **overrides** the managed agent's permission map, so a granted `bash` here
+   would hand the model a native shell on every tool turn; the agent map denies
+   `bash` too, and both layers have to agree.
 4. If pi runs in a different directory than the bridge, set
    `DEEPSEAPORT_OPENCODE_WORKDIR` to the project dir so sessions pin
    (`?directory=`) where pi expects file tools to run.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for protocol details, auth/PoW/SSE
-notes, and the tool-calling design.
+notes, and the tool-calling design, and [PROVIDERS.md](PROVIDERS.md) for
+adding an upstream.
+
+## Building
+
+The release `.exe` is a PyInstaller one-file build driven by
+`deepseaport.spec` (it sets `version` from `pyproject.toml`, and `upx=False` —
+no UPX is installed here, and PyInstaller 6 only warns when it is missing):
+
+```powershell
+pip install -e ".[build]"
+pyinstaller --clean --noconfirm deepseaport.spec
+python scripts/prepare_release.py --check     # audit, writes nothing
+python scripts/prepare_release.py             # release/ + release/dist.zip
+```
+
+**Package the release with `scripts/prepare_release.py`, not
+`Compress-Archive dist\*`.** `dist/` is both the PyInstaller output directory
+*and* the frozen app's live credential store: `config._app_dir()` returns
+`Path(sys.executable).parent` when frozen, so `dist/config.json` holds the
+account emails, plaintext passwords, 64-char bearer tokens and API keys that
+`deepseaport.exe` reads and writes. Zipping `dist/` by hand ships all of it, and
+`config.json` being gitignored protects git, not the upload — `.gitignore:2` and
+`deepseaport.spec` have no `datas` exclusion. `.github/workflows/release.yml`
+runs `prepare_release.py --check` as a **hard gate before every upload step** on
+a `v*` tag, and builds the zip through the same script. The script reads `dist/`
+and never writes to it, drops `*.bak` / `*.tmp` / `*.log` / `__pycache__` and
+leftover `.env`/`*.pem`/profile directories, and **refuses to build** when the
+tree holds a `config.json` or any other JSON with a non-empty `email` /
+`mobile` / `token` / `password` / `keys` / `api_key` / `secret` value, naming
+the file and the path inside it. Content scanning is JSON-only: a secret in
+`settings.ini`, `credentials.txt`, a `.har` or a screenshot ships unless its
+*name* matches an exclusion glob. It leaves your live `config.json` where it is;
+moving it out of `dist/` is your call (the exe reads it at startup, so
+`DEEPSEAPORT_CONFIG` or a moved copy both work). Exit 1 means a credential was
+found, exit 0 means the artifact is clean.
+
+**Version.** `pyproject.toml` `[project] version` is the only place a version
+is written. `deepseaport.spec` reads it at build time (so the exe's version
+resource and a broken pyproject now fail the build loudly instead of silently
+stamping `0.0.0`), `deepseaport.__version__` derives from it, and both FastAPI
+apps pass that to `FastAPI(version=...)`. Bump it there and nowhere else.
+
+Interpreter: the project is developed and tested on CPython **3.13.6**
+(Windows 11), and `.[build]` asks for `pyinstaller>=6`. On this checkout
+PyInstaller **6.22.3** is installed and importable, so the command above works
+as written. One gotcha if you reach for the module instead of the script:
+the package is capitalized, so `python -m pyinstaller` fails with
+`No module named pyinstaller` while `python -m PyInstaller --version` prints
+`6.22.3`. The `pyinstaller` console script is the one the command above uses.
+
+There is no build log in this tree and none is tracked in git (`*.log` is
+gitignored, and no `build*.log` path has ever been committed), so no claim
+about a previous build's interpreter or PyInstaller version is made here. If
+you produce a build, record the versions in the release notes — a build on
+record is worth more than one asserted here.
+
+The exe needs the **Visual C++ redistributable** on the target machine —
+`https://aka.ms/vs/17/release/vc_redist.x64.exe` — which the app needs
+anyway for obscura (see top of this file).
+
+## Development
+
+```powershell
+pip install -e ".[test]"     # editable install + pytest/httpx
+python -m pytest -q          # hermetic suite, no network
+```
+
+Two things a new contributor will hit immediately:
+
+1. **Run `pip install -e .` from this checkout**, or the tests import a
+   *different* installed copy of deepseaport and you debug code that is not
+   the code in front of you. `pyproject.toml` now pins
+   `pythonpath = ["src"]` under `[tool.pytest.ini_options]`, so `pytest`
+   always resolves this tree — but keep the editable install anyway so
+   `python -m deepseaport` runs your checkout too.
+2. **`tests/conftest.py` makes the suite hermetic**: it points
+   `DEEPSEAPORT_CONFIG`/`DEEPSEAPORT_DATA` at a temp dir, strips
+   `DEEPSEAPORT_*`/`DEEPSEEK_*`/`OBSCURA_*` from the ambient environment, and
+   raises on any non-loopback socket connect. `live` tests are **skipped**
+   unless you ask for them. The network tier is opt-in:
+
+   ```powershell
+   python -m pytest -m live -q
+   ```
+
+   That tier needs a real account token in `config.json` and the `obscura`
+   binary on PATH. Do not encode the default as `-m "not live"` in
+   `addopts`: a command-line `-m` does not override `addopts`, so
+   `pytest -m live` would silently deselect everything.
+
+   **Run this periodically** — it is the only thing in the repo that can
+   notice an upstream changed. `tests/test_live_smoke.py` is a small suite
+   (one run per provider, seconds) that exercises the real wire formats and
+   asserts the invariants a stub cannot: DeepSeek's continuation chunks
+   (bare `{"v":...}` with no `p`), Qwen's `delta.phase` split, the WAF jar,
+   the streamed `tool_calls` `index`, and — most importantly — that a reply
+   contains the *end* of the prompt. That last one exists because a stateless
+   parser once shipped and truncated a reply to `web` instead of
+   `web2api-ok`; no mock reproduces it, because the mock *is* what broke.
+
+   It skips with a precise reason per provider, so you only need one
+   upstream configured. opencode is the cheapest probe (no account, no
+   browser, no WAF — just a local process). Failures are redacted through
+   the same scrubber the server uses, and name the provider, model, status
+   and the SSE path the deltas arrived on, so a drift report is diagnosable
+   without ever printing a credential.
+
+CI: `.github/workflows/ci.yml` runs exactly
+`python -m pytest -m "not live" -q` on Python 3.11 and 3.13 (3.11 is the
+`requires-python` floor) against ubuntu-latest and windows-latest, with
+`.[test]` installed **editable** so the install and pytest's `pythonpath = ["src"]`
+agree — a plain install was shadowed by the checkout and proved nothing about
+what was in the wheel. One extra step then installs a real (non-editable) wheel
+and imports `deepseaport.core.tools.parser` and `deepseaport.providers.qwen`
+from outside the checkout, which is the only check that notices a package
+directory missing its `__init__.py`. No obscura, no browser, no account, no
+secrets.
 
 ## Disclaimer
 

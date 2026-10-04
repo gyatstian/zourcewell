@@ -11,7 +11,7 @@ Ownership:
   fragments-based stream shape (response/fragments/-1/content).
 - Header builders and ban helpers stay in protocol.py (re-exported here
   only via deferred local import to avoid a module cycle).
-- HTTP status/body/error-drain handling lives in transport_http.py.
+- HTTP status/body/error-drain handling lives in core/transport.py.
 """
 
 from __future__ import annotations
@@ -199,12 +199,23 @@ class StreamParser:
             # strings) in one "v" list. The old code only looked for FINISHED
             # and dropped any batched content, truncating the reply.
             # Items under {"p": "response", "o": "BATCH"} carry parent-relative
-            # paths ("accumulated_token_usage", "quasi_status"), resolved here.
+            # paths ("accumulated_token_usage", "quasi_status",
+            # "fragments/-1/content"), resolved here -- but ONLY when the item
+            # actually carried its own "p". An item without one is a
+            # continuation: it inherits the last live text path, exactly like
+            # the top-level bare {"v": "..."} shape. Prefixing an inherited
+            # path produced "response/response" (no content path at all) and
+            # routing a raw string to the parent "response" dropped it, so
+            # batched continuations silently truncated replies.
             for item in value:
                 if isinstance(item, dict):
-                    ip = item.get("p", "") or path
-                    if "/" not in ip and path == "response":
-                        ip = "response/" + ip
+                    own = str(item.get("p", "") or "")
+                    if own:
+                        ip = own
+                        if "/" not in own and path == "response":
+                            ip = "response/" + own
+                    else:
+                        ip = self.last_path or path
                     iv = item.get("v", "")
                     if iv == "FINISHED" and ip in self.FINISHED_PATHS + ("status",):
                         self.last_path = ""
@@ -226,7 +237,7 @@ class StreamParser:
                     if event is not None:
                         yield event
                 elif isinstance(item, str) and item:
-                    event = self._route_text(path, item)
+                    event = self._route_text(self.last_path or path, item)
                     if event is not None:
                         yield event
             return

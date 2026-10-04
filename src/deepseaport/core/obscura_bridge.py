@@ -90,6 +90,93 @@ def _profile_key(profile: str) -> str:
     return os.path.normcase(raw) if os.name == "nt" else raw
 
 
+# Owner-only mode for any directory that holds credentials: the Obscura
+# profile dir (the aws-waf-token cookie jar, a live solved WAF session) and
+# the managed opencode dir (serve.json holds the per-boot basic-auth
+# password). mkdir() used the process umask, i.e. 0755 on a default POSIX
+# umask, leaving those files world-readable. Windows has no POSIX modes (the
+# attribute is a no-op), so the chmod is POSIX-only -- see
+# ``warn_inherited_acl_once`` for the Windows half of the same problem.
+_DIR_MODE = 0o700
+
+
+def secure_dir(path, label: str = "") -> None:
+    """Create ``path`` (with parents) and tighten its mode to 0700.
+
+    Shared by every credential-bearing dir in the app so the POSIX half of the
+    "don't leave secrets world-readable" rule is stated once, and so a
+    Windows caller has one place to attach the ACL warning
+    (:func:`warn_inherited_acl_once`).
+
+    Never raises: a locked/undeletable dir must not stop the caller (the
+    bridge's WinError5 handling downstream relies on that).
+    """
+    name = str(label or path)
+    target = Path(path)
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.debug("%s mkdir failed for %s: %s", name, path, exc)
+        return
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(target, _DIR_MODE)
+    except Exception as exc:
+        # Read-only/foreign filesystem: the dir still works, only the mode
+        # stays wider than intended. Never fatal.
+        logger.debug("%s chmod 0700 skipped for %s: %s", name, path, exc)
+
+
+# Windows half of ``secure_dir``. ``os.chmod(f, 0o600)`` only toggles the
+# read-only attribute on win32 and never touches the DACL, so a "protected"
+# file keeps whatever the containing directory grants -- on a default install
+# that includes read access for ``BUILTIN\Users``. Deliberately a warning
+# rather than a fix: rewriting the ACL behind the operator's back (``icacls``,
+# a deny ACE) can lock them out of their own credential store, and the
+# actionable part is WHERE the file lives, which is the operator's call.
+#
+# Mirrors the shape of ``config._warn_inherited_acl_once`` (config.py owns that
+# one and imports nothing from this module, so neither imports the other: this
+# copy exists so a second secret store can warn without a cycle). The once
+# flag is keyed by ``label`` instead of being a single module boolean: each
+# store has its own secret and must get its own warning, and neither may
+# consume the other's.
+_ACL_WARNED_LABELS: set[str] = set()
+
+
+def warn_inherited_acl_once(target, secret: str, label: str = "credential file",
+                            platform: str | None = None) -> None:
+    """On Windows, warn ONCE per ``label`` that ``target`` inherits its dir ACL.
+
+    Same wording contract as the config.json warning (a log grep for
+    "inherits the ACL" finds every one of them): it names the file, the secret
+    at risk, the fact that the POSIX mode does not apply here, and the
+    mitigation. No-op on POSIX, where the 0700/0600 modes are real.
+
+    ``platform`` exists only so the branch is testable on both platforms:
+    faking ``os.name`` process-wide breaks ``pathlib`` (it picks PosixPath,
+    which cannot be instantiated on Windows). It defaults to the real one.
+    """
+    if (os.name if platform is None else platform) != "nt":
+        return
+    key = str(label or "credential file")
+    if key in _ACL_WARNED_LABELS:
+        return
+    _ACL_WARNED_LABELS.add(key)
+    try:
+        logger.warning(
+            "%s %s inherits the ACL of its directory: %s is readable by every "
+            "other local user that directory grants access to. POSIX 0600/0700 "
+            "does NOT apply on Windows -- os.chmod only toggles the read-only "
+            "attribute and never touches the DACL. Mitigation: keep it in a "
+            "directory only your own user can read, or point DEEPSEAPORT_DATA "
+            "at one (a per-user data dir, not a shared repo checkout).",
+            key, target, secret)
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
 def profile_lock(profile: str) -> threading.RLock:
     """Return the shared reentrant lock serializing obscura on `profile`.
 
@@ -106,12 +193,30 @@ def profile_lock(profile: str) -> threading.RLock:
         return lock
 
 
+# Worst case for a single warmup leader: it holds _proc_lock across pass 1
+# (``_run(timeout=timeout)``) and then, only if pass 1 produced no cookies, over
+# ``dump_cookies(timeout=30)`` and ``fetch_ua(timeout=30)``. A follower that gave
+# up before that returned the PRE-refresh jar, sent it, and 403'd again --
+# burning another full recovery pass, which reads to the user as "the WAF fix
+# does not work". So the follower waits for the leader's own bound (plus slack
+# for process startup) and re-checks the leader's completion flag before it
+# hands back cookies: an expired wait is still a stale jar, but a rare one we
+# log instead of one that fires on every slow refresh.
+WARMUP_SUBSTEP_TIMEOUT = 30.0  # dump_cookies / fetch_ua defaults
+WARMUP_FOLLOWER_SLACK = 15.0  # obscura startup + parse headroom
+
+
+def _follower_wait_budget(timeout: int) -> float:
+    """Seconds a singleflight follower waits for the leader's refresh."""
+    return max(1.0, float(timeout) + 2 * WARMUP_SUBSTEP_TIMEOUT + WARMUP_FOLLOWER_SLACK)
+
+
 class ObscuraBridge:
     def __init__(self, binary: str = "", profile: str = "") -> None:
         self.binary = self._resolve_binary(binary)
         default_profile = str(Path.home() / ".deepseaport" / "obscura-profile")
         self.profile = profile or default_profile
-        Path(self.profile).mkdir(parents=True, exist_ok=True)
+        secure_dir(self.profile, "obscura profile")
         self.state = WafState()
         # All obscura subprocesses share one --storage-dir. Parallel warmups
         # (multi-account 403 refreshes) would race on it and corrupt the
@@ -232,11 +337,20 @@ class ObscuraBridge:
                 self._warm_inflight = waiter
                 leader = True
         if not leader:
-            # Follower: wait for the leader's refresh, then share its result.
+            # Follower: wait for the leader to publish its refresh (the flag is
+            # set in the leader's finally), then share its result. Waiting is
+            # strictly better than giving up: the jar held here is the one the
+            # leader is in the middle of replacing, so returning early sends
+            # cookies that are already known to be stale.
+            budget = _follower_wait_budget(timeout)
             try:
-                waiter.wait(timeout=max(1, int(timeout) + 5))
+                done = waiter.wait(timeout=budget)
             except Exception:
-                pass
+                done = waiter.is_set()
+            if not done:
+                log.warning("obscura warmup follower gave up after %.0fs without "
+                            "the leader's refresh; sending the current jar "
+                            "(%d cookies)", budget, len(self.state.cookies))
             return dict(self.state.cookies)
         try:
             with self._proc_lock:

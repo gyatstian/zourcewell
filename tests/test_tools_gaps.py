@@ -1,11 +1,11 @@
-"""Offline gap tests for tools_support (no network)."""
+"""Offline gap tests for core.tools (no network)."""
 
 import json
 import logging
 
 import pytest
 
-from deepseaport import tools_support as T
+from deepseaport.core import tools as T
 
 
 # --- _int_env ---
@@ -275,21 +275,22 @@ def test_coerce_dsml_value_branches():
     assert T._coerce_dsml_value("120", "True") == "120"
 
 
-# --- _parse_dsml_calls / _dsml_spans / _strip_spans ---
+# --- _scan_dsml_calls / _strip_spans ---
 
 def test_parse_dsml_calls_missing_name_skipped():
     text = ('<||DSML|| invoke>'
             '<||DSML|| parameter name="x">1</||DSML|| parameter>'
             '</||DSML|| invoke>')
-    assert T._parse_dsml_calls(text) == []
+    assert T._scan_dsml_calls(text)[0] == []
 
 
 def test_dsml_spans_finds_calls_and_invoke():
     text = ('<||DSML|| calls>\n<||DSML|| invoke name="read">\n'
             '<||DSML|| parameter name="x">1</||DSML|| parameter>\n'
             '</||DSML|| invoke>\n</||DSML|| calls>')
-    spans = T._dsml_spans(text)
-    assert len(spans) >= 3
+    calls, spans = T._scan_dsml_calls(text)
+    assert [c["function"]["name"] for c in calls] == ["read"]
+    assert len(spans) == 1
 
 
 def test_strip_spans_overlapping_skipped():

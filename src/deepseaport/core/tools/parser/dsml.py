@@ -11,9 +11,8 @@ from ..common import (
     MAX_SCAN_OBJECTS,
     _LOOSE_JSON_MISS,
     _balanced_json,
-    _clean_rest,
+    _finish,
     _loads_json_lenient,
-    _normalize_calls,
     _normalize_dsml_text,
     _strip_spans,
 )
@@ -311,11 +310,18 @@ def _scan_dsml_calls(text: str, forgiving: bool = False,
         last_param_end = body_start
         # Bound per-invoke parameters (malformed replies with thousands of
         # <parameter> tags can't blow up the scan). Lazy: stop matching at
-        # the cap; truncation semantics match the old list-then-slice.
+        # the cap; truncation semantics match the old list-then-slice, which
+        # kept the first MAX_PARAMS_PER_INVOKE matches and left the scan
+        # bound (param_limit) at the invoke close.
+        #
+        # The cap must bound HOW MANY parameters are scanned, never the value
+        # range of the last accepted one: `param_limit` is the same value
+        # used as the last parameter's `value_limit`, so narrowing it here
+        # gave the 64th argument `value_start > value_limit` and silently
+        # emptied it (65+ tags -> p63 became ''). Only `params` is trimmed.
         params: list = []
         for _pm in param_open.finditer(norm, body_start, param_limit):
             if len(params) >= MAX_PARAMS_PER_INVOKE:
-                param_limit = params[-1].start() if params else param_limit
                 break
             params.append(_pm)
         for pidx, pm in enumerate(params):
@@ -372,13 +378,6 @@ def _scan_dsml_calls(text: str, forgiving: bool = False,
     return out, spans
 
 
-def _parse_dsml_calls(text: str, forgiving: bool = False,
-                      tools: list[dict] | None = None) -> list[dict]:
-    """Parse DSML / plain invoke+parameter blocks into raw tool calls."""
-    calls, _ = _scan_dsml_calls(text, forgiving=forgiving, tools=tools)
-    return calls
-
-
 def _dsml_wrapper_spans(text_norm: str, forgiving: bool = False,
                         ) -> list[tuple[int, int]]:
     """Wrapper <calls>/<tool_calls> spans from already-normalized text.
@@ -398,18 +397,6 @@ def _dsml_wrapper_spans(text_norm: str, forgiving: bool = False,
     return spans
 
 
-def _dsml_spans(text: str, forgiving: bool = False,
-                tools: list[dict] | None = None) -> list[tuple[int, int]]:
-    """Spans to strip on DSML success (length-preserving normalization)."""
-    norm = _normalize_dsml_text(text)
-    spans = _dsml_wrapper_spans(norm, forgiving=forgiving)
-    # The tolerant scanner owns invoke/parameter/plain/generic blocks. Its
-    # normalized copy is length-preserving, so positions map to `text`.
-    _, invoke_spans = _scan_dsml_calls(text, forgiving=forgiving, tools=tools)
-    spans.extend(invoke_spans)
-    return spans
-
-
 def try_parse_dsml(text, valid_or_none, limit_args, forgiving_on, tools,
                  diagnostics=None):
     """Gate on invoke/DSML marker, then scan. Returns (calls, rest) or (None, None)."""
@@ -420,20 +407,19 @@ def try_parse_dsml(text, valid_or_none, limit_args, forgiving_on, tools,
         dsml_raw, invoke_spans = _scan_dsml_calls(
             text, forgiving=forgiving_on, tools=tools)
         if dsml_raw:
-            calls, dropped = _normalize_calls(dsml_raw, valid_or_none, limit_args)
-            if diagnostics is not None:
-                diagnostics.append({"format": "dsml", "matched": bool(calls),
-                                    "kept": len(calls), "dropped": list(dropped),
-                                    "raw": len(dsml_raw)})
-            if calls:
-                # Strip on normalized text then map back by length-stable replace:
-                # fullwidth->ASCII is length-stable (1 char -> 1 char), so spans align.
-                norm = _normalize_dsml_text(text)
-                spans = _dsml_wrapper_spans(norm, forgiving=forgiving_on)
+            def _strip() -> str:
+                # Strip on normalized text then map back by length-stable
+                # replace: fullwidth->ASCII is length-stable (1 char -> 1
+                # char), so spans align with the original.
+                spans = _dsml_wrapper_spans(_normalize_dsml_text(text),
+                                           forgiving=forgiving_on)
                 spans.extend(invoke_spans)
-                rest = _clean_rest(_strip_spans(text, spans), forgiving_on)
-                # If spans came from normalized copy with same length, safe.
-                return calls, rest
+                return _strip_spans(text, spans)
+
+            hit = _finish(dsml_raw, valid_or_none, limit_args, "dsml",
+                          forgiving_on, diagnostics=diagnostics, on_hit=_strip)
+            if hit[0]:
+                return hit
             # DSML present but names unknown: fall through to fence/bare.
             # Unknown DSML must NOT suppress a valid bare call later; the
             # chain continues and diagnostics keeps the near-miss trail

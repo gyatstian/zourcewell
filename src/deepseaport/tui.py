@@ -1,4 +1,4 @@
-"""Stdlib-only TUI: main page (Start server / Settings) + settings editor.
+﻿"""Stdlib-only TUI: main page (Start server / Settings) + settings editor.
 
 No third-party deps (Windows-safe: plain input(), no curses) so `serve`
 works everywhere. All edits mutate the passed Settings in place and persist
@@ -7,30 +7,19 @@ via Settings.save().
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
 from typing import Callable
 
-from .config import VALID_LOG_LEVELS, Settings
-# Re-exported for backward compat (tests do tui._read_interactive).
-from .tui_editor import (
-    _WIN_SPECIAL_MAP,
-    _apply_cursor_move,
-    _char_cell,
-    _decode_posix_special,
-    _decode_windows_special,
-    _editor_width,
-    _ensure_vt,
-    _line_start,
-    _pos_line_col,
-    _read_interactive,
-    _read_interactive_posix,
-    _read_interactive_windows,
-    _read_keys_react,
-    _redraw_editor,
-    _unescape_newlines,
-    _visual_pos,
-)
+from .config import VALID_LOG_LEVELS, Settings, _normalize_keys
+# Only _read_interactive and _unescape_newlines are referenced from this
+# module; the rest of tui_editor is an implementation detail of the editor
+# itself and re-exporting it only invites callers to depend on internals
+# (tests pin these two: tui._read_interactive / tui._unescape_newlines).
+from . import tui_editor as _tui_editor
+from .tui_editor import _read_interactive, _unescape_newlines
 
 
 def _on_off(value: bool) -> str:
@@ -53,26 +42,25 @@ def _c(text: str, code: str) -> str:
     return f"\x1b[{code}m{text}\x1b[0m"
 
 
+def _stdout_is_tty() -> bool:
+    """False for pipes/logs/tests; the guard every screen draw uses."""
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
 def _clear_screen() -> None:
     """Clear screen on menu enter. No-op when not a tty (tests/pipes)."""
-    try:
-        if not sys.stdout.isatty():
-            return
-    except Exception:
+    if not _stdout_is_tty():
         return
     try:
-        if os.name == "nt":
-            # Enable ANSI VT processing on Windows 10+, best-effort.
-            try:
-                import ctypes
+        # Local import on purpose: tui_editor is imported for exactly two names
+        # at module scope (see the top of this file), and _ensure_vt must not
+        # become one -- tests assert `not hasattr(tui, "_ensure_vt")`.
+        from .tui_editor import _ensure_vt
 
-                kernel32 = ctypes.windll.kernel32
-                handle = kernel32.GetStdHandle(-11)
-                mode = ctypes.c_ulong()
-                if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-                    kernel32.SetConsoleMode(handle, mode.value | 0x0004)
-            except Exception:
-                pass
+        _ensure_vt()
         print("\x1b[2J\x1b[H", end="")
     except Exception:
         pass
@@ -118,12 +106,257 @@ def _ask(prompt: str, default: str = "") -> str:
         raise
 
 
+def _term_size() -> tuple[int, int]:
+    """(columns, rows) of the console, (80, 24) when it cannot be asked.
+
+    ``shutil.get_terminal_size`` follows COLUMNS/LINES, then the real console,
+    then its own (80, 24) fallback -- the same source tui_editor._editor_width
+    reads, and 80/24 are the Windows console defaults the table widths and the
+    menu compaction below are budgeted against. Piped output (tests, logs) also
+    lands on the fallback, so those draws stay deterministic. No try/except is
+    needed around this: get_terminal_size substitutes its own fallback and
+    always returns int fields.
+    """
+    import shutil
+
+    size = shutil.get_terminal_size()
+    return (int(size.columns) or 80, int(size.lines) or 24)
+
+
+def _pad_colored(text: str, width: int, code: str = "") -> str:
+    """Left-justify ``text`` in ``width`` VISIBLE columns.
+
+    ``f"{colored:<7}"`` pads to 7 characters *including* the ANSI escapes, so
+    a colored cell pushes every column after it out of alignment -- which is
+    the one thing the account table cannot afford at 80 columns.
+    """
+    text = str(text)
+    if not code:
+        return text.ljust(width)
+    return _c(text, code) + " " * max(0, width - len(text))
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Cooldown length the way it is said out loud: 120s / 45m / 1.5h / 30d.
+
+    Raw seconds rendered a 30-day mute as ``2592000s``: unreadable, and wide
+    enough on its own to push the account row past 80 columns while the ban
+    DATE beside it already says the same thing in a form a human reads.
+
+    Seconds are kept up to ten minutes: below that nobody wants minutes of
+    precision, and the ban date is the signal for anything long.
+    """
+    try:
+        secs = max(0.0, float(seconds or 0))
+    except (TypeError, ValueError):
+        return "-"
+    if secs < 600:
+        return f"{secs:.0f}s"
+    if secs < 3600:
+        return f"{secs / 60:.0f}m"
+    if secs < 86400:
+        return f"{secs / 3600:.1f}".replace(".0", "") + "h"
+    return f"{secs / 86400:.0f}d"
+
+
+def _longest_shared_prefix(idents: list[str]) -> int:
+    """Longest prefix any two identifiers share; 0 with fewer than two rows."""
+    worst = 0
+    for i, a in enumerate(idents):
+        for b in idents[i + 1:]:
+            k = 0
+            while k < min(len(a), len(b)) and a[k] == b[k]:
+                k += 1
+            worst = max(worst, k)
+    return worst
+
+
+def _elide_ids(idents: list[str], width: int) -> list[str]:
+    """Shorten each identifier to ``width`` columns, head-anchored on its
+    first difference from the others.
+
+    A fixed head/tail cut makes two long addresses that differ in the middle
+    render identically, and two identical rows are worse than a wrapped one:
+    nothing left on the row can tell the accounts apart. So every row keeps at
+    least the first column where it differs from every other row, and spends
+    its tail on the domain only once that head is long enough. The caller sizes
+    ``width`` so this head fits (see the table's ``need``).
+
+    The marker is ASCII "..." -- what this table used before -- and unlike
+    U+2026 it cannot blow up on a legacy console codepage mid-draw.
+    """
+    out: list[str] = []
+    for i, ident in enumerate(idents):
+        ident = str(ident or "")
+        if len(ident) <= width:
+            out.append(ident)
+            continue
+        need = 1
+        for j, other in enumerate(idents):
+            if i == j:
+                continue
+            other = str(other or "")
+            k = 0
+            while k < min(len(ident), len(other)) and ident[k] == other[k]:
+                k += 1
+            need = max(need, k + 1)
+        keep = width - 3                      # room for the marker
+        head = min(keep, max(keep // 2 + keep % 2, need))
+        out.append(ident[:head] + "..." + ident[len(ident) - (keep - head):])
+    return out
+
+
+# Measured height of the grouped settings screen in settings_menu: header(3)
+# + 8 sections x 2 + 19 items + 2 blanks + Back + the Select: prompt row = 42.
+# It is the threshold below which the screen is redrawn without its section
+# headers and blank lines, so the prompt stays on a short console. Re-measure
+# when an item or a section is added or removed.
+_GROUPED_SETTINGS_ROWS = 42
+
+
+def _run_submenu(label: str, fn: Callable[[Settings], None],
+                 settings: Settings) -> None:
+    """Run a submenu; an unexpected failure must not end the process.
+
+    Same guard style the serve branches use. EOFError/KeyboardInterrupt (how
+    the menus are left) and SystemExit are re-raised on purpose -- swallowing
+    them would turn Ctrl+C into "back to the main menu" and a serve-side
+    SystemExit into silence.
+    """
+    try:
+        fn(settings)
+    except (EOFError, KeyboardInterrupt):
+        raise
+    except Exception as exc:
+        _err(f"{label} failed: {type(exc).__name__}: {exc}")
+        _info("Back to the main menu.")
+
+
+def _ask_raw(prompt: str) -> str:
+    """input() with no strip() and no default suffix.
+
+    Secret-input companion to _ask: stripping " pass word " to "pass word"
+    silently corrupts the value that gets saved and re-sent to the login API.
+    """
+    try:
+        return input(f"{prompt}: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise
+
+
+def _provider_label(pid: str) -> str:
+    """Human name for a provider id, from the same registry the gate resolves.
+
+    Falls back to the id itself (never empty), so a login prompt always names
+    the service it is about to authenticate against. DeepSeek resolves to
+    "DeepSeek", which is what the prompts said before the provider split.
+    """
+    key = (str(pid or "").strip().lower() or "deepseek")
+    try:
+        from .core import registry as _reg
+
+        prov = _reg.get(key)
+        name = str(getattr(prov, "display_name", "") or "").strip()
+        if name:
+            return name
+    except Exception:
+        pass
+    return key
+
+
+_LOGIN_BANNERS = {
+    # Byte-identical to the pre-provider-split wording.
+    "deepseek": "Running Obscura login (browser, ~30s)...",
+}
+
+
+def _login_banner(pid: str) -> str:
+    """One-line "what is about to happen" for a provider login.
+
+    A mapping rather than an if-chain, because the browser-based providers are
+    not an exception to the rule any more: DeepSeek drives a real Obscura
+    session, so "one browser-based provider" was never a category with a
+    single member.
+    A new one is one line here instead of another branch.
+
+    The generic fallback stays "direct API signin, ~5s" and no browser: that
+    was the failure being fixed. Every non-browser provider's login is a POST
+    that returns in seconds, so promising a window sent the user watching the
+    terminal for ~30s for a window that never opened.
+    """
+    key = (str(pid or "").strip().lower() or "deepseek")
+    banner = _LOGIN_BANNERS.get(key)
+    if banner is not None:
+        return banner
+    return f"Running {_provider_label(key)} login (direct API signin, ~5s)..."
+
+
+def _provider_scope(settings: Settings) -> tuple[list[str], bool, str]:
+    """The one provider-scope lookup: (active_ids, is_multi, single).
+
+    Five screens need "which providers is this session scoped to", and each
+    used to spell it out with its own copy of the same import, the same
+    len() > 1 test and the same inline "deepseek" fallback. They drifted. Every
+    caller goes through here now.
+
+    `single` is always normalized (str/strip/lower, never empty), so callers do
+    not have to repeat that either. `core.pools` is the source of truth; when it
+    cannot be imported the configured selection stands in for it.
+    """
+    try:
+        from .core import pools as _pools
+
+        active = [str(p) for p in _pools.active_provider_ids(settings)]
+        single = _pools.selected_provider(settings)
+    except Exception:
+        single = None
+    single = (str(single or getattr(settings, "provider", "") or "deepseek")
+              .strip().lower() or "deepseek")
+    if not active:
+        active = [single]
+    return active, len(active) > 1, single
+
+
+def _provider_display(settings: Settings) -> str:
+    """The active provider(s) as ONE string, for every screen that shows it.
+
+    Settings item 19 is the only place the provider mode can be changed, and it
+    used to print bare ``settings.provider`` -- so with providers=
+    ["deepseek", "qwen"] the item that CHANGES the mode read as single-provider
+    while the main menu read "deepseek + qwen (multi)". Two hand-written
+    expressions for one fact is how they drift; _provider_scope is the only one
+    now, and this is its only reader on the settings screen.
+    """
+    active, is_multi, _single = _provider_scope(settings)
+    if is_multi:
+        return " + ".join(active) + " (multi)"
+    return active[0]
+
+
+def _active_providers_need_accounts(settings: Settings) -> bool:
+    """True when some active provider really needs an account/token.
+
+    A thin alias over ``core.pools.any_provider_needs_accounts`` so every hint
+    in this file asks one question of one implementation. Kept as a named local
+    because it is read at five call sites and the intent ("may I tell this user
+    to go add a credential?") is clearer than the pool-module name at each of
+    them.
+    """
+    from .core import pools as _pools
+
+    return _pools.any_provider_needs_accounts(settings)
+
+
 def _ask_password(prompt: str = "Password (Enter=skip)") -> str:
     """Hidden password prompt (no echo). Preserves inner/edge spaces.
 
-    Falls back to visible _ask when getpass cannot control the terminal
-    (e.g. no tty in tests) — getpass itself falls back to input() there,
-    so mocked builtins.input still works.
+    Falls back to visible _ask_raw when getpass cannot control the terminal
+    (e.g. no tty in tests) â€” getpass itself falls back to input() there,
+    so mocked builtins.input still works. On that path the secret IS echoed
+    (say so, instead of silently typing a password into a shared screen or
+    log) and spaces are preserved; the old _ask fallback stripped them, so
+    " pass word " was silently saved as "pass word".
     """
     try:
         import getpass as _gp
@@ -135,10 +368,34 @@ def _ask_password(prompt: str = "Password (Enter=skip)") -> str:
             print()
             raise
         except Exception:
-            return _ask(prompt)
+            _info("(no echo control available: the value below IS echoed)")
+            return _ask_raw(prompt)
     except (EOFError, KeyboardInterrupt):
         print()
         raise
+
+
+def _ask_secret(prompt: str) -> str:
+    """Hidden prompt for a bearer token, the same way the password is hidden.
+
+    A pasted userToken is a 64-char credential: through ``_ask`` (plain
+    input()) it lands in the console scrollback, the conhost buffer, any
+    screen share and Windows Terminal's scrollback, while the password two
+    fields earlier was typed blind. Same secret, same treatment.
+
+    The echo-control decision is made BEFORE calling getpass, which is the one
+    difference from _ask_password: with no console on stdin there is nothing to
+    turn the echo off, and getpass gets there via win_getpass ->
+    fallback_getpass -> sys.stdin.readline() (an exception here, or a read
+    from whatever stdin happens to be). Deciding up front keeps the visible
+    fallback on ``input()`` -- the path piped/automated callers drive -- and
+    announces the echo exactly as _ask_password does when it falls back.
+    """
+    interactive = _tui_editor._stdin_is_tty()
+    if interactive:
+        return _ask_password(prompt)
+    _info("(no echo control available: the value below IS echoed)")
+    return _ask_raw(prompt)
 
 
 def _has_token(settings: Settings, identifier: str) -> bool:
@@ -241,13 +498,35 @@ def _edit_port(settings: Settings) -> None:
         _err("Out of range 1-65535, cancelled.")
         return
     host = _resolve_bind_host(settings)
+    # Was the port the user typed actually free? _ensure_free_port returns the
+    # port unchanged both when it is free and when the busy-port offer was
+    # DECLINED (server_runner._ensure_free_port:238), so the return value alone
+    # cannot tell "saved a good port" from "saved a port we just proved is
+    # taken". Ask the socket, the same question _ensure_free_port asks.
     try:
-        picked = _ensure_free_port(settings, host, candidate)
+        from .cli import _is_port_free
+
+        busy = not _is_port_free(host, candidate)
+    except Exception:
+        busy = False
+    try:
+        if busy:
+            picked = _ensure_free_port(settings, host, candidate)
+        else:
+            picked = candidate
     except (EOFError, KeyboardInterrupt):
         print()
         return
-    # _ensure_free_port saves the winner when it auto-picks; when the
-    # candidate was free it returns it unsaved — persist either way.
+    if int(picked) == candidate and busy:
+        # Declined ("I'll handle it"), or no free port anywhere nearby. The
+        # old "persist either way" wrote the busy port to config.json and
+        # printed "ok: Port -> 54937 (saved)" -- the next Start then failed to
+        # bind on a port the app had just certified as occupied.
+        _info(f"Port {candidate} is in use; kept the previous port "
+              f"({settings.port}). Free it, or pick another port.")
+        return
+    # _ensure_free_port saves the winner when it auto-picks; when the candidate
+    # was free it returns it unsaved -- persist that case here.
     try:
         settings.port = int(picked)
         settings.save()
@@ -297,11 +576,23 @@ def _edit_keys(settings: Settings) -> None:
             if not raw:
                 _info("Cancelled.")
                 continue
-            if raw in keys:
+            # Same normalizer load_settings applies, applied BEFORE the
+            # emptiness/dupe checks: a stored key must equal the key
+            # _check_auth matches. Untrimmed it 401s every client for the rest
+            # of the session with no diagnosable cause, and the next start
+            # strips it - silently changing the key and invalidating clients
+            # already configured with it. A blank result is a cancel, not a
+            # key: stored, it is an auth-bypass entry once reloaded.
+            candidate = _normalize_keys([raw])
+            if not candidate:
+                _err("Blank key (whitespace only) - cancelled.")
+                continue
+            key = candidate[0]
+            if key in keys:
                 _err("Key already present, cancelled.")
                 continue
-            keys.append(raw)
-            settings.keys = keys
+            keys.append(key)
+            settings.keys = _normalize_keys(keys)
             settings.save()
             _ok(f"Key added ({len(keys)} total, saved)")
             continue
@@ -329,7 +620,10 @@ def _edit_keys(settings: Settings) -> None:
                     _info("Cancelled (nothing deleted).")
                     continue
                 del keys[idx]
-                settings.keys = keys
+                # Same writer as the add path: the assignment is the one that
+                # persists, so it normalizes even though a delete cannot
+                # introduce an untrimmed key.
+                settings.keys = _normalize_keys(keys)
                 settings.save()
                 _ok(f"Key removed ({len(keys)} left, saved)")
             else:
@@ -357,7 +651,16 @@ def _edit_obscura_bin(settings: Settings) -> None:
         settings.save()
         _ok("Obscura binary -> auto-discover (saved)")
         return
-    p = Path(ans.strip()).expanduser()
+    try:
+        p = Path(ans.strip()).expanduser()
+    except (RuntimeError, OSError) as exc:
+        # expanduser() raises RuntimeError("Could not determine home
+        # directory.") when USERPROFILE and HOMEDRIVE+HOMEPATH are all
+        # missing (stripped service account, some CI runners). That escaped
+        # Settings 12 and killed the TUI with a traceback; check the literal
+        # path instead so the operator still gets a real answer.
+        p = Path(ans.strip())
+        _err(f"Could not expand '~' ({exc}); checking the path as typed.")
     if not p.exists():
         _err(f"Path not found: {p}. Not saved.")
         _info("TIP: place obscura.exe next to config.json, bin/, tools/, vendor/.")
@@ -439,6 +742,8 @@ def _select_provider(settings: Settings) -> None:
     # Provider alias/match is shared (cli.normalize_provider_id via
     # _normalize_provider_choice below); no local alias map needed.
 
+    # Only for the per-id account counts below; the scope itself comes from
+    # _provider_scope.
     try:
         from .core import pools as _pools
     except Exception:
@@ -450,13 +755,7 @@ def _select_provider(settings: Settings) -> None:
             providers = {}
         ids = list(providers.keys())
         _header("Provider")
-        try:
-            active = list(_pools.active_provider_ids(settings)) if _pools else [
-                (getattr(settings, "provider", "") or "deepseek").strip().lower()]
-            multi = len(active) > 1
-        except Exception:
-            active = [(getattr(settings, "provider", "") or "deepseek").strip().lower()]
-            multi = False
+        active, multi, _single = _provider_scope(settings)
         if multi:
             _info("Mode: multi (one server will expose all listed providers' models)")
         else:
@@ -488,7 +787,7 @@ def _select_provider(settings: Settings) -> None:
             except Exception:
                 accts = []
             ntok = sum(1 for a in accts if (getattr(a, "token", "") or "").strip())
-            print(f"  {i}. {name} ({pid}) — {nmodels} models, "
+            print(f"  {i}. {name} ({pid}) â€” {nmodels} models, "
                   f"{len(accts)} accounts ({ntok} with token)")
         print()
         print("  m. Multi (all providers, one server exposes every model)")
@@ -576,17 +875,19 @@ def _ask_account_provider(settings: Settings) -> str:
     Multi mode prompts with text choices (e.g. deepseek [ds] / qwen),
     defaulting to deepseek on empty input. Never raises; EOF defaults.
     """
-    try:
-        from .core import pools as _pools
-        active = list(_pools.active_provider_ids(settings))
-        multi = len(active) > 1
-        single = _pools.selected_provider(settings)
-    except Exception:
-        active = [(getattr(settings, "provider", "") or "deepseek").strip().lower()]
-        multi = False
-        single = active[0] if active else "deepseek"
+    active, multi, single = _provider_scope(settings)
     if not multi:
-        return (single or "deepseek").strip().lower() or "deepseek"
+        # Single mode: no prompt, the id is INHERITED from the selection, which
+        # load_settings does not registry-check - coerce it like the CLI add
+        # path, or a junk DEEPSEAPORT_PROVIDER lands on every new account and
+        # no pool, login or ban check can ever match it. An explicitly picked id
+        # (multi mode below) is the operator's choice and stays verbatim.
+        try:
+            from .accounts import usable_provider as _usable
+
+            return _usable(single)
+        except Exception:
+            return (single or "deepseek").strip().lower() or "deepseek"
     # Multi: text choices only, deepseek shows its ds alias in brackets.
     parts: list[str] = []
     for pid in active:
@@ -618,10 +919,10 @@ def _preview_append(value: str, width: int = 30) -> str:
     lines = text.strip("\r\n").splitlines() or [text]
     first = lines[0].strip()
     if len(first) > width:
-        first = first[:width - 1] + "…"
+        first = first[:width - 1] + "â€¦"
     if len(lines) > 1:
         chars = len(text)
-        return f"{first or '…'} ({len(lines)} lines, {chars} chars)"
+        return f"{first or 'â€¦'} ({len(lines)} lines, {chars} chars)"
     return first or "(empty)"
 
 
@@ -636,14 +937,11 @@ def _edit_append_text(settings: Settings, attr: str, label: str) -> None:
     one backslash).
     """
     current = str(getattr(settings, attr, "") or "")
-    try:
-        is_tty = bool(sys.stdin.isatty())
-    except Exception:
-        is_tty = False
+    is_tty = _tui_editor._stdin_is_tty()
     print()
     if is_tty:
         if current.strip():
-            _info(f"{label} ({len(current.splitlines())} lines, {len(current)} chars — loaded below, edit away).")
+            _info(f"{label} ({len(current.splitlines())} lines, {len(current)} chars â€” loaded below, edit away).")
         else:
             _info(f"{label} (current: empty).")
     elif current.strip():
@@ -681,85 +979,112 @@ def settings_menu(settings: Settings) -> None:
     1-5 predate the dry-run toggle (6); toggles save immediately and
     multi-value options prompt for a new value.
     """
-    # Descriptor table: menu number -> zero-arg action. Numbers are stable
-    # API (tests drive "1".."19"); edit actions here, not the chain below.
-    def _actions() -> dict[str, Callable[[], None]]:
-        return {
-            "1": lambda: _toggle_bool(settings, "enable_tools", "Tool calling"),
-            "2": lambda: _toggle_bool(settings, "warmup_on_startup", "WAF warmup at startup"),
-            "3": lambda: _toggle_bool(settings, "auto_delete_session", "Delete session after reply"),
-            "4": lambda: _edit_retries(settings),
-            "5": lambda: _toggle_bool(settings, "parallel_challenge_fetch", "Parallel setup requests"),
-            "6": lambda: _toggle_bool(settings, "send_dry_run_to_frontend", "Send dry run to frontend"),
-            "7": lambda: _edit_choice(settings, "log_level", "Log level", VALID_LOG_LEVELS),
-            "8": lambda: _toggle_stream(settings),
-            "9": lambda: _toggle_bool(settings, "listen", "Allow LAN access"),
-            "10": lambda: _edit_port(settings),
-            "11": lambda: _edit_keys(settings),
-            "12": lambda: _edit_obscura_bin(settings),
-            "13": lambda: _edit_chat_model(settings),
-            "14": lambda: _toggle_bool(settings, "use_multiple_accounts", "Account failover"),
-            "15": lambda: _toggle_bool(settings, "enable_append", "Enable append"),
-            "16": lambda: _edit_append_text(settings, "append_top", "Append at top"),
-            "17": lambda: _edit_append_text(settings, "append_bottom", "Append at bottom"),
-            "18": lambda: _toggle_bool(settings, "forgiving_toolcalls", "More forgiving toolcalls"),
-            "19": lambda: _select_provider(settings),
-        }
-    _clear_screen()
-    while True:
-        _header(f"Settings ({settings.config_path or 'unsaved'})")
-
-        _section("Request handling")
-        _setting_line(1, "Tool calling", _on_off(settings.enable_tools))
-        _setting_line(2, "Warm up WAF at startup",
-                      _on_off(settings.warmup_on_startup))
-        _setting_line(3, "Delete session after reply",
-                      _on_off(settings.auto_delete_session))
-        _setting_line(4, "Retries per failed request", str(settings.max_retries))
-        _setting_line(5, "Parallel setup requests",
-                      _on_off(settings.parallel_challenge_fetch))
-        _setting_line(6, "Send dry run to frontend",
-                      _on_off(getattr(settings, "send_dry_run_to_frontend", True)))
-
-        _section("Chat & logs")
-        _setting_line(7, "Log level", str(settings.log_level))
-        _setting_line(8, "Reply streaming", str(settings.stream_mode))
-
-        _section("Server access")
-        _setting_line(9, "Allow LAN access", _on_off(settings.listen))
-        _setting_line(10, "Port", str(settings.port))
-        nkeys = len(getattr(settings, "keys", []) or [])
-        keys_disp = f"{nkeys} set" if nkeys else "none (open)"
-        _setting_line(11, "API keys", keys_disp)
-
-        _section("Setup & defaults")
+    # The 19 settings, declared ONCE. Both the draw below and the dispatch at
+    # the bottom of the loop read this one table, so a row cannot drift away
+    # from the key that runs it -- which is exactly what happened before, when
+    # setting 2 read "WAF warmup at startup" to the toggle and "Warm up WAF at
+    # startup" on screen. Numbers are stable API (tests drive "1".."19"), so an
+    # edit here is an edit to both at once; never renumber to insert one.
+    def _table() -> tuple[tuple[int, str, str, str, Callable[[], None]], ...]:
         obsc = (getattr(settings, "obscura_bin", "") or "").strip() or "(auto)"
         if len(obsc) > 30:
             obsc = "..." + obsc[-27:]
-        _setting_line(12, "Obscura binary", obsc)
-        _setting_line(13, "Chat model", str(settings.chat_model))
+        nkeys = len(getattr(settings, "keys", []) or [])
+        return (
+            (1, "Request handling", "Tool calling",
+             _on_off(settings.enable_tools),
+             lambda: _toggle_bool(settings, "enable_tools", "Tool calling")),
+            (2, "Request handling", "Warm up WAF at startup",
+             _on_off(settings.warmup_on_startup),
+             lambda: _toggle_bool(settings, "warmup_on_startup", "Warm up WAF at startup")),
+            (3, "Request handling", "Delete session after reply",
+             _on_off(settings.auto_delete_session),
+             lambda: _toggle_bool(settings, "auto_delete_session", "Delete session after reply")),
+            (4, "Request handling", "Retries per failed request",
+             str(settings.max_retries),
+             lambda: _edit_retries(settings)),
+            (5, "Request handling", "Parallel setup requests",
+             _on_off(settings.parallel_challenge_fetch),
+             lambda: _toggle_bool(settings, "parallel_challenge_fetch", "Parallel setup requests")),
+            (6, "Request handling", "Send dry run to frontend",
+             _on_off(getattr(settings, "send_dry_run_to_frontend", True)),
+             lambda: _toggle_bool(settings, "send_dry_run_to_frontend", "Send dry run to frontend")),
+            (7, "Chat & logs", "Log level", str(settings.log_level),
+             lambda: _edit_choice(settings, "log_level", "Log level", VALID_LOG_LEVELS)),
+            (8, "Chat & logs", "Reply streaming", str(settings.stream_mode),
+             lambda: _toggle_stream(settings)),
+            (9, "Server access", "Allow LAN access",
+             _on_off(settings.listen),
+             lambda: _toggle_bool(settings, "listen", "Allow LAN access")),
+            (10, "Server access", "Port", str(settings.port),
+             lambda: _edit_port(settings)),
+            (11, "Server access", "API keys",
+             f"{nkeys} set" if nkeys else "none (open)",
+             lambda: _edit_keys(settings)),
+            (12, "Setup & defaults", "Obscura binary", obsc,
+             lambda: _edit_obscura_bin(settings)),
+            (13, "Setup & defaults", "Chat model", str(settings.chat_model),
+             lambda: _edit_chat_model(settings)),
+            (14, "Accounts", "Account failover",
+             _on_off(getattr(settings, "use_multiple_accounts", True)),
+             lambda: _toggle_bool(settings, "use_multiple_accounts", "Account failover")),
+            (15, "Prompt", "Enable append",
+             _on_off(getattr(settings, "enable_append", True)),
+             lambda: _toggle_bool(settings, "enable_append", "Enable append")),
+            (16, "Prompt", "Append at top",
+             _preview_append(getattr(settings, "append_top", "")),
+             lambda: _edit_append_text(settings, "append_top", "Append at top")),
+            (17, "Prompt", "Append at bottom",
+             _preview_append(getattr(settings, "append_bottom", "")),
+             lambda: _edit_append_text(settings, "append_bottom", "Append at bottom")),
+            (18, "Tools", "More forgiving toolcalls",
+             _on_off(getattr(settings, "forgiving_toolcalls", False)),
+             lambda: _toggle_bool(settings, "forgiving_toolcalls", "More forgiving toolcalls")),
+            # Same string the main menu prints: a multi-provider setup must not
+            # read as single-provider on the one screen that changes the mode.
+            (19, "Provider", "Provider...", _provider_display(settings),
+             lambda: _select_provider(settings)),
+        )
 
-        _section("Accounts")
-        _setting_line(14, "Account failover",
-                      _on_off(getattr(settings, "use_multiple_accounts", True)))
+    _by_number = {str(n): act for n, _sec, _lbl, _val, act in _table()}
 
-        _section("Prompt")
-        _setting_line(15, "Enable append",
-                      _on_off(getattr(settings, "enable_append", True)))
-        _setting_line(16, "Append at top",
-                      _preview_append(getattr(settings, "append_top", "")))
-        _setting_line(17, "Append at bottom",
-                      _preview_append(getattr(settings, "append_bottom", "")))
+    # Message from the previous rejected digit, redrawn above Select: -- the
+    # loop clears before every redraw, so without this the reason a mistyped
+    # digit was refused would be wiped by the very redraw that asks again.
+    _pending = ""
 
-        _section("Tools")
-        _setting_line(18, "More forgiving toolcalls",
-                      _on_off(getattr(settings, "forgiving_toolcalls", False)))
+    def _group(title: str) -> None:
+        """Section header, dropped in the compact redraw (see compact below)."""
+        if not compact:
+            _section(title)
 
-        _section("Provider")
-        _setting_line(19, "Provider...", str(getattr(settings, "provider", "deepseek") or "deepseek"))
+    while True:
+        # The grouped screen below is 42 rows (see _GROUPED_SETTINGS_ROWS). On
+        # a 24-row console that puts Select: below the fold on the FIRST draw,
+        # and with no clear every rejected digit stacks another full copy
+        # underneath. Compact form (title + the 19 items + Back) fits 24 rows
+        # with the prompt visible. Only on a real console: piped output keeps
+        # the grouped screen.
+        _clear_screen()
+        compact = _stdout_is_tty() and _term_size()[1] < _GROUPED_SETTINGS_ROWS
+        if compact:
+            _info(f"=== Settings ({settings.config_path or 'unsaved'}) ===")
+        else:
+            _header(f"Settings ({settings.config_path or 'unsaved'})")
 
-        print()
+        _section_name = None
+        for num, section, label, value, _action in _table():
+            if section != _section_name:
+                _group(section)
+                _section_name = section
+            _setting_line(num, label, value)
+
+        if not compact:
+            print()
         print("  20. Back (q)")
+        if _pending:
+            _err(_pending)
+            _pending = ""
         print()
         try:
             choice = input("Select: ").strip().lower()
@@ -768,14 +1093,14 @@ def settings_menu(settings: Settings) -> None:
             return
         if choice in ("20", "b", "back", "q", "quit", ""):
             return
-        if choice not in {str(i) for i in range(1, 20)}:
-            _err("Unknown option: type 1-19, or q.")
+        if choice not in _by_number:
+            _pending = "Unknown option: type 1-19, or q."
             continue
         # Clear the menu before prompting so repeated edits do not stack
         # multiple copies of the settings screen in the terminal.
         _clear_screen()
         try:
-            _actions()[choice]()
+            _by_number[choice]()
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -801,10 +1126,71 @@ def accounts_menu(settings: Settings) -> None:
             settings.save()
         return pool
 
+    def _row_cfg(row_index: int):
+        """settings.accounts entry for a visible 1-based row number, else None.
+
+        The row list is provider-scoped (_vis_idx), so the screen number is
+        NOT a settings index. Two providers may also hold the same email, and
+        every accounts helper (_matches, pool.remove, set_account_token)
+        resolves by identifier and takes the FIRST hit -- so row 2 of
+        [a@x.com deepseek, a@x.com qwen] addressed by email would delete the
+        DeepSeek account while the user confirmed the Qwen one.
+        """
+        real = _vis_idx[row_index]
+        if 0 <= real < len(settings.accounts):
+            return settings.accounts[real]
+        return None
+
+    def _drop_cfg(cfg) -> bool:
+        """Delete exactly this AccountConfig (identity, not identifier).
+
+        Falls back to the identifier APIs only when no row was resolved, so
+        typing a literal email/mobile/token keeps working. CURRENT is cleared
+        only when no remaining account can satisfy it -- with a shared email
+        the surviving provider must keep the selection.
+        """
+        from .accounts import _matches as _m
+
+        dropped = False
+        with pool._guard:
+            for i, item in enumerate(pool._items):
+                if item.cfg is cfg:
+                    del pool._items[i]
+                    dropped = True
+                    break
+        kept = [a for a in settings.accounts if a is not cfg]
+        if len(kept) != len(settings.accounts):
+            settings.accounts = kept
+            dropped = True
+        if not dropped:
+            return False
+        if settings.active_account and not any(
+                _m(a, settings.active_account) for a in settings.accounts):
+            settings.active_account = ""
+        return True
+
+    def _label_of(cfg) -> str:
+        return f"{cfg.identifier} [{getattr(cfg, 'provider', '') or 'deepseek'}]"
+
     def _offer_auto_login(email: str, password: str, confirmed: bool = False,
-                          provider: str | None = None) -> str:
-        """Run Obscura login inside TUI. confirmed=True skips the Y/n prompt."""
+                          provider: str | None = None
+                          ) -> tuple[str, bool, float]:
+        """Run the provider login inside the TUI. confirmed=True skips the Y/n prompt.
+
+        Returns ``(token, banned, banned_until)`` and deliberately does NOT
+        touch settings.accounts: the caller owns the concrete AccountConfig
+        it is about to write (a fresh one on the add path, an existing one on
+        the set-token path) and is the only place that can apply the ban
+        state unambiguously. The old version re-scanned settings.accounts by
+        email to set banned/banned_until, which matched NOTHING on the add
+        path (the config is not appended yet) and matched the WRONG provider
+        when two providers share an email.
+        """
         from .accounts import token_help_for as _token_help_for
+        # Shared membership rule with cli.cmd_login's --provider, imported here
+        # because tui.py must not gain cli module attributes (tests/test_tui_gaps).
+        from .cli import _unknown_provider_exit
+        from .cli import provider_is_registered as _login_provider_known
         # Shared login-pid resolution (cli.resolve_login_provider_id): explicit
         # provider wins, else the selected single-mode provider, else deepseek.
         if provider:
@@ -821,30 +1207,48 @@ def accounts_menu(settings: Settings) -> None:
                 _pid = "deepseek"
             _pid = (str(_pid or "deepseek").strip().lower()) or "deepseek"
         _help = _token_help_for(_pid)
+        # Prompt/login wording follows the resolved provider: "DeepSeek
+        # password" while driving a Qwen signin is a copy-paste bug, and
+        # "Running Obscura login (browser, ~30s)" is a lie for the providers
+        # whose login is a direct API POST with no browser at all.
+        _label = _provider_label(_pid)
+        # Same membership rule as cli.cmd_login's --provider, same reason: an id
+        # the registry does not know used to fall through to the DeepSeek
+        # Obscura driver, so the banner below promised a Qwen-shaped "direct API
+        # signin, ~5s" while a ~30s DeepSeek browser opened, and the resulting
+        # userToken was then stored under the unknown label -- an account no UI
+        # lists and no request can use. The TUI cannot exit 2, so this is the
+        # in-app equivalent already used everywhere else in this function: the
+        # same refusal text, the token help, and the empty-token return the
+        # caller reads as "no login happened". The menu stays alive.
+        # deepseek is exempt: its login is the direct browser path, not a
+        # registry entry point.
+        if _pid != "deepseek" and not _login_provider_known(_pid):
+            _unknown_provider_exit(_pid)
+            print(_help)
+            return "", False, 0.0
         if not email:
-            return ""
+            return "", False, 0.0
         if not confirmed:
             try:
-                ans = input("No token. Run auto-login via Obscura now? [Y/n]: ").strip().lower()
+                ans = input(f"No token. Run auto-login via {_label} now? [Y/n]: ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print()
-                return ""
+                return "", False, 0.0
             if ans not in ("", "y", "yes"):
                 print()
                 print(_help)
-                return ""
+                return "", False, 0.0
         if not password:
-            try:
-                import getpass
-                password = getpass.getpass("DeepSeek password (Enter=skip): ")
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return ""
+            # _ask_password, not a bare getpass: that one has no fallback for a
+            # stdin it cannot read, and the resulting exception escaped the
+            # whole accounts menu instead of offering TOKEN_HELP.
+            password = _ask_password(f"{_label} password (Enter=skip)")
         if not password:
             _err("Auto-login needs password. Cancelled.")
             print()
             print(_help)
-            return ""
+            return "", False, 0.0
 
         def _registry_login():
             """Non-DeepSeek login via registry.get(pid).login; None = use shim."""
@@ -877,67 +1281,59 @@ def accounts_menu(settings: Settings) -> None:
                 print(_help)
                 return (None, False, "__handled__")
 
-        _info("Running Obscura login (browser, ~30s)...")
+        _info(_login_banner(_pid))
         try:
             _reg_result = _registry_login()
             if _reg_result is not None:
                 if len(_reg_result) == 3 and _reg_result[2] == "__handled__":
-                    return ""
+                    return "", False, 0.0
                 token, login_banned, ban_detail = _reg_result
             else:
-                from .auth import obscura_login_token as _login_token
-                from .auth import unpack_login_result as _unpack_login
+                from .providers.deepseek.auth import obscura_login_token as _login_token
+                from .providers.deepseek.auth import unpack_login_result as _unpack_login
                 token, login_banned, ban_detail = _unpack_login(
                     _login_token(email, password, settings))
         except Exception as exc:
             _err(f"Auto-login failed: {exc}")
             print()
             print(_help)
-            return ""
+            return "", False, 0.0
+        _until = 0.0
         if login_banned:
+            try:
+                from .providers.deepseek.auth import parse_ban_until
+                _until = float(parse_ban_until(ban_detail) or 0.0)
+            except Exception:
+                _until = 0.0
             if token:
-                try:
-                    from .auth import parse_ban_until
-                    from .accounts import _matches as _m
-                    until = parse_ban_until(ban_detail)
-                    for a in settings.accounts:
-                        if _m(a, email):
-                            a.banned = True
-                            a.banned_until = float(until or 0.0)
-                except Exception:
-                    pass
                 _err(f"Auto-login captured a token for {email}, "
                      "but the account is BANNED. Token saved; Account "
                      "list will show the ban.")
                 if ban_detail:
                     print(f"Evidence: {ban_detail[:300]}")
-                return token
+                return token, True, _until
             _err(f"Auto-login refused for {email}: account BANNED per login page.")
             if ban_detail:
                 print(f"Evidence: {ban_detail[:300]}")
-            return ""
+            return "", False, 0.0
         if not token:
-            return ""
+            return "", False, 0.0
         _ok(f"Auto-login ok for {email}")
-        return token
+        return token, False, 0.0
 
     _clear_screen()
+    # Message from the last rejected action, redrawn above Select: (see the
+    # settings loop): the screen is redrawn from scratch every iteration, so a
+    # reason printed under the old copy is gone by the time the user could
+    # read it.
+    _pending = ""
     while True:
         pool = _pool()
         # Provider-scoped view: single-provider shows only its own accounts,
         # multi shows everything. Numbers below always refer to this view.
-        try:
-            from .core import pools as _pools_v
-            _active_ids = list(_pools_v.active_provider_ids(settings))
-            _is_multi_v = len(_active_ids) > 1
-            _single_v = ("" if _is_multi_v else
-                         (_pools_v.selected_provider(settings) or "deepseek").strip().lower()
-                         or "deepseek")
-        except Exception:
-            _active_ids = [(getattr(settings, "provider", "") or "deepseek").strip().lower()
-                           or "deepseek"]
-            _is_multi_v = False
-            _single_v = _active_ids[0]
+        _active_ids, _is_multi_v, _single_v = _provider_scope(settings)
+        if _is_multi_v:
+            _single_v = ""
         try:
             from .core.pools import _provider_of as _prov_of_v
             _all_provs = [_prov_of_v(a) for a in settings.accounts]
@@ -975,7 +1371,7 @@ def accounts_menu(settings: Settings) -> None:
             from .accounts import (ban_label_for as _ban_lookup,
                                    get_cached_ban_labels as _ban_cached,
                                    refresh_ban_labels_background as _ban_refresh)
-            from . import protocol as _P
+            from .providers.deepseek import protocol as _P
             ban_map = _ban_cached(_visible_accounts) or {}
             try:
                 _ban_refresh(_visible_accounts)
@@ -992,37 +1388,107 @@ def accounts_menu(settings: Settings) -> None:
         if rows:
             id_width = max([len("Identifier")] + [len(r["identifier"]) for r in rows])
             id_width = min(id_width, 32)
-            print(f"    {'#':<2} {'Identifier':<{id_width}}  {'Uses':<4} {'Token':<7} {'Busy':<4} {'Cool':<6} {'Cur'}")
-            print(f"    {'--':<2} {'-' * id_width}  {'----':<4} {'-----':<7} {'----':<4} {'----':<6} {'---'}")
-            # _row_provs already scoped to the visible rows above.
+            # Render every row first, then size the one elastic column. 80 is
+            # the Windows console default and the widest thing on screen is
+            # fixed (mark + ban date + provider tag), so the identifier column
+            # is what has to give -- but not below 16, because two accounts
+            # that render the same are worse than one long row that wraps.
+            #
+            # The [provider] tag is dropped in single-provider mode, where the
+            # "Provider scope:" line above already names it and the tag is
+            # pure repetition. In multi mode it is the only thing telling two
+            # same-email accounts apart, so it is never dropped.
+            _now = time.time()
+            prepared = []
             for i, row in enumerate(rows, 1):
                 mark = "*" if row.get("current") else ""
                 has = _has_token(settings, row["identifier"])
                 ident = row["identifier"]
-                if len(ident) > 32:
-                    ident = ident[:29] + "..."
                 busy = "busy" if row.get("busy") else "-"
                 try:
                     cool = float(row.get("cooldown_remaining", 0) or 0)
                 except (TypeError, ValueError):
                     cool = 0
-                cool_s = f"{cool:.0f}s" if cool > 0 else "-"
+                # Human-scale, and the Token cell carries the expiry the
+                # provider login already wrote down: a Qwen JWT known to be
+                # expired still rendered "Token: yes" and only failed as a 401
+                # at request time. Fits the 7-wide cell ("expired", "yes 12d").
+                _cfg = _row_cfg(i - 1)
+                tok, tok_code = ("yes", "")
+                if not has:
+                    tok = "missing"
+                else:
+                    try:
+                        _exp = float(getattr(_cfg, "token_expires_at", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        _exp = 0.0
+                    if _exp and _exp <= _now:
+                        tok, tok_code = "expired", "31"
+                    elif _exp:
+                        # Only near expiries are worth a hint, and the day
+                        # count is capped so the 7-wide cell never grows.
+                        _days = round((_exp - _now) / 86400)
+                        if 0 < _days <= 99:
+                            tok = f"yes {_days}d"
                 # Red ban suffix: "(BANNED: 16 September)" from mute_until.
-                ban_suffix = ""
+                # Kept uncolored too: the column budget below is measured in
+                # VISIBLE columns, and the ANSI escapes take none of them.
+                ban_plain, ban_suffix = "", ""
                 try:
                     _found, _until = (_ban_lookup(ban_map, row["identifier"])
                                       if _ban_lookup else (False, None))
                     if _found and _P is not None:
+                        ban_plain = " " + _P.format_ban_label(_until)
                         ban_suffix = " " + _c(_P.format_ban_label(_until), "31")
                     elif _found:
-                        ban_suffix = " (BANNED)"
+                        ban_plain = ban_suffix = " (BANNED)"
                 except Exception:
-                    ban_suffix = ""
+                    ban_plain = ban_suffix = ""
                 _prov = _row_provs[i - 1] if 0 < i <= len(_row_provs) else "deepseek"
-                print(f"    {i:<2} {ident:<{id_width}}  {row['uses']:<4} "
-                      f"{'yes' if has else 'missing':<7} {busy:<4} {cool_s:<6} {mark}{ban_suffix} [{_prov}]")
-        else:
+                tag = f" [{_prov}]" if _is_multi_v else ""
+                prepared.append({
+                    "n": i, "ident": ident, "uses": row.get("uses", 0),
+                    "tok": tok, "code": tok_code, "busy": busy, "cool": cool,
+                    "tag": tag, "tail": mark + ban_suffix,
+                    # Worst-case row width outside the identifier column.
+                    "w": len(mark) + len(ban_plain) + len(tag),
+                })
+            # Everything the row format prints except the identifier and the
+            # tail: 4 indent + 2-wide row number + 7 separator columns + the
+            # Uses/Token/Busy/Cool cells (Uses grows with a 5-digit count).
+            _uses_w = max([4] + [len(str(p["uses"])) for p in prepared])
+            _fixed = 4 + 2 + 7 + _uses_w + 7 + 4 + 6
+            widest = max(p["w"] for p in prepared)
+            budget = _term_size()[0] - _fixed - widest
+            # Wide enough to tell every row from every other: one column past
+            # the longest prefix two identifiers share, plus the marker. Below
+            # that two rows are identical and the table says nothing. It only
+            # bites for long AND similar addresses (a plus-addressed pair on
+            # one domain), and it is capped by the 32-column preference.
+            need = _longest_shared_prefix([p["ident"] for p in prepared]) + 4
+            # The floor is 16: below that even distinct short addresses get
+            # mangled, and a wrapped row is recoverable while that is not. A
+            # 20-column ban date plus a multi-provider tag can still push such
+            # a row a few columns past the width on purpose -- the date and
+            # the tag are the information here, the width is only the budget.
+            id_width = max(16, min(id_width, budget), min(need, 32))
+            idents = _elide_ids([p["ident"] for p in prepared], id_width)
+            print(f"    {'#':<2} {'Identifier':<{id_width}}  {'Uses':<4} {'Token':<7} {'Busy':<4} {'Cool':<6} {'Cur'}")
+            print(f"    {'--':<2} {'-' * id_width}  {'----':<4} {'-----':<7} {'----':<4} {'----':<6} {'---'}")
+            for p, ident in zip(prepared, idents):
+                cool_s = _fmt_duration(p["cool"]) if p["cool"] > 0 else "-"
+                print(f"    {p['n']:<2} {ident:<{id_width}}  {p['uses']:<4} "
+                      f"{_pad_colored(p['tok'], 7, p['code'])} {p['busy']:<4} "
+                      f"{cool_s:<6} {p['tail']}{p['tag']}")
+        elif _active_providers_need_accounts(settings):
             _info("(no accounts yet -- use 'a' to add one)")
+        else:
+            # Accountless provider (opencode CLI): there is no pool to fill and
+            # its login() raises, so "add one" is advice that cannot be taken.
+            _info("(no accounts -- this provider needs none; Start server works)")
+        if _pending:
+            _err(_pending)
+            _pending = ""
         print()
         _info("number = select account (never deletes)")
         print()
@@ -1070,17 +1536,26 @@ def accounts_menu(settings: Settings) -> None:
             try:
                 email = _ask("Email (Enter=skip)", default="")
                 password = _ask_password("Password (Enter=skip)")
-                raw_token = _ask("Token (y = auto-token)", default="")
+                # Hidden like the password above it: a pasted userToken is a
+                # bearer credential, and input() put it in the scrollback.
+                raw_token = _ask_secret("Token (y = auto-token)")
             except (EOFError, KeyboardInterrupt):
                 print()
                 return
             if raw_token.strip().lower() in ("y", "yes"):
-                token = _offer_auto_login(email, password, confirmed=True,
-                                          provider=new_provider)
+                token, login_banned, banned_until = _offer_auto_login(
+                    email, password, confirmed=True, provider=new_provider)
             else:
-                token = extract_token(raw_token)
+                token, login_banned, banned_until = extract_token(raw_token), False, 0.0
+            # The ban state has to be built into the config that is actually
+            # appended: _offer_auto_login used to set banned/banned_until by
+            # scanning settings.accounts for the email, which on this path
+            # matched nothing (the account does not exist yet), so the list
+            # said "Token saved; Account list will show the ban" while the
+            # saved account kept banned=False.
             cfg = AccountConfig(email=email, password=password, token=token,
-                                provider=new_provider)
+                                provider=new_provider, banned=login_banned,
+                                banned_until=banned_until)
             try:
                 from .accounts import add_account as _add
                 _add(settings, pool, cfg)
@@ -1098,8 +1573,9 @@ def accounts_menu(settings: Settings) -> None:
             _clear_screen()
             print()
             try:
-                ident = _ask("Account email", default="")
-                token = _ask("New token value (Enter=skip = auto-login offer)", default="")
+                ident = _ask("Account email or row number", default="")
+                # Hidden for the same reason as the add form's token field.
+                token = _ask_secret("New token value (Enter=skip = auto-login offer)")
             except (EOFError, KeyboardInterrupt):
                 print()
                 return
@@ -1107,28 +1583,48 @@ def accounts_menu(settings: Settings) -> None:
             if not ident:
                 _info("Cancelled.")
                 continue
+            # A row number addresses the concrete account; a typed identifier
+            # keeps the by-identifier path (and its first-match caveat).
+            target = None
+            if ident.isdigit():
+                idx = int(ident) - 1
+                if not 0 <= idx < len(rows):
+                    _pending = "Out of range, nothing changed."
+                    continue
+                target = _row_cfg(idx)
+                ident = rows[idx]["identifier"]
             if not token:
                 from .accounts import _matches as _m
-                existing = next((a for a in settings.accounts if _m(a, ident)), None)
+                existing = (target if target is not None else
+                            next((a for a in settings.accounts if _m(a, ident)), None))
                 if existing is None:
-                    _err(f"Not found: {ident}")
+                    _pending = f"Not found: {ident}"
                     continue
                 try:
                     _exist_prov = (getattr(existing, "provider", "deepseek")
                                    or "deepseek")
                 except Exception:
                     _exist_prov = "deepseek"
-                token = _offer_auto_login(existing.email, existing.password,
-                                          provider=_exist_prov)
+                token, login_banned, banned_until = _offer_auto_login(
+                    existing.email, existing.password, provider=_exist_prov)
                 if not token:
                     continue
-            from .accounts import set_account_token as _set
-            matched = _set(settings, ident, token)
+                if login_banned:
+                    # Apply to THIS object: a by-email rescan would flag the
+                    # same address under the other provider.
+                    existing.banned = True
+                    existing.banned_until = banned_until
+            if target is not None:
+                target.token = token  # __setattr__ re-normalizes the value
+                matched = target
+            else:
+                from .accounts import set_account_token as _set
+                matched = _set(settings, ident, token)
             if matched is not None:
                 settings.save()
-                _ok(f"Token updated for {matched.identifier} (saved)")
+                _ok(f"Token updated for {_label_of(matched)} (saved)")
             else:
-                _err(f"Not found: {ident}")
+                _pending = f"Not found: {ident}"
             continue
         if choice == "d":
             _clear_screen()
@@ -1143,35 +1639,52 @@ def accounts_menu(settings: Settings) -> None:
                 continue
             # Allow number for delete, but ONLY inside explicit d flow.
             # Numbers refer to the provider-scoped view above.
-            rows_now = rows
+            target = None
             if ident.isdigit():
                 idx = int(ident) - 1
-                if 0 <= idx < len(rows_now):
-                    ident = rows_now[idx]["identifier"]
-                else:
-                    _err("Out of range, nothing deleted.")
+                if not 0 <= idx < len(rows):
+                    _pending = "Out of range, nothing deleted."
                     continue
+                target = _row_cfg(idx)
+                ident = rows[idx]["identifier"]
+            # Name the provider in the prompt, outside the quotes and exactly
+            # as the row renders it: with a shared email the identifier alone
+            # cannot tell the user which account is about to be destroyed.
+            if target is not None:
+                name = target.identifier
+                prov = getattr(target, "provider", "") or "deepseek"
+            else:
+                name, prov = ident, ""
             try:
-                confirm = input(f"Delete '{ident}'? Type y to confirm: ").strip().lower()
+                confirm = input(f"Delete '{name}'"
+                                + (f" [{prov}]" if prov else "")
+                                + "? Type y to confirm: ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print()
                 continue
             if confirm not in ("y", "yes"):
                 _info("Cancelled (nothing deleted).")
                 continue
-            if not pool.remove(ident):
-                _err(f"Not found: {ident} (nothing deleted)")
-                continue
-            from .accounts import remove_account as _remove
-            _remove(settings, ident)
+            shown = f"{name} [{prov}]" if prov else name
+            if target is not None:
+                if not _drop_cfg(target):
+                    _pending = f"Not found: {shown} (nothing deleted)"
+                    continue
+            else:
+                # Typed identifier: legacy by-identifier path, kept working.
+                if not pool.remove(ident):
+                    _pending = f"Not found: {ident} (nothing deleted)"
+                    continue
+                from .accounts import remove_account as _remove
+                _remove(settings, ident)
             settings.save()
-            _ok(f"Removed {ident} (saved)")
+            _ok(f"Removed {shown} (saved)")
             continue
         # Number = SELECT, never delete.
         try:
             idx = int(choice) - 1
         except ValueError:
-            _err("Unknown option. Number selects, d deletes.")
+            _pending = "Unknown option. Number selects, d deletes."
             continue
         _clear_screen()
         rows_now = rows
@@ -1182,9 +1695,9 @@ def accounts_menu(settings: Settings) -> None:
                 settings.save()
                 _ok(f"Current -> [{ident}] (saved). Failover to others on cooldown.")
             else:
-                _err(f"Select failed: {ident}")
+                _pending = f"Select failed: {ident}"
         else:
-            _err("Out of range.")
+            _pending = "Out of range."
 
 
 def _preflight_reason(settings: Settings) -> str:
@@ -1196,16 +1709,15 @@ def _preflight_reason(settings: Settings) -> str:
     """
     try:
         from .core import pools as _pools
-        from .core import registry as _reg
 
-        _ids = _pools.active_provider_ids(settings)
-        _need = [pid for pid in _ids
-                 if getattr(_reg.get(pid), "requires_accounts", True)]
-        if _ids and not _need:
+        if _pools.only_accountless_providers(settings):
             # Only local (accountless) providers active (opencode CLI):
             # nothing to provision, serve can start.
             return ""
-        _accts = [a for _pid in (_need or _ids)
+        # Scope to the account-needing providers only. `providers` is empty
+        # when the registry could not answer, in which case every id counts.
+        _accts = [a for _pid in (_pools.providers_requiring_accounts(settings)
+                                 or _pools.active_provider_ids(settings))
                   for a in _pools.accounts_for_provider(settings, _pid)]
     except Exception:
         _accts = settings.accounts
@@ -1218,15 +1730,123 @@ def _preflight_reason(settings: Settings) -> str:
 
 
 def _refresh_from_disk(settings: Settings) -> None:
-    """Pick up account/config changes made via API while serving."""
+    """Pick up account/config changes made via API while serving. Non-destructive.
+
+    load_settings() swallows a JSON error and returns accounts=[], so trusting
+    it blindly is data loss: a transiently truncated config.json (the Windows
+    non-atomic save fallback, an editor mid-write, a crashed writer) would
+    replace the in-memory accounts with [] and the very next settings.save()
+    from any toggle / key add / port change would persist "accounts": [],
+    destroying every email, password and token. So validate the file parses as
+    a JSON *object* BEFORE handing it to load_settings(); a missing file is a
+    no-op and a broken one keeps memory and says so loudly.
+    """
+    path = getattr(settings, "config_path", "")
+    if not path:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return  # Never saved yet (or deleted): nothing to pick up.
+    except (OSError, ValueError) as exc:
+        # ValueError covers json.JSONDecodeError (truncated/half-written file).
+        _err(f"Config not valid JSON ({exc}); keeping in-memory settings "
+             f"and NOT overwriting {path}. Fix or delete the file by hand.")
+        return
+    if not isinstance(raw, dict):
+        _err(f"Config is {type(raw).__name__}, not a JSON object; keeping "
+             f"in-memory settings and NOT overwriting {path}.")
+        return
     try:
         from .config import load_settings as _reload
-        if settings.config_path:
-            _fresh = _reload(settings.config_path)
-            settings.accounts = _fresh.accounts
-            settings.active_account = _fresh.active_account
-    except Exception:
-        pass
+
+        fresh = _reload(path)
+    except Exception as exc:
+        _err(f"Config reload failed ({exc}); keeping in-memory settings.")
+        return
+    settings.accounts = fresh.accounts
+    settings.active_account = fresh.active_account
+
+
+def _preflight_gate(settings: Settings) -> bool:
+    """True when serving may start; False when the user was sent to Accounts.
+
+    Single home for the gate that was copy-pasted into three main_menu
+    branches: print the reason, print TOKEN_HELP when it is about tokens,
+    then jump straight into accounts_menu so the fix is one step away.
+    accounts_menu swallows EOF/KeyboardInterrupt itself (it returns), so the
+    menu always continues afterwards.
+    """
+    reason = _preflight_reason(settings)
+    if not reason:
+        return True
+    print()
+    _err(reason)
+    if "token" in reason.lower():
+        from .accounts import TOKEN_HELP as _TH
+
+        print()
+        print(_TH)
+    accounts_menu(settings)
+    return False
+
+
+def _report_serve_exit(label: str, exc: SystemExit) -> None:
+    """Report a SystemExit from a serve path and hand control back to the menu.
+
+    uvicorn calls sys.exit(STARTUP_FAILURE) when bind() fails, and SystemExit
+    is a BaseException: the (EOFError, KeyboardInterrupt) handlers never saw
+    it, so a taken port (the port pre-check is TOCTOU) or any other startup
+    exit killed the whole TUI with no menu and no message. A clean
+    SystemExit(0) is a normal stop, not an error.
+    """
+    code = exc.code
+    if code in (0, None):
+        print()
+        _info(f"{label}, back to menu.")
+        return
+    print()
+    _err(f"{label} exited with code {code}. Port already in use, or the "
+         "provider failed to start -- fix it in Settings/Accounts, or pick "
+         "another port, then Start again.")
+
+
+def _run_mode(settings: Settings, runner: Callable[[Settings], object],
+              label: str, stopped: str, refresh: bool) -> None:
+    """Run one serve-style mode under the shared exit guard, then return.
+
+    Serve, chat, multi-server and dry run all end the same way: EOF or Ctrl+C
+    returns to the menu, a SystemExit is reported as a serve failure, and the
+    settings are re-read from disk so an edit made elsewhere shows up. That
+    guard was copied four times; it lives here once now.
+
+    `refresh=False` is deliberate for dry run: it writes nothing, so re-reading
+    the config would only discard in-memory edits.
+    """
+    try:
+        runner(settings)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        _info(stopped)
+    except SystemExit as exc:
+        _report_serve_exit(label, exc)
+    if refresh:
+        _refresh_from_disk(settings)
+
+
+def _multi_default(settings: Settings) -> object:
+    """`multi_fn` fallback: the caller wired no multi-server entry point."""
+    from .chat_ui import run_multi_chat_servers
+
+    return run_multi_chat_servers(settings)
+
+
+def _dry_default(settings: Settings) -> object:
+    """`dry_fn` fallback: the caller wired no dry-run entry point."""
+    from .dry_run import run_dry_run
+
+    return run_dry_run(settings)
 
 
 def main_menu(settings: Settings, serve_fn: Callable[[Settings], int],
@@ -1244,39 +1864,43 @@ def main_menu(settings: Settings, serve_fn: Callable[[Settings], int],
         _info(f"Port     : {settings.port}")
         _info(f"Reply    : {settings.stream_mode}  |  Tools: {_on_off(settings.enable_tools)}"
               f"  |  Failover: {_on_off(getattr(settings, 'use_multiple_accounts', True))}")
-        try:
-            from .core import pools as _pools
-
-            _active = list(_pools.active_provider_ids(settings))
-            _is_multi_mm = len(_active) > 1
-            if _is_multi_mm:
-                _scoped_accts = list(settings.accounts)
-                _cur_mm = (settings.active_account or "").strip() or "ALL"
-            else:
-                _single_mm = (_pools.selected_provider(settings) or "deepseek").strip().lower() or "deepseek"
-                _scoped_accts = _pools.accounts_for_provider(settings, _single_mm)
-                try:
-                    from .accounts import _matches as _m_mm
-                    _raw_mm = (settings.active_account or "").strip()
-                    if _raw_mm and any(_m_mm(a, _raw_mm) for a in _scoped_accts):
-                        _cur_mm = _raw_mm
-                    else:
-                        _cur_mm = "ALL"
-                except Exception:
-                    _cur_mm = (settings.active_account or "").strip() or "ALL"
-            _display = (" + ".join(_active) + " (multi)") if _is_multi_mm else (
-                _active[0] if _active else "deepseek")
-        except Exception:
-            _display = (getattr(settings, "provider", "") or "deepseek")
-            _scoped_accts = list(getattr(settings, "accounts", []) or [])
+        _active, _is_multi_mm, _single_mm = _provider_scope(settings)
+        if _is_multi_mm:
+            _scoped_accts = list(settings.accounts)
             _cur_mm = (settings.active_account or "").strip() or "ALL"
+        else:
+            try:
+                from .core import pools as _pools
+
+                _scoped_accts = _pools.accounts_for_provider(settings, _single_mm)
+            except Exception:
+                _scoped_accts = list(getattr(settings, "accounts", []) or [])
+            try:
+                from .accounts import _matches as _m_mm
+
+                _raw_mm = (settings.active_account or "").strip()
+                if _raw_mm and any(_m_mm(a, _raw_mm) for a in _scoped_accts):
+                    _cur_mm = _raw_mm
+                else:
+                    _cur_mm = "ALL"
+            except Exception:
+                _cur_mm = (settings.active_account or "").strip() or "ALL"
+        # One expression for the provider line, shared with Settings item 19
+        # (see _provider_display): multi mode used to be visible here and
+        # invisible on the screen that changes the mode.
         _info(f"Accounts : {len(_scoped_accts)}  |  Current: [{_cur_mm}]")
-        _info(f"Provider  : {_display}")
+        _info(f"Provider  : {_provider_display(settings)}")
         has_token = any((getattr(a, "token", "") or "").strip()
                         for a in _scoped_accts)
         if not _scoped_accts:
-            _info(f"Setup    : no accounts yet -> Accounts ({accounts_num}) to add one")
-        elif not has_token:
+            if _active_providers_need_accounts(settings):
+                _info(f"Setup    : no accounts yet -> Accounts ({accounts_num}) to add one")
+            else:
+                # Accountless provider (opencode CLI): _preflight_reason returns
+                # "" and Start server works, so pointing at Accounts sent the
+                # user to provision a credential nothing will ever read.
+                _info("Setup    : ready - this provider needs no accounts")
+        elif not has_token and _active_providers_need_accounts(settings):
             _info(f"Setup    : no account token -> Accounts ({accounts_num}) to refresh one")
         print()
         print("  1. Start server")
@@ -1298,89 +1922,46 @@ def main_menu(settings: Settings, serve_fn: Callable[[Settings], int],
             print()
             return 0
         if choice == "1":
-            reason = _preflight_reason(settings)
-            if reason:
-                print()
-                _err(reason)
-                if "token" in reason.lower():
-                    from .accounts import TOKEN_HELP as _TH
-                    print()
-                    print(_TH)
-                accounts_menu(settings)
+            if not _preflight_gate(settings):
                 continue
             print()
             _info("Server running. Press Ctrl+C or Esc to stop and return to menu.")
             print()
-            try:
-                serve_fn(settings)
-            except (EOFError, KeyboardInterrupt):
-                print()
-                _info("Server stopped, back to menu.")
-            _refresh_from_disk(settings)
+            _run_mode(settings, serve_fn, "Server",
+                     "Server stopped, back to menu.", True)
             continue
         if chat_fn is not None and choice == "2":
-            reason = _preflight_reason(settings)
-            if reason:
-                print()
-                _err(reason)
-                if "token" in reason.lower():
-                    from .accounts import TOKEN_HELP as _TH
-                    print()
-                    print(_TH)
-                accounts_menu(settings)
+            if not _preflight_gate(settings):
                 continue
-            try:
-                chat_fn(settings)
-            except (EOFError, KeyboardInterrupt):
-                print()
-                _info("Chat stopped, back to menu.")
-            _refresh_from_disk(settings)
+            _run_mode(settings, chat_fn, "Chat server",
+                      "Chat stopped, back to menu.", True)
             continue
         if chat_fn is not None and choice == "3":
-            reason = _preflight_reason(settings)
-            if reason:
-                print()
-                _err(reason)
-                if "token" in reason.lower():
-                    from .accounts import TOKEN_HELP as _TH
-                    print()
-                    print(_TH)
-                accounts_menu(settings)
+            if not _preflight_gate(settings):
                 continue
-            try:
-                if multi_fn is not None:
-                    multi_fn(settings)
-                else:
-                    from .chat_ui import run_multi_chat_servers as _multi
-                    _multi(settings)
-            except (EOFError, KeyboardInterrupt):
-                print()
-                _info("Multi-server stopped, back to menu.")
-            _refresh_from_disk(settings)
+            _run_mode(settings, multi_fn or _multi_default, "Multi-server",
+                      "Multi-server stopped, back to menu.", True)
             continue
         if choice == ("4" if chat_fn is not None else "2"):
-            settings_menu(settings)
+            # Guarded like the serve branches: an unexpected failure inside a
+            # submenu used to end the process with a traceback, taking the
+            # whole TUI down over one bad edit.
+            _run_submenu("Settings", settings_menu, settings)
             _clear_screen()
             continue
         if choice == ("5" if chat_fn is not None else "3"):
-            accounts_menu(settings)
+            _run_submenu("Accounts", accounts_menu, settings)
             _clear_screen()
             continue
         if choice == dry_num or choice in ("dry", "dry-run", "dryrun"):
             # No preflight: dry run needs no accounts, launches no browser,
-            # and never calls DeepSeek — it echoes the formatted prompt.
+            # and never calls DeepSeek â€” it echoes the formatted prompt.
             print()
             _info("Dry run. Press Ctrl+C or Esc to stop and return to menu.")
             print()
-            try:
-                if dry_fn is not None:
-                    dry_fn(settings)
-                else:
-                    from .dry_run import run_dry_run as _dry
-                    _dry(settings)
-            except (EOFError, KeyboardInterrupt):
-                print()
-                _info("Dry run stopped, back to menu.")
+            # refresh=False: dry run writes nothing (see _run_mode).
+            _run_mode(settings, dry_fn or _dry_default, "Dry run",
+                      "Dry run stopped, back to menu.", False)
             continue
         if choice in ("q", "quit", "0", "exit"):
             return 0

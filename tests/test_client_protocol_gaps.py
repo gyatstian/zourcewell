@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from deepseaport import protocol as P
-from deepseaport import pow as PoW
+from deepseaport.providers.deepseek import protocol as P
+from deepseaport.providers.deepseek import pow as PoW
 
 
 _MUTE_TS = 1789555791.11
@@ -63,7 +63,7 @@ class _FakeResp:
 
 
 def _sess(monkeypatch, *, get=None, get_exc=None, post=None, post_exc=None):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     attrs = {}
     if get_exc is not None:
@@ -85,7 +85,7 @@ def _sess(monkeypatch, *, get=None, get_exc=None, post=None, post_exc=None):
 
 
 def test_biz_error_non_ban_passthrough():
-    from deepseaport.client import _biz_error
+    from deepseaport.providers.deepseek.client import _biz_error
 
     err = _biz_error({"code": 40003, "msg": "Auth failed", "data": None})
     assert err == ("40003", "Auth failed")
@@ -95,7 +95,7 @@ def test_biz_error_non_ban_passthrough():
 
 
 def test_biz_error_code_zero_none():
-    from deepseaport.client import _biz_error
+    from deepseaport.providers.deepseek.client import _biz_error
 
     assert _biz_error({"code": 0, "msg": "", "data": None}) is None
     assert _biz_error({"code": "0", "msg": "x", "data": None}) is None
@@ -111,7 +111,7 @@ def test_biz_error_code_zero_none():
 
 
 def test_fetch_current_user_returns_envelope(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     resp = _FakeResp(200, json_data=dict(_VALID_USER))
     _sess(monkeypatch, get=resp)
@@ -119,7 +119,7 @@ def test_fetch_current_user_returns_envelope(monkeypatch):
 
 
 def test_check_ban_top_level_40003(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     resp = _FakeResp(200, json_data={"code": 40003, "msg": "Auth failed", "data": None})
     _sess(monkeypatch, get=resp)
@@ -127,7 +127,7 @@ def test_check_ban_top_level_40003(monkeypatch):
 
 
 def test_check_ban_inner_biz_code_40003(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     data = {"code": 0, "msg": "",
             "data": {"biz_code": 40003, "biz_msg": "invalid", "biz_data": {}}}
@@ -136,7 +136,7 @@ def test_check_ban_inner_biz_code_40003(monkeypatch):
 
 
 def test_check_ban_ban_payload(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     _sess(monkeypatch, get=_FakeResp(200, json_data=dict(_BAN_COMPLETION)))
     banned, ts = C.check_ban({"h": "1"})
@@ -145,14 +145,14 @@ def test_check_ban_ban_payload(monkeypatch):
 
 
 def test_check_ban_explicit_non_muted(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     _sess(monkeypatch, get=_FakeResp(200, json_data=dict(_VALID_USER)))
     assert C.check_ban({"h": "1"}) == (False, None)
 
 
 def test_check_ban_exception(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     _sess(monkeypatch, get_exc=RuntimeError("net down"))
     assert C.check_ban({"h": "1"}) == (False, None)
@@ -162,7 +162,7 @@ def test_check_ban_exception(monkeypatch):
 
 
 def test_create_session_biz_error_raises(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     body = json.dumps(_BAN_COMPLETION)
     resp = _FakeResp(200, text=body, json_data=dict(_BAN_COMPLETION))
@@ -172,7 +172,7 @@ def test_create_session_biz_error_raises(monkeypatch):
 
 
 def test_create_session_no_id_raises(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     data = {"code": 0, "msg": "", "data": {"biz_code": 0, "biz_msg": "", "biz_data": {}}}
     resp = _FakeResp(200, text=json.dumps(data), json_data=data)
@@ -182,14 +182,14 @@ def test_create_session_no_id_raises(monkeypatch):
 
 
 def test_delete_session_swallows_exception(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     _sess(monkeypatch, post_exc=RuntimeError("net down"))
     C.delete_session({"h": "1"}, "sess-1")  # must not raise
 
 
 def test_fetch_pow_biz_error_raises(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     data = {"code": 0, "msg": "",
             "data": {"biz_code": "POW_HEADER_ERROR", "biz_msg": "bad pow"}}
@@ -200,7 +200,7 @@ def test_fetch_pow_biz_error_raises(monkeypatch):
 
 
 def test_fetch_pow_bad_shape_raises(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     data = {"code": 0, "msg": "", "data": {"biz_code": 0, "biz_msg": "", "biz_data": {}}}
     resp = _FakeResp(200, text=json.dumps(data), json_data=data)
@@ -219,7 +219,7 @@ def _challenge() -> dict:
 
 
 def test_solve_challenge_none_raises(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     monkeypatch.setattr(C.PoW, "solve", lambda *a, **k: None)
     with pytest.raises(RuntimeError, match="no answer"):
@@ -227,7 +227,7 @@ def test_solve_challenge_none_raises(monkeypatch):
 
 
 def test_solve_challenge_success(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     monkeypatch.setattr(C.PoW, "solve", lambda *a, **k: 42)
     monkeypatch.setattr(C.PoW, "build_header", lambda ch: f"hdr-{ch['answer']}")
@@ -240,7 +240,7 @@ def test_solve_challenge_success(monkeypatch):
 
 
 def test_ban_stream_event_without_biz_code():
-    from deepseaport.client import _ban_stream_event
+    from deepseaport.providers.deepseek.client import _ban_stream_event
 
     ev = _ban_stream_event(dict(_BAN_NO_CODE))
     assert ev is not None and ev.kind == "error"
@@ -250,7 +250,7 @@ def test_ban_stream_event_without_biz_code():
 
 
 def test_ban_stream_event_non_ban_none():
-    from deepseaport.client import _ban_stream_event
+    from deepseaport.providers.deepseek.client import _ban_stream_event
 
     assert _ban_stream_event(dict(_VALID_USER)) is None
     assert _ban_stream_event({"code": 0, "data": None}) is None
@@ -261,7 +261,7 @@ def test_ban_stream_event_non_ban_none():
 
 
 def test_stream_completion_200_json_ban(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     resp = _FakeResp(200, content_type="application/json",
                      json_data=dict(_BAN_COMPLETION), lines=[])
@@ -273,7 +273,7 @@ def test_stream_completion_200_json_ban(monkeypatch):
 
 
 def test_stream_completion_200_empty_falls_through(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     resp = _FakeResp(200, text="", content_type="application/json",
                      lines=[], json_raises=True)
@@ -283,7 +283,7 @@ def test_stream_completion_200_empty_falls_through(monkeypatch):
 
 
 def test_stream_completion_403_waf(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     resp = _FakeResp(403, text="blocked", content_type="text/html", lines=[])
     _sess(monkeypatch, post=resp)
@@ -293,8 +293,44 @@ def test_stream_completion_403_waf(monkeypatch):
     assert "blocked" in events[0].message
 
 
+# transport.http_error_code: the 403 meaning is per-provider and injectable ---
+
+
+def test_http_error_code_default_is_deepseek_waf():
+    from deepseaport.core import transport as T
+
+    # 1-arg call unchanged: DeepSeek's 403 is always the AWS-WAF challenge.
+    assert T.http_error_code(403) == "HTTP_403_WAF"
+    assert T.http_error_code(500) == "HTTP_500"
+    assert T.http_error_code(422) == "HTTP_422"
+    assert T.http_error_code("403") == "HTTP_403_WAF"
+    assert T.http_error_code(None) == "HTTP_None"
+
+
+def test_http_error_code_injectable_per_provider():
+    from deepseaport.core import transport as T
+
+    # Empty mapping: report the status as-is (Qwen's WAF is 200 + text/html).
+    assert T.http_error_code(403, {}) == "HTTP_403"
+    assert T.http_error_code(429, {}) == "HTTP_429"
+    # A provider may map something else entirely.
+    assert T.http_error_code(401, {401: "TOKEN_EXPIRED"}) == "TOKEN_EXPIRED"
+    assert T.http_error_code(403, {401: "TOKEN_EXPIRED"}) == "HTTP_403"
+
+
+def test_build_http_error_event_forwards_forbidden():
+    from deepseaport.core import transport as T
+
+    default = T.build_http_error_event(_FakeResp(403, text="blocked"), {})
+    assert default.code == "HTTP_403_WAF"
+    plain = T.build_http_error_event(
+        _FakeResp(403, text="suspended"), {}, forbidden={})
+    assert plain.code == "HTTP_403"
+    assert "suspended" in plain.message
+
+
 def test_stream_completion_422_detail(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     body = '{"detail":[{"loc":["body","prompt"],"msg":"field required"}]}'
     resp = _FakeResp(422, text=body, content_type="application/json", lines=[])
@@ -306,7 +342,7 @@ def test_stream_completion_422_detail(monkeypatch):
 
 
 def test_stream_completion_raw_json_ban_in_stream(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     line = json.dumps(_BAN_COMPLETION)
     resp = _FakeResp(200, content_type="text/event-stream", lines=[line])
@@ -317,7 +353,7 @@ def test_stream_completion_raw_json_ban_in_stream(monkeypatch):
 
 
 def test_stream_completion_finished_closes(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     resp = _FakeResp(200, content_type="text/event-stream", lines=[
         'data: {"p":"response/status","v":"FINISHED"}',
@@ -330,7 +366,7 @@ def test_stream_completion_finished_closes(monkeypatch):
 
 
 def test_stream_completion_error_closes(monkeypatch):
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     resp = _FakeResp(200, content_type="text/event-stream", lines=[
         'data: {"type":"error","content":"boom","finish_reason":"rate_limit_reached"}',
@@ -405,7 +441,7 @@ def test_base_headers_cookie_bearer():
 
 
 def test_bridge_headers_fallback(monkeypatch):
-    monkeypatch.setattr("deepseaport.obscura_bridge.get_default_bridge",
+    monkeypatch.setattr("deepseaport.core.obscura_bridge.get_default_bridge",
                         lambda: None)
     assert P.bridge_headers(bearer="t") == P.base_headers(bearer="t")
 
@@ -420,7 +456,7 @@ def test_bridge_headers_uses_bridge(monkeypatch):
         def cookie_header(self):
             return "c=d"
 
-    monkeypatch.setattr("deepseaport.obscura_bridge.get_default_bridge",
+    monkeypatch.setattr("deepseaport.core.obscura_bridge.get_default_bridge",
                         lambda: _Bridge())
     h = P.bridge_headers(bearer="t")
     assert h["User-Agent"] == "bridge-ua"

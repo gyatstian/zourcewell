@@ -17,51 +17,22 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from support import FakeBridge, settings
 from deepseaport.accounts import AccountPool, PooledAccount
 from deepseaport.config import AccountConfig, Settings
-from deepseaport.server import (
-    _acquire_slot_or_499,
-    _ban_403_for_item,
-    _check_auth,
-    _ensure_token,
-    _headers,
-    _is_invalid_token_error,
-    _is_transient_overload,
-    _openai_response,
-    _prepare,
-    create_app,
-)
+from deepseaport.server import _openai_response, create_app
+from deepseaport.server_concurrency import _acquire_slot_or_499
+from deepseaport.providers.deepseek.completion_service import _ban_403_for_item, _ensure_token, _headers, _is_invalid_token_error, _is_transient_overload
+from deepseaport.server_routes import _check_auth, _prepare
 
 
-class _FakeState:
-    user_agent = "test-ua"
-    cookies: dict = {}
-
-
-class _FakeBridge:
-    def __init__(self, cookies: str = "") -> None:
-        self.state = _FakeState()
-        self._cookies = cookies
-
-    def cookie_header(self) -> str:
-        return self._cookies
-
-    def warmup(self) -> dict:
-        return {}
+# Default kwargs differ per file; the shared base dict lives in
+# support.py. Every list here is rebuilt per call on purpose.
 
 
 def _settings(**kw) -> Settings:
-    base = dict(
-        keys=[],
-        accounts=[AccountConfig(email="a@x.com", token="tok")],
-        config_path="",
-        warmup_on_startup=False,
-        max_retries=1,
-        log_level="WARNING",
-        parallel_challenge_fetch=True,
-    )
-    base.update(kw)
-    return Settings(**base)
+    kw.setdefault("accounts", [AccountConfig(email="a@x.com", token="tok")])
+    return settings(**kw)
 
 
 def _tools_body(**kw):
@@ -98,11 +69,6 @@ def test_check_auth_invalid_key_raises_401():
 
 
 # _prepare ------------------------------------------------------------------
-
-def test_prepare_unknown_model_404():
-    with pytest.raises(HTTPException) as ei:
-        _prepare({"model": "gpt-99", "messages": [{"role": "user", "content": "hi"}]})
-    assert ei.value.status_code == 404
 
 
 def test_prepare_enable_tools_false_disables():
@@ -147,7 +113,7 @@ def test_headers_no_bridge_bearer_only():
 
 def test_headers_with_bridge_cookie_and_ua():
     app = create_app(_settings())
-    app.state.bridge = _FakeBridge(cookies="waf=abc")
+    app.state.bridge = FakeBridge(cookies="waf=abc")
     h = _headers(app, "tok123")
     assert h["Authorization"] == "Bearer tok123"
     assert h["Cookie"] == "waf=abc"

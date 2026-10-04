@@ -11,13 +11,10 @@ monkeypatch surface is this module (``providers.deepseek.completion_service``);
 
 from __future__ import annotations
 
-import asyncio
 import enum
-import json
 import logging
 import threading
 import time
-import uuid
 from collections.abc import Callable
 
 from fastapi import FastAPI, HTTPException
@@ -26,10 +23,9 @@ from . import client as DS
 from . import pow as PoW
 from . import protocol as P
 from ...accounts import AccountPool, PooledAccount
-from ...config import Settings, load_settings
+from ...config import Settings
 from ...core import engine as _engine
 from ...core.engine import (
-    AttemptOutcome as _AttemptOutcome,
     drive_retries,
     slot_releaser as _slot_releaser,
 )
@@ -42,8 +38,6 @@ from ...core.tools import (
     parse_tool_calls as _parse_tool_calls_local,
 )
 from ...server_concurrency import (
-    FAILOVER_ACQUIRE_TIMEOUT,
-    INVALID_TOKEN_COOLDOWN_SECONDS,
     _CHALLENGE_EXECUTOR,
     _CLEANUP_EXECUTOR,
     _CONSUMER_GRACE_SECONDS,
@@ -169,13 +163,6 @@ def _is_upstream_invalid_error(error: str | None) -> bool:
     return "http_422" in low or "unprocessable" in low or "http_400" in low
 
 
-def _error_text(code: str | None, message: str | None) -> str:
-    # Compat alias: single formatter lives in core.engine (qwen/opencode
-    # already alias it). Kept as a def (not a plain assignment) so existing
-    # ``completion_service._error_text`` patch seams keep working.
-    return _engine.error_text(code, message)
-
-
 def classify_error(error: str | None) -> RetryKind | None:
     """Map an attempt error string to its retry/terminal kind.
 
@@ -184,9 +171,10 @@ def classify_error(error: str | None) -> RetryKind | None:
     overload -> upstream-invalid -> upstream). Returns None only when there
     is no error text to classify.
 
-    The retry table additionally guards OVERLOAD with the "partial live emit"
-    flag (a re-stream would duplicate text); that is a retry-policy decision,
-    not a classification, so it stays in the table rather than here.
+    The retry table additionally guards EVERY kind with the "partial live emit"
+    flag (a re-POST plus re-stream would duplicate text); that is a
+    retry-policy decision, not a classification, so it stays in the table
+    rather than here.
     """
     if not error:
         return None
@@ -204,9 +192,21 @@ def classify_error(error: str | None) -> RetryKind | None:
         # terminal ladder still surfaces it as 503. Signal that by
         # returning OVERLOAD anyway; the retry recover checks the guard.
         return RetryKind.OVERLOAD
-    if P.is_ban_error_text(error) or any(
-            k in low for k in ("restricted", "unauthorized", "401")):
+    if P.is_ban_error_text(error) or "restricted" in low:
         return RetryKind.BAN
+    # A bare HTTP 401 is an AUTH failure, not a suspension.
+    # ``transport.http_error_code(401)`` renders as "HTTP_401: <body>": it
+    # carries neither "40003" nor "authorization failed" (so
+    # ``_is_invalid_token_error`` misses it) and no ban word, but it used to
+    # match the "401" entry of the ban family below, so one transient 401
+    # labelled a healthy account ``banned: true`` in config.json forever and
+    # answered 403 with ban wording. INVALID_TOKEN is both retryable and
+    # terminal-mapped: ``_terminal_invalid_token`` probes users/current
+    # first, so a genuinely muted account still becomes 403 + cooldown while
+    # an unconfirmed 401 surfaces as an UNMARKED 401. Qwen already mapped it
+    # this way; the two providers now agree.
+    if "401" in low or "unauthorized" in low:
+        return RetryKind.INVALID_TOKEN
     if _is_rate_limit_error(error):
         return RetryKind.RATE_LIMIT
     if _is_upstream_invalid_error(error):
@@ -333,8 +333,11 @@ def _refresh_token_via_obscura(app: FastAPI, item: PooledAccount,
         except Exception:
             pass
         if banned:
+            # Scrubbed for the same reason as the no-token log below: `detail`
+            # is the raw Obscura login result, and on a banned page it is the
+            # page body itself. A slice is a length guard, not a secret guard.
             logger.warning("Obscura login page shows account %s BANNED: %s",
-                           key, (detail or "")[:200])
+                           key, _engine.scrub_upstream_text(detail, 200))
             item.clear_login_backoff()
             _leave_token_refresh(key, inflight, banned=True,
                                  detail=str(detail or ""))
@@ -354,7 +357,11 @@ def _refresh_token_via_obscura(app: FastAPI, item: PooledAccount,
         # No token, no ban page: back off the browser so repeated 40003s
         # don't hammer the challenge endpoint. Manual set-token clears it.
         if detail:
-            login_note = str(detail)[:500]
+            # Scrubbed: the note is the Obscura login result, which for a
+            # no-token run is the raw page/body (localStorage JSON with the
+            # userToken in it). It reaches the 401 detail AND this log, so
+            # the long opaque runs go before either.
+            login_note = _engine.scrub_upstream_text(detail, 500)
             logger.warning("Obscura login for %s produced no usable token: %s",
                            item.cfg.identifier, login_note[:300])
         else:
@@ -384,6 +391,46 @@ def _solve(app: FastAPI, token: str) -> dict[str, str]:
     """Fresh PoW header merged over base headers."""
     headers = _headers(app, token)
     return {**headers, "X-DS-PoW-Response": DS.solve_pow(headers)}
+
+
+def _delete_observed_session_on_completion(headers: dict,
+                                          created: list,
+                                          fut) -> None:
+    """Delete a session whose creation we stopped waiting for (best effort).
+
+    ``concurrent.futures.Future.cancel()`` returns False once the callable
+    has started, so ``_await_cancelable``'s cancel of a create_session that
+    is already in flight does nothing: the request raises
+    ``_StreamCancelled`` while the executor worker goes on to create the
+    session anyway. The id that call is about to produce then lands nowhere,
+    the ``finally`` in ``_run_completion_core`` has no id to delete, and the
+    session lingers upstream (plus a challenge worker stays pinned for the
+    full create_session timeout).
+
+    Fix without changing the ``create_session(headers)`` call signature
+    (tests and the real client both call it with exactly one argument): the
+    submitted callable records the id in a one-element holder that travels
+    out of band, and this attaches a done-callback that deletes it. The
+    callback runs on the worker that just created the session, or inline if
+    the future already completed -- either way the abort path does not wait
+    for a network round trip, and a create_session that raised (or never
+    started) leaves the holder empty and nothing is signalled.
+    """
+    def _cleanup(_fut) -> None:
+        try:
+            session_id = created[0] if created else None
+        except Exception:
+            session_id = None
+        if not session_id:
+            return
+        try:
+            _delete_session_bg(headers, session_id, enabled=True)
+        except Exception:
+            pass
+    try:
+        fut.add_done_callback(_cleanup)
+    except Exception:
+        _cleanup(fut)
 
 
 def _session_and_challenge(headers: dict, parallel: bool = True,
@@ -425,7 +472,18 @@ def _session_and_challenge(headers: dict, parallel: bool = True,
                 pass
             raise _StreamCancelled()
         return session_id, challenge
-    fut_session = _CHALLENGE_EXECUTOR.submit(DS.create_session, headers)
+    # Out-of-band id holder: see _delete_observed_session_on_completion. The
+    # wrapper keeps DS.create_session(headers)'s one-argument call shape, so
+    # every existing patch seam (`lambda headers: "sess-1"`) still applies.
+    created: list = [None]
+
+    def _create_session_observed(hdrs: dict) -> str:
+        session_id = DS.create_session(hdrs)
+        if session_id:
+            created[0] = session_id
+        return session_id
+
+    fut_session = _CHALLENGE_EXECUTOR.submit(_create_session_observed, headers)
     fut_challenge = _CHALLENGE_EXECUTOR.submit(DS.fetch_pow, headers)
     try:
         session_id = _await_cancelable(fut_session, cancel_event)
@@ -434,6 +492,9 @@ def _session_and_challenge(headers: dict, parallel: bool = True,
             fut_challenge.cancel()
         except Exception:
             pass
+        # The cancel above is a no-op for an already-running create_session:
+        # collect the id it still produces instead of leaking the session.
+        _delete_observed_session_on_completion(headers, created, fut_session)
         raise
     except Exception:
         try:
@@ -515,7 +576,8 @@ def _run_obscura_login(app: FastAPI, item: PooledAccount,
         except Exception:
             pass
     except Exception as exc:
-        logger.warning("token refresh via Obscura failed for %s: %s", key, exc)
+        logger.warning("token refresh via Obscura failed for %s: %s",
+                       key, _engine.scrub_upstream_text(exc, 300))
         new_token, banned, detail = None, False, ""
     return new_token, bool(banned), str(detail or "")
 
@@ -544,15 +606,6 @@ def _refresh_waf_without_account_lock(app: FastAPI, item: PooledAccount,
 def _is_ban_http_exception(exc: BaseException) -> bool:
     """True when exc is the ban 403 raised by _run_completion_core."""
     return _engine.is_ban_http_exception(exc, P.is_ban_error_text)
-
-
-def _switch_current_after_ban_failover(pool: AccountPool, settings: Settings,
-                                       used: PooledAccount,
-                                       failed: PooledAccount,
-                                       reason: str = "unusable") -> None:
-    """Move CURRENT to the working account after failover (engine-owned)."""
-    _engine.switch_current_after_ban_failover(pool, settings, used, failed,
-                                              reason=reason)
 
 
 def _complete_with_failover_sync(app: FastAPI, pool: AccountPool, prep: dict,
@@ -590,18 +643,30 @@ def _invalid_token_401_detail(identifier: str, error: str,
     failed refresh, ``_terminal_invalid_token`` after a mid-stream 40003);
     one helper keeps the wording — and the BANNED-vs-stale distinction —
     identical. (Smallest risk-reducing step toward typed errors; the full
-    ``RetryKind``-carrying error-type refactor stays deferred.)
+    ``RetryKind``-carrying error-type-refactor stays deferred.)
+
+    ``error`` and ``login_note`` are scrubbed before they are quoted: the
+    first is the upstream biz body, the second the Obscura login result, and
+    both end up in a client-visible 401 detail. Long opaque runs (the 64-char
+    userToken is the realistic one) are redacted; the codes and the ban
+    wording an operator needs are not touched. EVERY return path must quote
+    ``err``/``note`` and never the raw arguments -- a second, unscrubbed
+    return below an unconditional one is dead code today and a live leak the
+    day someone reorders the ``if refreshed:`` above it.
     """
-    note = f" Browser login note: {login_note[:300]}." if login_note else ""
+    err = _engine.scrub_upstream_text(error, 200)
+    note = (f" Browser login note: {_engine.scrub_upstream_text(login_note, 300)}."
+            if login_note else "")
     if refreshed:
         return (f"Authorization Failed: token invalid for {identifier} "
-                f"even after browser refresh ({error[:200]}).{note} "
+                f"even after browser refresh ({err}).{note} "
                 f"Re-login the account. If the web UI shows "
                 f"suspension/violation, treat it as BANNED.")
     return (f"Authorization Failed: token invalid for {identifier} "
-            f"and could not be refreshed ({error[:200]}).{note} "
+            f"and could not be refreshed ({err}).{note} "
             f"Re-login the account. If the web UI shows "
             f"suspension/violation, treat it as BANNED.")
+
 
 
 def _terminal_invalid_token(app: FastAPI, item: PooledAccount, prep: dict,
@@ -625,35 +690,23 @@ def _terminal_ban(app: FastAPI, item: PooledAccount, prep: dict,
     """Banned accounts stay unusable until mute_until: cool down for the
     remaining suspension. The completion ban envelope already carried
     mute_until (stream_ban_until) — use it directly and skip the extra
-    users/current HTTP; fall back to check_ban only when the stream had no ts."""
+    users/current HTTP; fall back to check_ban only when the stream had no ts.
+
+    The probe's BOOLEAN is honoured, not just its timestamp: a negative
+    verdict means "not muted", so a stray ``(False, ts)`` must not be adopted
+    as a ban cooldown (the ban text is evidence enough to answer 403 and fail
+    over, but not to pin an expiry the probe just denied).
+    """
     ban_until: float | None = stream_ban_until
     if ban_until is None:
         try:
-            _, ban_until = _probe_ban(
+            banned, probed_until = _probe_ban(
                 app, token, timeout=5,
                 provider=(getattr(item.cfg, "provider", "deepseek") or "deepseek"))
         except Exception:
-            ban_until = None
+            banned, probed_until = False, None
+        ban_until = probed_until if banned else None
     raise _ban_403_for_item(app, item, ban_until, error)
-
-
-def _terminal_rate_limit(app: FastAPI, item: PooledAccount, prep: dict,
-                         token: str | None, error: str, login_note: str,
-                         stream_ban_until: float | None) -> None:
-    # Global throttle: do NOT poison a specific account with a cooldown.
-    _engine.raise_rate_limit("DeepSeek", error)
-
-
-def _terminal_overload(app: FastAPI, item: PooledAccount, prep: dict,
-                       token: str | None, error: str, login_note: str,
-                       stream_ban_until: float | None) -> None:
-    _engine.raise_overload("DeepSeek", error)
-
-
-def _terminal_upstream_invalid(app: FastAPI, item: PooledAccount, prep: dict,
-                               token: str | None, error: str, login_note: str,
-                               stream_ban_until: float | None) -> None:
-    _engine.raise_upstream_invalid("DeepSeek", prep, error)
 
 
 def _terminal_upstream(app: FastAPI, item: PooledAccount, prep: dict,
@@ -663,19 +716,20 @@ def _terminal_upstream(app: FastAPI, item: PooledAccount, prep: dict,
 
 
 #: Terminal dispatch table: one RetryKind (from the shared classifier) per
-#: HTTP outcome. POW/INVALID_SESSION/WAF are retryable kinds that only reach
-#: here after exhausting the retry budget -> generic bad-gateway, exactly as
-#: the historical fallthrough did.
+#: HTTP outcome. RATE_LIMIT/OVERLOAD/UPSTREAM_INVALID/UPSTREAM are the
+#: label-only handlers every provider shares (core.engine), so a fix to one
+#: raise_* message lands everywhere at once; only INVALID_TOKEN and BAN are
+#: DeepSeek-specific. POW/INVALID_SESSION/WAF are retryable kinds that only
+#: reach here after exhausting the retry budget -> generic bad-gateway,
+#: exactly as the historical fallthrough did.
 _TERMINAL_HANDLERS: dict[RetryKind, Callable[..., None]] = {
+    **_engine.generic_terminal_handlers(RetryKind, "DeepSeek",
+                                        upstream=_terminal_upstream),
     RetryKind.INVALID_TOKEN: _terminal_invalid_token,
     RetryKind.BAN: _terminal_ban,
-    RetryKind.RATE_LIMIT: _terminal_rate_limit,
-    RetryKind.OVERLOAD: _terminal_overload,
-    RetryKind.UPSTREAM_INVALID: _terminal_upstream_invalid,
     RetryKind.POW: _terminal_upstream,
     RetryKind.INVALID_SESSION: _terminal_upstream,
     RetryKind.WAF: _terminal_upstream,
-    RetryKind.UPSTREAM: _terminal_upstream,
 }
 
 
@@ -685,7 +739,7 @@ def _raise_for_terminal_error(app: FastAPI, item: PooledAccount, prep: dict,
                               stream_ban_until: float | None) -> None:
     """Map a terminal completion error event to its HTTP status. Always raises."""
     _engine.dispatch_terminal(classify_error, _TERMINAL_HANDLERS,
-                              _terminal_upstream, app, item, prep, token,
+                              app, item, prep, token,
                               error, login_note, stream_ban_until)
 
 
@@ -713,11 +767,12 @@ def _run_completion_core(
     """Shared retry engine for buffered + live streaming.
 
     on_content/on_thinking are called incrementally (producer thread) for the
-    live stream mode. Overload retries are skipped once partial deltas were
-    already emitted (re-stream would duplicate text); overload retries use a
-    fresh PoW header. PoW/session/WAF retries normally carry no content
-    prefix, so the residual interleaving risk is minimal.
-    Buffered callers pass no callbacks and get identical behaviour to before.
+    live stream mode. Once any delta has reached the client NO retry row fires
+    again, whichever kind it is: the completion POST is not idempotent and a
+    re-stream into a half-read stream duplicates text or interleaves two halves
+    of one tool_calls JSON object, then ends in a clean [DONE]. Overload
+    additionally uses a fresh PoW header. Buffered callers pass no callbacks and
+    get identical behaviour to before.
 
     cancel_event, when set, aborts the attempt at the next SSE event so a
     disconnected client does not keep the account lock for the whole reply.
@@ -780,7 +835,7 @@ def _run_completion_core(
                 f"Obscura login page shows account {item.cfg.identifier} "
                 f"suspended: {(login_detail or '')[:200]}")
         if login_detail and not new_token:
-            login_note = str(login_detail)[:500]
+            login_note = _engine.scrub_upstream_text(login_detail, 500)
             logger.warning("Obscura login for %s produced no usable token: %s",
                            item.cfg.identifier, login_note[:300])
         if not new_token:
@@ -886,9 +941,9 @@ def _run_completion_core(
         # from the ban envelope) so the ban path below needs no extra HTTP.
         # check_ban stays only as fallback when the stream carried no ts.
         stream_ban_until: float | None = None
-        # Overload-after-partial-emit guard lives in core.engine
-        # (LiveEmitTracker): a re-stream after output left would duplicate
-        # text and corrupt tool-call JSON.
+        # After-partial-emit guard lives in core.engine (LiveEmitTracker) and
+        # now covers every row: a re-POST plus re-stream after output left
+        # would duplicate text and corrupt tool-call JSON.
         _emit_tracker, _wrapped_content, _wrapped_thinking = _engine.live_emit_pair(
             on_content, on_thinking)
 
@@ -980,8 +1035,10 @@ def _run_completion_core(
 
         def _recover_overload() -> None:
             """Retry transient overload with a fresh PoW header."""
+            # Scrubbed before the 80-char slice: a slice is not a redactor, and
+            # Qwen's twin of this line already says so at its own copy.
             logger.info("upstream overloaded (%s), retrying (retries left %s)",
-                        (error or "")[:80], max_retries)
+                        _engine.scrub_upstream_text(error, 80), max_retries)
             # Fresh PoW: the prior header may have expired during a long
             # reasoning stream; reusing it risks POW_HEADER_ERROR on retry.
             try:
@@ -996,26 +1053,37 @@ def _run_completion_core(
         _do_attempt(headers, payload)
         # Ordered like the historical loops (pow -> session -> token -> waf ->
         # overload); a later kind sees whatever error the earlier one left.
-        # Overload is not retried after a partial live emit (would duplicate).
+        def _retryable(kind) -> Callable[[str | None], bool]:
+            """One predicate factory so NO row retries after a live emit.
+
+            The guard used to sit on the overload row alone, on the assumption
+            that the other kinds fail before any content. ``drain_attempt``
+            makes content-then-error a legal ordering, and the POST is not
+            idempotent (upstream appended a turn), so a pow/session/token/waf
+            recovery here re-POSTs the same payload on the same session and
+            re-streams from delta 0 into a stream the client already read:
+            duplicated text, or two interleaved halves of one tool_calls JSON
+            object, then a clean ``[DONE]`` and no error to stop the harness
+            executing the corrupt call.
+            """
+            def _ok(e: str | None) -> bool:
+                return (classify_error(e) == kind
+                        and not _emit_tracker.emitted)
+
+            return _ok
+
         drive_retries(
             max_retries,
             _cancelled,
             lambda: error,
             (
-                ("pow", lambda e: classify_error(e) == RetryKind.POW,
-                 _recover_pow),
-                ("invalid_session",
-                 lambda e: classify_error(e) == RetryKind.INVALID_SESSION,
+                ("pow", _retryable(RetryKind.POW), _recover_pow),
+                ("invalid_session", _retryable(RetryKind.INVALID_SESSION),
                  _recover_invalid_session),
-                ("invalid_token",
-                 lambda e: classify_error(e) == RetryKind.INVALID_TOKEN,
+                ("invalid_token", _retryable(RetryKind.INVALID_TOKEN),
                  _recover_invalid_token),
-                ("waf", lambda e: classify_error(e) == RetryKind.WAF,
-                 _recover_waf),
-                ("overload",
-                 lambda e: classify_error(e) == RetryKind.OVERLOAD
-                 and not _emit_tracker.emitted,
-                 _recover_overload),
+                ("waf", _retryable(RetryKind.WAF), _recover_waf),
+                ("overload", _retryable(RetryKind.OVERLOAD), _recover_overload),
             ),
         )
         if _cancelled():
@@ -1064,7 +1132,7 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
     live = str(getattr(settings, "stream_mode", "live")).lower() == "live"
     (cid, created, out, cancel_event, consumer_timeout, model,
      _emit, _put) = _engine.new_producer_context(
-        prep, DS.DEFAULT_TIMEOUT, _CONSUMER_GRACE_SECONDS)
+        prep, DS.DEFAULT_TIMEOUT, _CONSUMER_GRACE_SECONDS, buffered=not live)
 
     def _produce(*, live: bool) -> None:
         # Single publisher: buffered and live differ only in callbacks.
@@ -1091,7 +1159,13 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
         except HTTPException as exc:
             _emit(("http_error", exc))
         except Exception as exc:  # noqa: BLE001
-            _emit(("error", str(exc)))
+            # Scrubbed because this is the one emit path that does NOT go
+            # through the terminal ladder: the client helpers raise with a raw
+            # slice of the upstream body in the message, and that body is the
+            # one most likely to echo the Authorization header it was given.
+            # 800 is the scrubber's default and a superset of that 200-char
+            # slice, so no diagnostic text is lost relative to today.
+            _emit(("error", _engine.scrub_upstream_text(exc, 800)))
 
     def produce_buffered():
         _produce(live=False)

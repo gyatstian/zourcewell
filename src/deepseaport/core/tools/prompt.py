@@ -162,6 +162,21 @@ def _message_text(content) -> str:
     return str(content or "")
 
 
+def _role_marker(role) -> str:
+    """`<Role role="X">` opening marker for a role with no marker of its own.
+
+    A non-string role (int, dict or None from a sloppy client) is stringified
+    so it cannot confuse the reader, then reduced to characters that cannot
+    close the attribute or fake another marker (a role of `x"><System>` would
+    otherwise splice a system block in). The message text is never dropped:
+    the user sent it, it is only labelled.
+    """
+    if not isinstance(role, str):
+        role = str(role)
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in role)[:64]
+    return f'<Role role="{safe}">'
+
+
 def render_prompt(messages: list[dict]) -> str:
     """Flatten OpenAI messages into the single web `prompt` string.
 
@@ -169,7 +184,13 @@ def render_prompt(messages: list[dict]) -> str:
     - tool messages become "<Tool>Tool <name> returned: ..." records (kept
       distinct from user turns so tool boundaries survive),
     - same-role neighbours merge with a labeled separator so no boundary is
-      lost; roles map to <System>/<User>/<Assistant>/<Tool> markers.
+      lost; roles map to <System>/<User>/<Assistant>/<Tool> markers,
+    - `developer` renders as <System> (OpenAI gives it system precedence, and
+      it is what LiteLLM emits when translating a system message),
+    - any other role is labelled `<Role role="X">` (see _role_marker) with a
+      newline in front, so its text can never fuse into a neighbouring block.
+      Only a leading block — nothing before it to fuse with, same as a leading
+      user turn — passes through unlabelled.
     """
     blocks: list[tuple[str, str]] = []
     for msg in messages:
@@ -205,12 +226,28 @@ def render_prompt(messages: list[dict]) -> str:
             text = chunks[0]
         if role == "assistant":
             parts.append(f"<Assistant>{text}<endofsentence>")
-        elif role == "system":
+        elif role in ("system", "developer"):
+            # `developer` is a first-class OpenAI role (o-series and newer;
+            # LiteLLM emits it when translating `system`) and the spec ranks
+            # it at system precedence, so it renders with the same <System>
+            # marker: same privilege level, no new marker vocabulary, and a
+            # system message can no longer arrive unlabelled and glued onto
+            # the preceding block.
             parts.append(f"<System>{text}")
         elif role == "tool":
             parts.append(f"<Tool>{text}")
         elif role == "user":
             parts.append(text if idx == 0 else f"<User>{text}")
-        else:
+        elif not parts:
+            # Leading block with nothing before it: it cannot fuse into a
+            # neighbour, so it passes through as-is (same rule as a leading
+            # user turn). Every later block is labelled.
             parts.append(text)
+        else:
+            # The parts are concatenated with no separator, so an unlabelled
+            # block used to run straight into the previous one and the model
+            # read it as a continuation of that block (e.g. untrusted text
+            # fused onto the system prompt). Leading newline = separator,
+            # marker = attribution. Content is preserved either way.
+            parts.append("\n" + _role_marker(role) + text)
     return "".join(parts)

@@ -63,6 +63,14 @@ _X_AP_RE = re.compile(r"\bx-ap=([^;,\s]+)", re.IGNORECASE)
 # Allowlist for bridge-jar merge (never store token=/Authorization).
 _QWEN_WAF_ALLOW = frozenset({"acw_tc", "x-ap", "sca", "cna", "tfstk", "isg", "xlly_s"})
 
+# Qwen's WAF answers 200 + text/html, never 403 (see protocol.is_waf_challenge),
+# so the shared transport default (DeepSeek: 403 == WAF challenge) must NOT be
+# applied here: a real Qwen 403 carries a genuine upstream status — e.g. a
+# suspension body — and labelling it HTTP_403_WAF makes the classifier pick the
+# WAF branch, so the account is never cooled down or failed over. Empty mapping
+# = report a plain HTTP_<status>.
+_FORBIDDEN_CODES: dict[int, str] = {}
+
 
 def _is_winerror5(exc: BaseException) -> bool:
     """True for WinError 5 / profile-dir access-denied (graceful, never raise)."""
@@ -512,16 +520,6 @@ def delete_chat(headers: dict, chat_id: str) -> None:
         logger.debug("delete_chat ignored: %s", exc)
 
 
-def stop_completion(headers: dict, payload: dict) -> None:
-    """Best-effort POST /api/v2/chat/completions/stop; swallow exceptions."""
-    try:
-        _SESSION.post(_with_chat_id(P.CHAT_COMPLETIONS_STOP_URL, payload),
-                      headers=headers, json=payload,
-                      impersonate=IMPERSONATE, timeout=10)
-    except Exception as exc:
-        logger.debug("stop_completion ignored: %s", exc)
-
-
 def fetch_models(headers: dict, timeout: int = 20) -> list[dict]:
     """GET qwen-host /api/v2/models/ -> data.data list; harvest acw_tc.
 
@@ -609,19 +607,6 @@ def check_ban(headers: dict, timeout: int = 20) -> tuple[bool, float | None]:
         return False, None
 
 
-def _waf_markers_in_line(line: str) -> bool:
-    """True when a drained line carries Aliyun WAF challenge markers.
-
-    Thin alias over the shared ``protocol.is_waf_body`` (identical
-    substring set); kept so existing ``QC._waf_markers_in_line`` imports
-    keep working while the marker set lives in exactly one place.
-    """
-    try:
-        return bool(P.is_waf_body(line or ""))
-    except Exception:
-        return False
-
-
 def stream_completion(headers: dict, payload: dict,
                       timeout: int = DEFAULT_TIMEOUT) -> Iterator[StreamEvent]:
     """POST /api/v2/chat/completions?chat_id=<id> and yield parsed events.
@@ -649,7 +634,7 @@ def stream_completion(headers: dict, payload: dict,
         # is empty — drain via iter_lines (shared cap/helpers).
         try:
             body = T.drain_json_text(resp, T.JSON_DRAIN_CAP)
-            if _waf_markers_in_line(body):
+            if P.is_waf_body(body):
                 T.close_quietly(resp)
                 _log_waf_headers("stream_completion_body", headers)
                 yield StreamEvent(
@@ -685,7 +670,7 @@ def stream_completion(headers: dict, payload: dict,
             pass
         T.close_quietly(resp)
     if resp.status_code != 200:
-        event = T.build_http_error_event(resp, payload)
+        event = T.build_http_error_event(resp, payload, _FORBIDDEN_CODES)
         T.close_quietly(resp)
         yield event
         return
@@ -693,7 +678,7 @@ def stream_completion(headers: dict, payload: dict,
     # guard + Qwen wire parser stay Qwen-specific (DeepSeek uses its own
     # parser + raw-JSON ban guard).
     def _qwen_waf_precheck(line: str) -> StreamEvent | None:
-        if _waf_markers_in_line(line):
+        if P.is_waf_body(line):
             _log_waf_headers("stream_completion_line", headers)
             return StreamEvent(
                 kind="error", code="WAF_CHALLENGE",

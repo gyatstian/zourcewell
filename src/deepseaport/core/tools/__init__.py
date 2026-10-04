@@ -59,7 +59,7 @@ from .common import (
     _valid_names,
     looks_truncated_tool_attempt,
 )
-from .parser import PARSE_CHAIN, ParseResult, parse_tool_calls, parse_tool_calls_ex
+from .parser import ParseResult, parse_tool_calls, parse_tool_calls_ex
 from .parser.bare import _parse_bare_name_objects
 from .parser.dsml import (
     _DS,
@@ -81,12 +81,10 @@ from .parser.dsml import (
     _SP,
     _assign_unnamed_param,
     _coerce_dsml_value,
-    _dsml_spans,
     _find_close,
     _invoke_open_re,
     _param_open_re,
     _parse_dsml_attrs,
-    _parse_dsml_calls,
     _preprocess_dsml_attrs,
     _scan_dsml_calls,
     _tag_re,
@@ -155,11 +153,8 @@ __all__ = [
     "_parse_dsml_attrs",
     "_find_close",
     "_scan_dsml_calls",
-    "_parse_dsml_calls",
-    "_dsml_spans",
     "_parse_bare_name_objects",
     "_strip_spans",
-    "PARSE_CHAIN",
     "ParseResult",
     "parse_tool_calls_ex",
     "_looks_like_tool_attempt",

@@ -9,9 +9,8 @@ from ..common import (
     MAX_BARE_OBJECTS,
     _LOOSE_JSON_MISS,
     _balanced_json,
-    _clean_rest,
+    _finish,
     _loads_json_lenient,
-    _normalize_calls,
     _strip_spans,
 )
 
@@ -88,16 +87,11 @@ def try_parse_bare(text, valid, valid_or_none, limit_args, limit_bare, forgiving
     if valid:
         bare_raw, bare_spans = _parse_bare_name_objects(text, valid, limit_bare)
         if bare_raw:
-            calls, dropped = _normalize_calls(bare_raw, valid_or_none, limit_args)
-            if diagnostics is not None:
-                diagnostics.append({"format": "bare", "matched": bool(calls),
-                                    "kept": len(calls), "dropped": list(dropped),
-                                    "raw": len(bare_raw)})
-            if calls:
-                # Strip only the spans that survived normalization.
-                rest = _clean_rest(_strip_spans(text, bare_spans), forgiving_on)
-                return calls, rest
-            return None, None
+            hit = _finish(bare_raw, valid_or_none, limit_args, "bare",
+                          forgiving_on, diagnostics=diagnostics,
+                          # Strip only the spans that survived normalization.
+                          on_hit=lambda: _strip_spans(text, bare_spans))
+            return hit if hit[0] else (None, None)
         # No valid-name candidates: record unknown-name near-miss so
         # diagnostics distinguishes plain answers (no trail) from
         # near-misses (matched=False trail). Bounded C-level scan only.

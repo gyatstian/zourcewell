@@ -22,13 +22,69 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 
+from fastapi import HTTPException
+
+from ..server_concurrency import _StreamCancelled
+
 logger = logging.getLogger("deepseaport.core.engine")
+
+
+# Exception types a recovery closure must never have contained.
+#
+# A recovery can raise two kinds of exception and only one of them is a
+# malfunction:
+#
+# * ``HTTPException`` is a deliberate status DECISION -- the ban 403 an
+#   invalid-token recovery raises after a positive users/current probe, the
+#   401 the session path raises for a dead token. That status is the answer
+#   the client must see, so it propagates untouched (otherwise a 401 that
+#   was really a ban would be downgraded to the generic upstream status).
+# * ``_StreamCancelled`` means the client already left; it has to win, or a
+#   disconnect during recovery would be reported as an upstream 401/502
+#   instead of 499.
+#
+# Everything else is a failure OF the recovery itself -- ``DS.solve_pow``'s
+# HTTP ``fetch_pow`` blowing up, ``RuntimeError("PoW solver found no
+# answer")``, a browser warmup error -- and must not become the client's
+# error.
+_MUST_PROPAGATE: tuple[type[BaseException], ...] = (HTTPException, _StreamCancelled)
+
+
+def _run_recovery(name: str, recover: Callable[[], None]) -> bool:
+    """Run one recovery closure; return False when it failed (contained).
+
+    A recovery closure calls real work (PoW solve + HTTP challenge fetch,
+    session recreate, browser token refresh, Obscura warmup) and that work can
+    fail. Its failure is NOT the client's actionable error -- the upstream
+    reason is -- and letting it escape replaced the decided status (503
+    overload / 502 WAF / 401 token) with an unhandled 500 on the non-stream
+    path. On failure we log the scrubbed reason and stop escalating this kind;
+    the caller hands the unchanged error to the next handler and the terminal
+    ladder raises the ORIGINAL status. Not swallowed: the request still fails.
+    """
+    try:
+        recover()
+        return True
+    except _MUST_PROPAGATE:
+        raise
+    except Exception as exc:
+        # No ``exc_info``: a recovery failure is very often the provider's own
+        # HTTP raise, whose message embeds a slice of the raw upstream body,
+        # and the traceback prints that message again at the bottom. Both were
+        # a second unscrubbed copy of the body this file exists to de-tokenize,
+        # and a recovery that fails is not worth a stack trace anyway.
+        logger.warning(
+            "retry recovery %r failed (%s: %s); keeping the original upstream "
+            "error and escalating no further on this kind",
+            name, type(exc).__name__, scrub_upstream_text(exc, 500))
+        return False
 
 
 def drive_retries(
@@ -46,12 +102,25 @@ def drive_retries(
     loops (pow -> invalid-session -> invalid-token -> waf -> overload) with
     identical ``max_retries``-per-kind semantics; a later handler sees the
     error left by the earlier one.
+
+    A ``recover()`` that itself raises is contained, not propagated: the
+    recoveries call real work (``DS.solve_pow`` does an HTTP ``fetch_pow``,
+    ``solve_challenge`` raises ``RuntimeError("PoW solver found no answer")``,
+    the WAF refresh warms a browser) and that work failing is NOT the client's
+    actionable error -- the upstream reason is. Letting it escape replaced the
+    real status (503 overload / 502 WAF / 401 token) with an unhandled 500
+    "Exception in ASGI application" on the non-stream path. On failure we
+    log, stop escalating this kind, and hand the *unchanged* error to the next
+    handler, so the terminal ladder still raises the original status. Not
+    swallowed: the request still fails, with the upstream reason.
+    ``HTTPException`` and the cancellation sentinel are exempt -- they are
+    decisions, not malfunctions (see ``_run_recovery``).
     """
     try:
         budget = max(0, int(max_retries))
     except Exception:
         budget = 0
-    for _name, should_retry, recover in handlers:
+    for name, should_retry, recover in handlers:
         for _ in range(budget):
             try:
                 if is_cancelled():
@@ -68,7 +137,8 @@ def drive_retries(
                 return
             if not want:
                 break
-            recover()
+            if not _run_recovery(name, recover):
+                break
 
 
 def run_with_failover(
@@ -76,12 +146,12 @@ def run_with_failover(
     first_item,
     run_once: Callable[[object], object],
     is_retryable_exc: Callable[[BaseException], bool],
+    acquire: Callable[[float], object],
     on_before_retry: Callable[[BaseException, object, int, int], None] | None = None,
     acquire_timeout: float = 10,
     is_cancelled: Callable[[], bool] | None = None,
     allow_failover: bool = True,
     release: Callable[[object], None] | None = None,
-    acquire: Callable[[float], object] | None = None,
 ) -> object:
     """Run ``run_once(item)`` on ``first_item``, failing over on retryable errors.
 
@@ -90,6 +160,11 @@ def run_with_failover(
     re-raises the first error when no healthy account remains. ``run_once``
     performs one attempt (including any per-kind retries); the engine only
     handles cross-account failover, cancellation, and slot lifecycle.
+
+    ``acquire`` is required: every caller already binds the pool's own
+    ``acquire``, so a default could only ever duplicate it. ``release`` still
+    defaults, because a caller that could not import ``AccountPool`` passes
+    ``None`` and needs the bare ``item.lock`` fallback.
     """
     if release is None:
         def _default_release(item) -> None:
@@ -106,11 +181,6 @@ def run_with_failover(
                     pass
 
         release = _default_release
-    if acquire is None:
-        def _default_acquire(timeout: float):
-            return pool.acquire(timeout=timeout)
-
-        acquire = _default_acquire
 
     if not allow_failover:
         try:
@@ -176,6 +246,82 @@ def error_text(code: str | None, message: str | None) -> str:
     return f"{code}: {message}" if code else message
 
 
+# An "opaque run" is a long unbroken stretch of token characters -- exactly
+# what a credential looks like (bearer token, session id, base64 blob, hex
+# nonce) and never what a diagnostic sentence looks like. 32 is comfortably
+# above the longest thing an operator reads in an error ("generation_timeout",
+# "Authorization Failed", a biz code, a ban phrase) and comfortably below a
+# real secret.
+_OPAQUE_RUN_RE = re.compile(r"[A-Za-z0-9_\-]{32,}")
+
+# The second shape a secret takes and the run rule structurally cannot see: a
+# JWT, i.e. dot-framed base64url segments. Its segments are each SHORT (a
+# typical header is 20 chars, a signature 27), so `[A-Za-z0-9_-]{32,}` matches
+# nothing and the whole token -- header and payload included -- travelled
+# verbatim. A future base64 (`+`/`/`) credential has the same blind spot.
+#
+# The pattern is deliberately anchored to a whole token-shaped string: the
+# lookarounds stop it matching the middle of a longer run, and requiring every
+# segment to be 4+ chars of token characters (dots directly adjacent, no
+# spaces) is what keeps prose intact -- "Server busy. Try again." has spaces
+# around its dots, "opencode 1.18.32" has 1-2 char segments, and
+# "docs.example.com" ends in a 3-char segment. Both patterns are needed: the
+# run rule catches the single-segment secrets (DeepSeek's 64-char userToken),
+# this one catches the framed ones.
+_SEGMENT_FRAMED_RE = re.compile(
+    r"(?<![A-Za-z0-9_.\-])[A-Za-z0-9_\-]{4,}(?:\.[A-Za-z0-9_\-]{4,}){1,3}"
+    r"(?![A-Za-z0-9_.\-])")
+
+
+def scrub_upstream_text(text, limit: int = 800) -> str:
+    """Clamp and de-tokenize an upstream body before it leaves the process.
+
+    Upstream error payloads are echoed twice over: into an HTTPException
+    detail (so a third-party API client sees them) and into the server log
+    (so they are written to disk and shipped to any log shipper). Whatever
+    the upstream decided to put in that body travels with them -- an
+    Authorization header it was given, a session id, a captcha token scraped
+    from a login page. The account's own 64-char bearer token is the case
+    that matters: the request that triggered the error is precisely the one
+    carrying it.
+
+    Two redaction shapes, because credentials have two shapes (see
+    ``_SEGMENT_FRAMED_RE``): a long single run of token characters, and a
+    dot-framed token such as a JWT. The framed rule runs FIRST, so a JWT is
+    redacted whole rather than partially (its payload can be long enough to
+    trip the run rule and leak the header next to a ``[redacted]``).
+
+    The redaction is otherwise deliberately narrow. Every word an operator
+    diagnoses with survives verbatim (status code, biz_code, the ban/error
+    wording), and the length is hard-clamped so a hostile or broken upstream
+    cannot use the detail as a megabyte of reflected anything. Never raises:
+    this runs on the terminal error path, where raising would replace the real
+    status with a 500.
+    """
+    try:
+        out = "" if text is None else str(text)
+    except Exception:
+        return ""
+    try:
+        out = _SEGMENT_FRAMED_RE.sub("[redacted]", out)
+    except Exception:
+        pass
+    try:
+        out = _OPAQUE_RUN_RE.sub("[redacted]", out)
+    except Exception:
+        pass
+    try:
+        cap = max(0, int(limit))
+    except (TypeError, ValueError):
+        cap = 800
+    try:
+        if cap and len(out) > cap:
+            out = out[:cap] + f"... [+{len(out) - cap} chars]"
+    except Exception:
+        pass
+    return out
+
+
 class AttemptOutcome(tuple):
     """4-tuple (content, thinking, error, usage) + ban_until attr.
 
@@ -191,11 +337,32 @@ class AttemptOutcome(tuple):
         return obj
 
 
+# The cancel token of the attempt this thread is currently draining.
+# Thread-local, not a parameter: ``drain_attempt`` receives ``stream_fn`` as
+# ``provider.client.stream_completion`` and every provider's signature is
+# ``(headers, payload)`` -- adding a third argument here would mean passing a
+# kwarg every provider does not accept, and passing it positionally would have
+# silently landed in Qwen's ``timeout``. ``drain_attempt`` and the generator it
+# creates run on the same producer thread, so thread-local is the exact scope
+# that matters: no cross-talk between concurrent requests, and no
+# re-entrancy problem (the previous value is restored, not cleared).
+_CURRENT_CANCEL = threading.local()
+
+
+def current_cancel_event() -> threading.Event | None:
+    """The cancel token in force on this thread, or None outside a drain.
+
+    Read by a stream function that sits inside a blocking socket read, where
+    returning control to ``drain_attempt``'s per-event check is the only way to
+    notice a disconnect.
+    """
+    return getattr(_CURRENT_CANCEL, "event", None)
+
+
 def drain_attempt(stream_fn: Callable[[dict, dict], object],
                   headers: dict, payload: dict,
                   on_content=None, on_thinking=None,
                   cancel_event: threading.Event | None = None,
-                  error_formatter: Callable[[str | None, str | None], str] | None = None,
                   ) -> tuple[str, str, str | None, int]:
     """Drain one SSE stream into (content, thinking, error, usage).
 
@@ -205,14 +372,18 @@ def drain_attempt(stream_fn: Callable[[dict, dict], object],
     per-provider input is the stream function itself. Explicit ``gen.close()``
     so the HTTP connection returns to the pool instead of lingering through
     retries. Cancel is checked per event so a disconnected client frees the
-    account slot promptly.
+    account slot promptly, and is published for the duration of the drain (see
+    ``current_cancel_event``) so a stream function blocked inside the socket
+    read can notice it too.
     """
-    fmt = error_formatter or error_text
+    fmt = error_text
     content: list[str] = []
     think: list[str] = []
     error: str | None = None
     usage_total = 0
     ban_until: float | None = None
+    _outer_cancel = getattr(_CURRENT_CANCEL, "event", None)
+    _CURRENT_CANCEL.event = cancel_event
     gen = stream_fn(headers, payload)
     try:
         for event in gen:
@@ -254,6 +425,7 @@ def drain_attempt(stream_fn: Callable[[dict, dict], object],
             elif kind == "finished":
                 break
     finally:
+        _CURRENT_CANCEL.event = _outer_cancel
         try:
             close = getattr(gen, "close", None)
             if callable(close):
@@ -262,6 +434,17 @@ def drain_attempt(stream_fn: Callable[[dict, dict], object],
             pass
     return AttemptOutcome("".join(content), "".join(think), error,
                           usage_total, ban_until)
+
+
+# How long ``slot_releaser`` waits to hand the account slot back before
+# giving up (see that docstring). Sized for the realistic contention, not
+# for the worst case: the slot was released so OTHER work could use the
+# account, and the honest owner of it is another request whose own attempt
+# can legitimately run for a full stream (a ~90s socket budget plus PoW).
+# One minute covers that for a single-account deployment; a WAF warmup or a
+# browser login that outlives it just means this attempt proceeds without
+# the slot, which is the safe direction.
+SLOT_REACQUIRE_TIMEOUT = 60.0
 
 
 @contextmanager
@@ -274,12 +457,15 @@ def slot_releaser(item, cancel_event: threading.Event | None = None):
     indefinitely under contention (raises ``_StreamCancelled``). Leaving
     the slot released on cancel is safe: the outer ``run_with_failover``
     release is ``RuntimeError``-safe.
+
+    The reacquire is DEADLINE-bounded (``SLOT_REACQUIRE_TIMEOUT``) because
+    ``cancel_event=None`` is legal (it is ``Provider.complete``'s documented
+    default, and the direct-call/unit-test path), so every wait in this module
+    has to be bounded. On give-up the slot simply stays released, which is the
+    same state the cancel path already left behind and is safe by
+    construction: the outer ``run_with_failover`` release is authoritative and
+    swallows the ``RuntimeError`` of releasing a lock nobody holds.
     """
-    try:
-        from ..server_concurrency import _StreamCancelled as _Cancelled
-    except Exception:
-        class _Cancelled(Exception):  # type: ignore[no-redef]
-            pass
     released = False
     try:
         item.lock.release()
@@ -292,18 +478,42 @@ def slot_releaser(item, cancel_event: threading.Event | None = None):
         yield released
     finally:
         if released:
+            deadline = time.monotonic() + SLOT_REACQUIRE_TIMEOUT
             while True:
                 if cancel_event is not None and cancel_event.is_set():
-                    raise _Cancelled()
+                    raise _StreamCancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # Bound hit, not a cancel: the account is busy elsewhere
+                    # (another request, or a failover to this very account).
+                    # Continue WITHOUT the slot rather than block forever --
+                    # the attempt is still rate-limited by the pool and the
+                    # outer release stays authoritative either way.
+                    logger.warning(
+                        "account slot still held elsewhere after %.0fs; "
+                        "continuing without re-acquiring it for this attempt",
+                        SLOT_REACQUIRE_TIMEOUT)
+                    break
                 try:
-                    if item.lock.acquire(timeout=0.5):
+                    if item.lock.acquire(timeout=min(0.5, remaining)):
                         break
                 except Exception:
                     break
 
 
 def app_settings(app):
-    """Return app settings, tolerating app=None and embedded test apps."""
+    """Return app settings, tolerating app=None and embedded test apps.
+
+    The freshly loaded fallback is deliberately NOT memoized onto
+    ``app.state``. A hand-built app (test/tool embedding) has no settings of
+    its own, and ``load_settings()`` returns a Settings bound to the operator's
+    on-disk ``config.json``; writing it back meant every later
+    ``app.state.settings`` read got that same operator-bound object, and the
+    provider save paths (qwen token expiry, ban persisting) then rewrote the
+    real file. The caller still gets the object to use for THIS call -- nothing
+    is retained, so the next call re-reads and a provider save stays the
+    caller's own decision.
+    """
     if app is None:
         from ..config import load_settings
 
@@ -312,11 +522,7 @@ def app_settings(app):
     if settings is None:
         from ..config import load_settings
 
-        settings = load_settings()
-        try:
-            app.state.settings = settings
-        except Exception:
-            pass
+        return load_settings()
     return settings
 
 
@@ -354,6 +560,17 @@ def ban_403_for_item(app, item, ban_until: float | None,
     ``ban_message_fn`` is provider-specific (DeepSeek ``P.ban_message``,
     Qwen local ``_ban_message``); everything else is shared. Never raises
     for the marking itself; always returns the 403 to raise.
+
+    Persist is gated on the app OWNING its settings -- the same guard
+    ``providers/qwen/completion_service`` applies. ``app_settings(app)``
+    falls back to ``load_settings()``, which is a Settings bound to the
+    operator's real ``config.json``; saving that from a hand-built app (a
+    test or a tool embedding the engine with no ``app.state.settings``) would
+    rewrite the operator's file with a ban they never hit. The fallback is
+    also no longer memoized (see ``app_settings``), so the write would not
+    even stick as a side effect -- it just corrupted the file. When the app
+    owns its settings we save exactly as before; otherwise the in-memory
+    marker stands alone and a warning says so.
     """
     from fastapi import HTTPException
 
@@ -361,17 +578,36 @@ def ban_403_for_item(app, item, ban_until: float | None,
         from ..accounts import AccountPool
 
         AccountPool.mark_banned(item, until=ban_until)
-        try:
-            app_settings(app).save()
-        except Exception:
-            pass
+        _ident = getattr(getattr(item, "cfg", None), "identifier", "?")
+        own = getattr(getattr(app, "state", None), "settings", None)
+        if own is not None:
+            try:
+                own.save()
+            except Exception as exc:
+                logger.warning("ban for account %s could not be persisted "
+                               "(save failed: %s: %s); the marker is "
+                               "in-memory only and a restart forgets it",
+                               _ident, type(exc).__name__, exc)
+        else:
+            logger.warning(
+                "ban for account %s NOT persisted: this app owns no "
+                "settings (app.state.settings is unset), so there is nothing "
+                "safe to write -- the operator's config.json was left "
+                "untouched on purpose. The ban marker is in-memory only; "
+                "a restart forgets it.", _ident)
     except Exception:
         pass
     try:
         base = ban_message_fn(ban_until) if ban_message_fn is not None else ""
         ident = getattr(getattr(item, "cfg", None), "identifier", "?")
         if not base:
-            detail = (error_text_ or "account banned")[:300]
+            # Scrubbed: the caller-facing text here is the RAW upstream/login
+            # body (the Obscura path passes up to 200 chars of scraped login
+            # page DOM), which lands in the 403 detail the client sees and in
+            # nothing the operator can act on beyond the ban verdict itself.
+            # ``base`` is our own ban_message, not upstream text, and is kept
+            # verbatim.
+            detail = scrub_upstream_text(error_text_ or "account banned", 300)
             if "banned" not in detail.lower() and "muted" not in detail.lower():
                 detail = f"Account {ident} banned. {detail}"
         else:
@@ -381,7 +617,7 @@ def ban_403_for_item(app, item, ban_until: float | None,
             ident = getattr(getattr(item, "cfg", None), "identifier", "?")
         except Exception:
             ident = "?"
-        detail = (error_text_ or f"Account {ident} banned")[:300]
+        detail = scrub_upstream_text(error_text_ or f"Account {ident} banned", 300)
     return HTTPException(status_code=403, detail=detail)
 
 
@@ -398,12 +634,26 @@ def is_ban_http_exception(exc: BaseException,
 
 
 def switch_current_after_ban_failover(pool, settings, used, failed,
-                                      reason: str = "unusable") -> None:
+                                      reason: str = "unusable",
+                                      persist: bool | None = None) -> None:
     """Move CURRENT to the working account after failover.
 
     Only fires when CURRENT pointed at the failed account: the request
     already proved it unusable (ban/auth cooldown), so future requests should
     prefer the healthy one first. Best-effort, never raises.
+
+    ``persist`` decides whether the moved selection is written to disk.
+    ``None`` means "persist" (the historical behaviour, kept for the
+    provider aliases that call this with a settings object they were handed).
+    ``False`` marks the switch in-memory only. The reason it has to be
+    selectable: ``complete_with_failover_sync`` gets ``settings`` from
+    ``get_settings``, whose default is ``engine.app_settings`` -- and that
+    falls back to ``load_settings()``, a Settings bound to the OPERATOR's real
+    ``config.json``. Saving that from an app that owns no settings (a
+    hand-built app, a test, an embedder) rewrote the operator's file with a
+    CURRENT switch they never made -- the same defect
+    ``ban_403_for_item`` was fixed for. So the caller passes the ownership
+    verdict it already computed, and a skip says so in the log.
     """
     try:
         from ..accounts import _matches as _m
@@ -415,7 +665,17 @@ def switch_current_after_ban_failover(pool, settings, used, failed,
         if pool.set_current(used.cfg.identifier):
             try:
                 settings.active_account = pool.current
-                settings.save()
+                if persist is None or bool(persist):
+                    settings.save()
+                else:
+                    logger.warning(
+                        "CURRENT %s -> %s switched but NOT persisted: this "
+                        "app owns no settings (app.state.settings is unset), "
+                        "so there is nothing safe to write -- the operator's "
+                        "config.json was left untouched on purpose. The "
+                        "switch is in-memory only; a restart picks the old "
+                        "CURRENT again.", failed.cfg.identifier,
+                        used.cfg.identifier)
             except Exception:
                 pass
             logger.warning("account %s %s, CURRENT auto-switched -> %s",
@@ -442,7 +702,22 @@ def complete_with_failover_sync(app, pool, prep: dict, first_item,
     error directly; None reads ``use_multiple_accounts`` from settings.
     Bans and 401 auth failures are account-specific; other failures belong to
     the caller/current request.
+
+    ``prep``, ``on_content`` and ``on_thinking`` are ACCEPTED AND IGNORED.
+    They are not a live callback seam: the ``run_core`` closure the provider
+    hands in already captured all three (``_run_completion_core(app, account,
+    prep, on_content=..., on_thinking=...)``), and both provider adapters pass
+    them through by keyword. Wiring them up here would apply every delta a
+    second time -- duplicated SSE text and a doubled tool-call JSON payload,
+    which is worse than a crash because the client renders a plausible wrong
+    answer. They are deleted at the top of the body so the next maintainer
+    reads a ``NameError`` risk instead of a plausible-looking dead parameter,
+    and the parameters stay in the signature purely for call compatibility.
+    Do NOT reintroduce a use for them: add a new, explicitly named parameter
+    if the engine ever needs to drive emission itself.
     """
+    # Historical call-compatibility only -- see the docstring. Do not use.
+    del prep, on_content, on_thinking
     _get_settings = get_settings or app_settings
     if allow_failover is None:
         try:
@@ -510,12 +785,12 @@ def complete_with_failover_sync(app, pool, prep: dict, first_item,
         first_item,
         _run_once,
         _is_retryable,
+        acquire=lambda timeout: pool.acquire(timeout=timeout),
         on_before_retry=_on_before_retry,
         acquire_timeout=_FAILOVER_TIMEOUT,
         is_cancelled=lambda: cancel_event is not None and cancel_event.is_set(),
         allow_failover=allow_failover,
         release=_release,
-        acquire=lambda timeout: pool.acquire(timeout=timeout),
     )
     if failed_item is not None and used_item is not None:
         try:
@@ -523,20 +798,35 @@ def complete_with_failover_sync(app, pool, prep: dict, first_item,
         except Exception:
             reason = "unusable"
         try:
-            switch_current_after_ban_failover(
-                pool, _get_settings(app), used_item, failed_item, reason=reason)
+            settings = _get_settings(app)
+            # Ownership verdict, same rule as ban_403_for_item: only the app's
+            # OWN settings may be written back. The fallback Settings from
+            # app_settings() is the operator's on-disk config.json, and
+            # saving it from a settings-less app rewrote their file with a
+            # CURRENT switch this process invented.
+            own = getattr(getattr(app, "state", None), "settings", None)
+            persist = own is not None and own is settings
+        except Exception:
+            settings, persist = None, False
+        try:
+            if settings is not None:
+                switch_current_after_ban_failover(
+                    pool, settings, used_item, failed_item,
+                    reason=reason, persist=persist)
         except Exception:
             pass
     return result  # type: ignore[return-value]
 
 
 class LiveEmitTracker:
-    """Flag partial live emits so overload retries skip after output left.
+    """Flag partial live emits so EVERY retry row skips once output left.
 
     Live mode already ``_put`` partial deltas to the client; a retry after a
-    partial emit would re-stream from 0 (duplicated/interleaved text and
-    corrupt tool-call JSON). Wrap each live callback once; the overload
-    retry predicate checks ``tracker.emitted``. Shared by every provider.
+    partial emit would re-POST a payload the upstream already turned into a
+    turn, then re-stream from 0 -- duplicated/interleaved text and a corrupt
+    tool-call JSON object inside a 200 stream that still ends in a clean
+    ``[DONE]``. Wrap each live callback once; every retry predicate checks
+    ``tracker.emitted``. Shared by every provider.
     """
 
     def __init__(self) -> None:
@@ -560,7 +850,7 @@ def raise_rate_limit(provider_label: str, error: str | None) -> None:
     from fastapi import HTTPException
 
     raise HTTPException(status_code=429,
-                        detail=f"{provider_label} rate limited: {(error or '')[:200]}. "
+                        detail=f"{provider_label} rate limited: {scrub_upstream_text(error, 200)}. "
                                "Wait 2-20 min, space requests, avoid parallel loops.")
 
 
@@ -569,7 +859,7 @@ def raise_overload(provider_label: str, error: str | None) -> None:
     from fastapi import HTTPException
 
     raise HTTPException(status_code=503,
-                        detail=f"{provider_label} server busy: {(error or '')[:200]}. "
+                        detail=f"{provider_label} server busy: {scrub_upstream_text(error, 200)}. "
                                "Retry shortly (transient overload).")
 
 
@@ -579,11 +869,11 @@ def raise_upstream_invalid(provider_label: str, prep: dict, error: str | None) -
 
     logger.warning("upstream rejected completion payload (%s); "
                    "prompt_len=%d model=%s",
-                   (error or "")[:500], len(str((prep or {}).get("prompt", ""))),
+                   scrub_upstream_text(error, 500), len(str((prep or {}).get("prompt", ""))),
                    (prep or {}).get("model"))
     raise HTTPException(
         status_code=502,
-        detail=f"{provider_label} rejected the request as invalid ({(error or '')[:800]}). "
+        detail=f"{provider_label} rejected the request as invalid ({scrub_upstream_text(error, 800)}). "
                "The prompt/payload failed upstream validation, not a ban or "
                "rate limit. Retry with a non-empty prompt; if it persists, "
                "the upstream API schema likely changed.")
@@ -593,10 +883,10 @@ def raise_upstream(provider_label: str, error: str | None) -> None:
     """Generic upstream error: 502. Always raises."""
     from fastapi import HTTPException
 
-    logger.warning("upstream completion error: %s", (error or "")[:500])
+    logger.warning("upstream completion error: %s", scrub_upstream_text(error, 500))
     raise HTTPException(
         status_code=502,
-        detail=f"{provider_label} upstream error: {(error or '')[:800]}")
+        detail=f"{provider_label} upstream error: {scrub_upstream_text(error, 800)}")
 
 
 def empty_response_error(provider_label: str):
@@ -611,10 +901,48 @@ def empty_response_error(provider_label: str):
                                 "changed — update deepseaport)")
 
 
+def generic_terminal_handlers(kind, label: str, *, upstream=None) -> dict:
+    """Terminal handlers that only differ by provider label.
+
+    RATE_LIMIT / OVERLOAD / UPSTREAM_INVALID / UPSTREAM carry no provider
+    state -- they are the raise_* helpers above with the provider's display
+    name substituted. Every web2api adapter was re-declaring those four
+    one-line wrappers plus a hand-written dispatch table, so a fix to any
+    raise_* message had to be copied into each provider. Only INVALID_TOKEN
+    and BAN are genuinely provider-specific (they read the stored credential
+    and the account health table), so those stay in the adapter and are
+    merged in by the caller.
+
+    ``kind`` is the provider's own RetryKind enum (the enums are deliberately
+    per-provider; members differ), so the returned dict is keyed the way
+    ``dispatch_terminal`` looks up. ``upstream`` overrides just the
+    UPSTREAM entry for the one provider that needs a distinguishable
+    message there.
+
+    ponytail: one table, keyed per provider. A provider with new terminal
+    states adds its own kind + handler; it does not fork this.
+    """
+    def _rate_limit(app, item, prep, token, error, login_note, ban_until) -> None:
+        raise_rate_limit(label, error)
+
+    def _overload(app, item, prep, token, error, login_note, ban_until) -> None:
+        raise_overload(label, error)
+
+    def _upstream_invalid(app, item, prep, token, error, login_note, ban_until) -> None:
+        raise_upstream_invalid(label, prep, error)
+
+    def _upstream(app, item, prep, token, error, login_note, ban_until) -> None:
+        raise_upstream(label, error)
+
+    return {kind.RATE_LIMIT: _rate_limit,
+            kind.OVERLOAD: _overload,
+            kind.UPSTREAM_INVALID: _upstream_invalid,
+            kind.UPSTREAM: upstream or _upstream}
+
+
 def dispatch_terminal(classify_fn: Callable[[str | None], object],
-                      handlers: dict, fallback: Callable[..., None],
-                      app, item, prep: dict, token: str | None, error: str,
-                      *extra) -> None:
+                      handlers: dict, app, item, prep: dict,
+                      token: str | None, error: str, *extra) -> None:
     """Map a terminal completion error to its HTTP status. Always raises.
 
     Single dispatch: ``classify_fn`` (the provider's ``classify_error``)
@@ -626,12 +954,24 @@ def dispatch_terminal(classify_fn: Callable[[str | None], object],
     without a browser note pass ``login_note=None``; providers without a
     ban envelope pass ``ban_until=None``. ``*extra`` keeps old 6-arg
     callers working during migration, but new code passes both.
+
+    No fallback handler: every provider's ``_TERMINAL_HANDLERS`` is total
+    over its own ``RetryKind``, and this is only reached under ``if error:``
+    (``classify_error`` returns None solely for a falsy error). A missing key
+    is therefore a provider bug, and ``KeyError`` names it at once instead of
+    quietly answering a wrong status.
     """
-    kind = classify_fn(error)
-    (handlers.get(kind, fallback))(app, item, prep, token, error, *extra)
+    handlers[classify_fn(error)](app, item, prep, token, error, *extra)
 
 
 # --- Stream bridge (producer/consumer shared by every provider) -------------
+
+# Read-budgets covered by the buffered consumer watchdog (see
+# ``new_stream_context``): one for the attempt itself, the rest covering
+# session create + PoW solve + one recovery pass (browser login refresh /
+# Obscura warmup). Deliberately a fixed multiple, not a derived budget: the
+# engine has no view of ``max_retries`` and the worst case is unbounded anyway.
+_BUFFERED_PRODUCER_READS = 3
 
 
 def stream_chunk(cid: str, created: int, model: str,
@@ -646,11 +986,23 @@ def stream_chunk(cid: str, created: int, model: str,
 
 def tool_finish_chunks(chunk_fn: Callable[..., bytes], calls,
                        truncated: bool = False):
-    """Tool-call deltas + finish chunk; ``length`` when a call was cut off."""
+    """Tool-call deltas + finish chunk; ``length`` when a call was cut off.
+
+    Every delta carries its own ``index`` -- its position in ``calls``, in
+    emission order -- because that is the only field that tells a consumer
+    which of N parallel calls a delta belongs to (each delta is otherwise a
+    complete, standalone call). OpenAI's streaming contract makes ``index``
+    mandatory on ``tool_calls`` deltas: ``openai-python`` validates each
+    chunk against its pydantic model and raises when it is absent, i.e.
+    inside the stream, mid agent-loop turn; accumulators keyed by ``index``
+    cannot merge parallel calls at all. The non-stream path
+    (``core.openai._openai_response``) needs no index: there the calls
+    arrive as one complete list, so position is implicit.
+    """
     if calls:
-        for call in calls:
+        for i, call in enumerate(calls):
             yield chunk_fn({"tool_calls": [{
-                "id": call["id"], "type": "function",
+                "index": i, "id": call["id"], "type": "function",
                 "function": {"name": call["function"]["name"],
                              "arguments": call["function"]["arguments"]}}]})
         yield chunk_fn({}, "tool_calls")
@@ -671,18 +1023,52 @@ def usage_chunk(cid: str, created: int, model: str, prep: dict,
     try:
         from .openai import build_usage as _build_usage
         usage = _build_usage(prep, content or "", thinking or "", usage_total)
-    except Exception:
-        try:
-            pt = max(1, len(str((prep or {}).get("prompt", "") or "")) // 4)
-            ct = max(1, (len(content or "") + len(thinking or "")) // 4)
-        except Exception:
-            pt, ct = 1, 1
-        usage = {"prompt_tokens": pt, "completion_tokens": ct,
-                 "total_tokens": pt + ct}
+    except Exception:  # pragma: no cover - build_usage is pure and local
+        usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
     return ("data: " + json.dumps(
         {"id": cid, "object": "chat.completion.chunk", "created": created,
          "model": model, "choices": [], "usage": usage},
         ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+# In-band SSE error frames (OpenAI ``{"error": {message, type, code}}``)
+# must be built in ONE place: three call sites in ``drain_stream_queue``
+# (watchdog timeout, propagated HTTPException, any other queued failure)
+# previously hand-rolled the dict and drifted -- some had no ``type`` at
+# all, and ``HTTPException.detail`` is untyped in FastAPI, so a dict detail
+# serialized as a nested JSON object and failed strict SDK deserialization
+# of ``error.message`` (``str`` in the OpenAI schema).
+#
+# ``type`` scheme (chosen so LiteLLM / SDK retry classifiers bucket these
+# the way they bucket api.openai.com):
+#   * 4xx -> ``invalid_request_error``: the caller/bridge rejected the
+#     request (auth, unknown model, rate limit) -- not worth retrying as-is.
+#   * 5xx, and frames raised locally with no HTTP status (the watchdog
+#     timeout, a generic consumer failure) -> ``upstream_error``: the web
+#     upstream broke or stalled, which is a "retry later" bucket. OpenAI's
+#     own 5xx slug is ``server_error``; ``upstream_error`` is the honest
+#     name here because every 5xx this bridge raises originates upstream.
+# ``code`` stays the numeric HTTP status when one is known and ``null``
+# when the failure never had one (OpenAI types it as optional).
+def sse_error_frame(message, status_code=None) -> bytes:
+    """One OpenAI-shaped SSE error frame; ``message`` always a JSON string.
+
+    Clamped and de-tokenized here, not at the call sites: the response has no
+    Content-Length yet, so an unbounded frame is both a reflected megabyte and
+    the one path a locally-raised error takes upstream text into the client.
+    A frame raised on the consumer side (the watchdog timeout, a generic
+    failure) carries whatever ``str(exc)`` held, and the producer tails hand us
+    exactly the upstream body text.
+    """
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError):
+        status = 0
+    kind = "invalid_request_error" if 400 <= status < 500 else "upstream_error"
+    return ("data: " + json.dumps(
+        {"error": {"message": scrub_upstream_text(message, 800),
+                    "type": kind, "code": status or None}},
+        ensure_ascii=False) + "\n\n").encode()
 
 
 def wants_usage(prep: dict) -> bool:
@@ -710,20 +1096,8 @@ async def parse_stream_calls(prep: dict, content: str,
     """
     _real_parse = None
     _real_ex = None
-    try:
-        from .openai import _resolve_parse_fn as _resolve
-        parse_fn, _real_parse, _real_ex = _resolve(parse_fn)
-    except Exception:
-        try:
-            from .tools import parse_tool_calls as _rp
-            from .tools.parser import parse_tool_calls_ex as _re
-            _real_parse, _real_ex = _rp, _re
-        except Exception:
-            pass
-        if parse_fn is None:
-            parse_fn = _real_parse
-            if parse_fn is None:
-                from .tools import parse_tool_calls as parse_fn  # type: ignore[no-redef]
+    from .openai import _resolve_parse_fn
+    parse_fn, _real_parse, _real_ex = _resolve_parse_fn(parse_fn)
     if truncated_fn is None:
         from .tools import looks_truncated_tool_attempt as truncated_fn  # type: ignore[no-redef]
     limit = prep.get("tool_args_max_chars")
@@ -732,31 +1106,21 @@ async def parse_stream_calls(prep: dict, content: str,
     remaining: str = content
     dropped: list[int] | None = None
     diagnostics: list[dict] | None = None
+    kwargs: dict = {"forgiving": forgiving}
+    if limit:
+        kwargs["max_args_chars"] = limit
     if parse_fn is _real_parse and _real_ex is not None:
-        kwargs: dict = {"forgiving": forgiving}
-        if limit:
-            kwargs["max_args_chars"] = limit
         try:
             res = await asyncio.to_thread(
                 _real_ex, content, prep["tools"], **kwargs)
             calls, remaining = res.calls, res.rest
             dropped, diagnostics = res.dropped, res.diagnostics
         except Exception:
-            if limit:
-                calls, remaining = await asyncio.to_thread(
-                    parse_fn, content, prep["tools"],
-                    max_args_chars=limit, forgiving=forgiving)
-            else:
-                calls, remaining = await asyncio.to_thread(
-                    parse_fn, content, prep["tools"], forgiving=forgiving)
+            calls, remaining = await asyncio.to_thread(
+                parse_fn, content, prep["tools"], **kwargs)
     else:
-        if limit:
-            calls, remaining = await asyncio.to_thread(
-                parse_fn, content, prep["tools"],
-                max_args_chars=limit, forgiving=forgiving)
-        else:
-            calls, remaining = await asyncio.to_thread(
-                parse_fn, content, prep["tools"], forgiving=forgiving)
+        calls, remaining = await asyncio.to_thread(
+            parse_fn, content, prep["tools"], **kwargs)
     truncated = False
     if not calls:
         try:
@@ -767,55 +1131,13 @@ async def parse_stream_calls(prep: dict, content: str,
             logger.warning("stream tool call looks truncated model=%s preview=%.200s",
                            prep.get("model"), (content or "")[:200])
         else:
-            # Rich miss log (single home in core.openai.format_miss_trail):
-            # diagnostics say unknown-name vs oversize vs format drift.
-            try:
-                if diagnostics is None and _real_ex is not None:
-                    from .tools import _valid_names as _vn
-                    kwargs2: dict = {"forgiving": forgiving}
-                    if limit:
-                        kwargs2["max_args_chars"] = limit
-                    res2 = await asyncio.to_thread(
-                        _real_ex, content or "", prep.get("tools") or [],
-                        **kwargs2)
-                    diagnostics = res2.diagnostics
-                    try:
-                        valid = _vn(prep.get("tools"))
-                    except Exception:
-                        valid = None
-                    try:
-                        from .openai import format_miss_trail as _fmt
-                        trail = _fmt(diagnostics, valid)
-                    except Exception:
-                        trail = None
-                else:
-                    trail = None
-                    if diagnostics is not None:
-                        try:
-                            from .tools import _valid_names as _vn2
-                            valid2 = _vn2(prep.get("tools"))
-                        except Exception:
-                            valid2 = None
-                        try:
-                            from .openai import format_miss_trail as _fmt2
-                            trail = _fmt2(diagnostics, valid2)
-                        except Exception:
-                            trail = None
-                if trail:
-                    logger.warning(
-                        "stream tool-call miss model=%s forgiving=%s %s "
-                        "preview=%.300s",
-                        prep.get("model"), forgiving, trail,
-                        (content or "")[:300])
-                else:
-                    logger.debug("stream no tool call parsed model=%s preview=%.200s",
-                                 prep.get("model"), (content or "")[:200])
-            except Exception:
-                logger.debug("stream no tool call parsed model=%s preview=%.200s",
-                             prep.get("model"), (content or "")[:200])
+            # Rich miss log, single home in core.openai._alog_tool_miss: the
+            # diagnostics trail says unknown-name vs oversize vs format drift.
+            from .openai import _alog_tool_miss
+            await _alog_tool_miss(prep, content, diagnostics, where="stream")
     elif dropped:
-        logger.warning("stream tool-call partial drop model=%s dropped=%s",
-                       prep.get("model"), list(dropped))
+        from .openai import _log_tool_dropped
+        _log_tool_dropped(prep, dropped, where="stream")
     return calls, remaining, truncated
 
 
@@ -836,8 +1158,7 @@ async def drain_stream_queue(out: asyncio.Queue, prep: dict, live: bool,
         try:
             kind, payload = await asyncio.wait_for(out.get(), timeout=consumer_timeout)
         except asyncio.TimeoutError:
-            yield ("data: " + json.dumps({"error": {"message": "upstream timed out"}},
-                                         ensure_ascii=False) + "\n\n").encode()
+            yield sse_error_frame("upstream timed out")
             yield b"data: [DONE]\n\n"
             return
         if kind == "thinking":
@@ -862,12 +1183,9 @@ async def drain_stream_queue(out: asyncio.Queue, prep: dict, live: bool,
                 for piece in tool_finish_chunks(chunk, calls, truncated):
                     yield piece
                 if wants_usage(prep):
-                    try:
-                        _ut = payload.get("usage_total")
-                    except Exception:
-                        _ut = None
-                    yield usage_chunk(cid, created, model, prep,
-                                      content, thinking, _ut)
+                    # payload["content"]/["thinking"] already unpacked at 1127.
+                    yield usage_chunk(cid, created, model, prep, content,
+                                      thinking, payload.get("usage_total"))
             elif prep.get("tools"):
                 calls, remaining, truncated = await parse_stream_calls(
                     prep, payload["content"], parse_fn, truncated_fn)
@@ -876,51 +1194,57 @@ async def drain_stream_queue(out: asyncio.Queue, prep: dict, live: bool,
                 for piece in tool_finish_chunks(chunk, calls, truncated):
                     yield piece
                 if wants_usage(prep):
-                    try:
-                        _ut = payload.get("usage_total")
-                        _th = payload.get("thinking", "")
-                        _co = payload.get("content", "")
-                    except Exception:
-                        _ut, _th, _co = None, "", ""
-                    yield usage_chunk(cid, created, model, prep, _co, _th, _ut)
+                    yield usage_chunk(cid, created, model, prep,
+                                      payload.get("content", ""),
+                                      payload.get("thinking", ""),
+                                      payload.get("usage_total"))
             else:
                 yield chunk({}, "stop")
                 if wants_usage(prep):
-                    try:
-                        _ut = payload.get("usage_total")
-                        _th = payload.get("thinking", "")
-                        _co = payload.get("content", "")
-                    except Exception:
-                        _ut, _th, _co = None, "", ""
-                    yield usage_chunk(cid, created, model, prep, _co, _th, _ut)
+                    yield usage_chunk(cid, created, model, prep,
+                                      payload.get("content", ""),
+                                      payload.get("thinking", ""),
+                                      payload.get("usage_total"))
             yield b"data: [DONE]\n\n"
             return
         if kind == "http_error":
             err = payload
-            yield ("data: " + json.dumps({"error": {"message": err.detail,
-                                                    "code": err.status_code}},
-                                         ensure_ascii=False) + "\n\n").encode()
+            yield sse_error_frame(err.detail, err.status_code)
             yield b"data: [DONE]\n\n"
             return
-        yield ("data: " + json.dumps({"error": {"message": str(payload)}},
-                                     ensure_ascii=False) + "\n\n").encode()
+        yield sse_error_frame(payload)
         yield b"data: [DONE]\n\n"
         return
 
 
-def new_stream_context(prep: dict, stream_timeout: float,
-                       consumer_grace: float = 10.0):
+def new_stream_context(stream_timeout: float,
+                       consumer_grace: float = 10.0, buffered: bool = False):
     """Allocate one stream's (cid, created, queue, cancel_event, timeouts).
 
     Thin constructor so providers share the exact queue/cancel/timeout shape:
-    the consumer wait outlasts the blocking stream timeout so the async
-    reader never times out while the producer is still on a valid long reply.
+    the consumer wait outlasts the blocking stream timeout so the async reader
+    never times out while the producer is still on a valid long reply.
+
+    ``stream_timeout`` is ONE socket read, which is the right budget for live
+    mode (every delta resets the per-``get`` clock, so it only measures
+    genuine silence) but far too small for buffered mode, where the producer
+    emits nothing until the whole reply lands: the timer then covers the ENTIRE
+    producer -- session create (30s) + PoW solve + the reply + up to
+    ``max_retries`` recovery passes, any of which can include a ~180s browser
+    login refresh and an Obscura warmup. Sizing it from one read killed a
+    healthy-but-slow upstream with a client-visible
+    ``{"error": {"message": "upstream timed out"}}`` and threw away a valid
+    answer. ``buffered=True`` therefore multiplies the budget by
+    ``_BUFFERED_PRODUCER_READS`` (setup + one full recovery pass of headroom);
+    live mode passes ``False`` and keeps the single-read budget exactly.
     """
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
     out: asyncio.Queue = asyncio.Queue()
     cancel_event = threading.Event()
     consumer_timeout = float(stream_timeout) + float(consumer_grace)
+    if buffered:
+        consumer_timeout *= _BUFFERED_PRODUCER_READS
     return cid, created, out, cancel_event, consumer_timeout
 
 
@@ -953,17 +1277,19 @@ def ban_until_of(outcome) -> float | None:
 
 
 def new_producer_context(prep: dict, client_timeout: float,
-                         consumer_grace: float = 10.0):
+                         consumer_grace: float = 10.0, buffered: bool = False):
     """Shared _stream_completion prelude: context + model + emit closures.
 
     Owns ``new_stream_context`` + ``prep["model"]`` + the running loop +
     ``_emit``/``_put`` pair so the three providers share one queue/cancel/
     emit shape. The producer bodies stay provider-specific (failover entry
     vs live token tail); the bounded-executor submit stays at the call site
-    so the executor property remains greppable per provider.
+    so the executor property remains greppable per provider. ``buffered``
+    is forwarded to the watchdog sizing (see ``new_stream_context``) and
+    defaults to False so every existing call site keeps its exact budget.
     """
     cid, created, out, cancel_event, consumer_timeout = new_stream_context(
-        prep, client_timeout, consumer_grace)
+        client_timeout, consumer_grace, buffered=buffered)
     model = prep["model"]
     try:
         loop = asyncio.get_running_loop()

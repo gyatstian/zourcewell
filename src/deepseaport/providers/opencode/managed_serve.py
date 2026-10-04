@@ -12,10 +12,13 @@ plugin). The user's own opencode setup is never touched:
   left intact, so plain ``opencode`` runs exactly as before;
 - the parent's ``OPENCODE_CONFIG`` file path is dropped from the child env
   (config merges additively, so it would otherwise leak user instructions
-  into the managed instance);
+  into the managed instance), as is every well-known third-party provider key
+  (see ``_CHILD_ENV_DENY_NAMES``);
 - an ephemeral basic-auth password is generated per boot and only shared
-  between the child and this process (plus a ``0o600`` port file so extra
-  deepseaport workers can reuse the same instance);
+  between the child and this process (the port file and every managed dir are
+  created owner-only 0700 on POSIX, with a one-shot Windows ACL warning, so
+  extra deepseaport workers can reuse the same instance without publishing
+  the password to other local users);
 - an explicitly user-configured ``DEEPSEAPORT_OPENCODE_BASE`` is respected:
   managed boot is skipped entirely and the user's serve is used as-is.
 
@@ -31,12 +34,14 @@ import json
 import logging
 import os
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -99,15 +104,16 @@ export const DeepSeaportStripSystem = async () => ({
 
 def managed_config_content() -> str:
     """Inline opencode config (highest precedence) for the managed instance."""
-    # read+bash stay allowed (declared, not used): the free-tier gatekeeper
-    # needs them effective upstream (an explicit all-false tool list 403s
-    # with "only be used from within OpenCode"; omitting the per-message
-    # key passes via these agent defaults on opencode 1.18.32). The agent
-    # prompt forces text-only output so the harness (e.g. pi) owns
-    # execution; sessions are pinned to the caller's workdir via
-    # `?directory=` (see protocol.session_directory) so any accidental
-    # native tool still runs where the harness expects.
-    perms = {"read": "allow", "edit": "deny", "bash": "allow",
+    # read stays allowed, bash is DENIED: the free-tier gatekeeper needs both
+    # keys *declared* (an explicit all-false tool list 403s with "only be used
+    # from within OpenCode"; omitting the per-message key passes via these
+    # agent defaults on opencode 1.18.32), but the declared value must not hand
+    # the model native shell access — a prompt-injection chain must not be able
+    # to run commands in a process that already holds the operator's env (see
+    # _child_env) and cwd. The agent prompt forces text-only output so the
+    # harness (e.g. pi) owns execution; sessions are pinned to the caller's
+    # workdir via `?directory=` (see protocol.session_directory).
+    perms = {"read": "allow", "edit": "deny", "bash": "deny",
              "webfetch": "deny", "external_directory": "deny"}
     cfg = {
         "$schema": "https://opencode.ai/config.json",
@@ -154,7 +160,15 @@ def write_isolated_files(base: Path) -> dict[str, Path]:
     via OPENCODE_CONFIG_DIR), ``home/`` (XDG_CONFIG_HOME target, stays
     empty), ``serve.log`` and ``serve.json`` (port/password reuse file).
     Pure file work; never touches the real HOME. Never raises.
+
+    ``base`` and every subdir are created 0700 on POSIX: ``serve.json`` holds
+    the live basic-auth password in cleartext and mkdir()'s umask default is
+    0755, which left it world-readable. Same helper the obscura cookie-jar
+    dir uses (``core.obscura_bridge.secure_dir``), plus the one-shot Windows
+    ACL warning, because chmod is a no-op there.
     """
+    from ...core.obscura_bridge import secure_dir, warn_inherited_acl_once
+
     paths = {
         "work": base / "work",
         "cfg": base / "cfg",
@@ -163,11 +177,19 @@ def write_isolated_files(base: Path) -> dict[str, Path]:
         "port_file": base / "serve.json",
     }
     try:
-        paths["work"].mkdir(parents=True, exist_ok=True)
-        (paths["cfg"] / "plugins").mkdir(parents=True, exist_ok=True)
-        paths["home"].mkdir(parents=True, exist_ok=True)
+        for target in (base, paths["work"], paths["cfg"], paths["home"],
+                       paths["cfg"] / "plugins"):
+            secure_dir(target, "managed opencode dir")
     except Exception:
         return paths
+    try:
+        warn_inherited_acl_once(
+            paths["port_file"],
+            secret="the per-boot opencode basic-auth password it stores in "
+                   "cleartext (and the base URL any local process can then use)",
+            label="managed opencode port file")
+    except Exception:
+        pass
     try:
         plugin = paths["cfg"] / "plugins" / "strip-system.js"
         if (not plugin.exists()
@@ -222,6 +244,10 @@ def _read_port_file(port_file: Path) -> tuple[str, str, int, str]:
 
 def _write_port_file(port_file: Path, base: str, password: str,
                      pid: int, config_hash: str) -> None:
+    # 0600 is real on POSIX only; on Windows os.chmod merely toggles the
+    # read-only attribute and the file keeps its directory's DACL, which is
+    # why write_isolated_files also emits the one-shot ACL warning for this
+    # file. The parent dir is 0700 on POSIX, so the mode here is belt-and-braces.
     try:
         port_file.write_text(json.dumps(
             {"base": base, "password": password, "pid": pid,
@@ -234,9 +260,264 @@ def _write_port_file(port_file: Path, base: str, password: str,
         pass
 
 
+# Subprocess probe timeout for the command-line read in _process_command_line.
+# The Windows path spawns a PowerShell (or wmic) child, so it is not free; it
+# runs only on the stale-serve reap path (a config-hash change with an
+# unhealthy recorded base), never per request.
+_CMDLINE_PROBE_TIMEOUT = 5.0
+# What the managed child's command line must LOOK like for the reaper to signal
+# it. These are the executable and the subcommand, and they are matched as
+# argv[0]'s basename and as a standalone argv element -- never as substrings
+# of the rendered line. The substring form was no gate at all:
+# `notepad.exe C:\opencode\serve.txt`, `powershell -c Write-Host opencode
+# serve` and `calc.exe serve opencode` all satisfied it, so anything that
+# could write serve.json could still aim the SIGTERM at a stranger.
+_SERVE_BIN_NAME = "opencode"
+_SERVE_SUBCOMMAND = "serve"
+
+
+def _posix_command_line(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+    except (OSError, ValueError, TypeError):
+        return ""
+    # NUL-separated argv; join so a substring check sees one line.
+    return " ".join(p.decode("utf-8", "replace")
+                    for p in raw.split(b"\0") if p)
+
+
+def _windows_command_line(pid: int) -> str:
+    """CIM query first (present on every current Windows), wmic as fallback.
+
+    Neither is a dependency: a stripped-down image without PowerShell or
+    wmic, a locked-down host, or a timeout all return "" and the caller
+    refuses to signal the pid. Losing the reap is the acceptable outcome;
+    signalling a stranger is not.
+    """
+    attempts = (
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         f"(Get-CimInstance Win32_Process -Filter \"ProcessId={int(pid)}\").CommandLine"],
+        ["wmic", "process", "where", f"processid={int(pid)}", "get", "commandline"],
+    )
+    for argv in attempts:
+        exe = shutil.which(argv[0])
+        if not exe:
+            continue
+        creationflags = 0
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        except Exception:
+            creationflags = 0
+        try:
+            done = subprocess.run(
+                [exe, *argv[1:]], capture_output=True, text=True, errors="replace",
+                timeout=_CMDLINE_PROBE_TIMEOUT, creationflags=creationflags)
+        except Exception:
+            continue
+        if getattr(done, "returncode", 1) != 0:
+            continue
+        out = str(getattr(done, "stdout", "") or "")
+        if not out.strip():
+            continue
+        if out.lstrip().lower().startswith("commandline"):
+            # wmic prints a header row above the value.
+            out = out.split("\n", 1)[1] if "\n" in out else ""
+        return " ".join(out.split())
+    return ""
+
+
+def _process_command_line(pid: int) -> str:
+    """Command line of ``pid`` as one string; "" when it cannot be read.
+
+    Never raises: the only caller is the reaper, which must not be able to
+    fail a request (or guess).
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return ""
+    if pid <= 0:
+        return ""
+    try:
+        return (_windows_command_line(pid) if os.name == "nt"
+                else _posix_command_line(pid))
+    except Exception:
+        return ""
+
+
+def _split_argv(cmdline: str) -> list[str]:
+    """Command line -> argv list; ``[]`` when it cannot be parsed (never raises).
+
+    Two quoting dialects, and picking the wrong one is a security bug, not a
+    cosmetic one: POSIX ``shlex`` mode eats backslashes, so
+    ``C:\\oc\\opencode.exe`` would come back as ``C:ocopencode.exe``. On
+    Windows the non-POSIX splitter runs instead and the quotes it leaves
+    behind are stripped (``shlex`` has no CommandLineToArgvW backslash rule --
+    irrelevant here because only argv[0]'s basename, the ``serve`` element and
+    ``--port`` are read). A line with an unbalanced quote raises inside
+    ``shlex`` and yields ``[]``, which the caller reads as "not identifiable".
+
+    The reader above already collapsed ``/proc/<pid>/cmdline`` into one
+    string, so this re-splits it. The only lossy case is a POSIX argv element
+    that itself contains a space and no quotes (``a b serve``); the identity
+    check does not depend on it and a quoted path round-trips exactly.
+    """
+    try:
+        raw = " ".join(str(cmdline or "").split())  # fold the reader's newlines
+        if not raw:
+            return []
+        if os.name == "nt":
+            tokens = shlex.split(raw, posix=False)
+            return [t for t in (str(tok).strip().strip('"').strip("'")
+                               for tok in tokens) if t]
+        return shlex.split(raw)
+    except Exception:
+        return []
+
+
+def _exe_basename(command: str) -> str:
+    """``opencode.exe`` -> ``opencode``; quotes, separators and case folded."""
+    try:
+        raw = str(command or "").strip().strip('"').strip("'")
+        name = raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        if name.lower().endswith(".exe"):
+            name = name[:-4]
+        return name.strip().lower()
+    except Exception:
+        return ""
+
+
+def _serve_binary_names() -> set[str]:
+    """Acceptable argv[0] basenames: the literal name plus what PATH resolves.
+
+    A recorded binary that is not the one on PATH is still the same program
+    (two opencode installs, a moved shim), so a name mismatch is never
+    disqualifying on its own -- only a non-``opencode`` name is.
+    """
+    names = {_SERVE_BIN_NAME}
+    try:
+        resolved = shutil.which(_SERVE_BIN_NAME)
+    except Exception:
+        resolved = ""
+    if resolved:
+        base = _exe_basename(resolved)
+        if base:
+            names.add(base)
+    return names
+
+
+def _argv_port(argv: list[str]) -> int:
+    """``--port N`` / ``--port=N`` in argv; 0 when absent or unreadable."""
+    try:
+        for idx, tok in enumerate(argv):
+            if tok == "--port" and idx + 1 < len(argv):
+                return int(str(argv[idx + 1]).strip())
+            if tok.startswith("--port="):
+                return int(tok.split("=", 1)[1].strip())
+    except Exception:
+        return 0
+    return 0
+
+
+def _base_port(base: str) -> int:
+    """Port of a base URL; 0 when it carries none."""
+    try:
+        return int(urllib.parse.urlsplit(str(base or "").strip()).port or 0)
+    except Exception:
+        return 0
+
+
+def _looks_like_managed_serve(cmdline: str, expected_base: str = "") -> bool:
+    """True only when a command line IS the managed ``opencode serve``.
+
+    An identity check, not a resemblance check, because the pid this gates
+    comes from an ordinary JSON file in the data dir:
+
+    * ``argv[0]``'s basename must be the opencode binary name, case-folded
+      and extension-insensitive (Windows: ``opencode.exe`` == ``opencode``).
+      ``shutil.which`` is consulted when it resolves, so an install whose
+      binary carries a different suffix still matches, and a bare ``opencode``
+      on PATH (argv[0] with no directory) is accepted on the name alone --
+      which is what the child is actually spawned as. Anything else is a
+      stranger: notepad, powershell, calc, a file named ``serve.exe``.
+    * ``serve`` must be a real argv element, not a word somewhere in the
+      line. The line is split into argv first (POSIX quoting on POSIX,
+      CommandLineToArgvW-style quoting on Windows) so a quoted path and a
+      path-less invocation both parse.
+    * ``--port N``, when present, must agree with the base URL recorded
+      alongside the pid. A serve on another port is not the instance whose
+      pid was recorded.
+
+    Returns False on ANY failure to read or parse: an unreadable command
+    line, an unbalanced quote, an empty argv. The caller then skips the
+    signal (see :func:`_kill_pid`), so the cost is a stale process and a busy
+    port -- ``ensure()`` boots a fresh instance on a new free port anyway --
+    while signalling a stranger is not recoverable. Never raises.
+    """
+    try:
+        argv = _split_argv(cmdline)
+        if len(argv) < 2:
+            return False
+        if _exe_basename(argv[0]) not in _serve_binary_names():
+            return False
+        if not any(tok.lower() == _SERVE_SUBCOMMAND for tok in argv[1:]):
+            return False
+        port = _argv_port(argv)
+        if port and expected_base:
+            want = _base_port(expected_base)
+            if want and want != port:
+                logger.warning(
+                    "managed serve reaper: recorded base %s is port %d but the "
+                    "pid's command line says --port %d; not signalling it.",
+                    expected_base, want, port)
+                return False
+        return True
+    except Exception:  # pragma: no cover - defensive, contract is "never raises"
+        return False
+
+
 def _kill_pid(pid: int) -> None:
-    """Best-effort SIGTERM of a stale managed serve (never raises)."""
+    """Best-effort SIGTERM of a stale managed serve (never raises).
+
+    The pid comes out of ``data/opencode-managed/serve.json`` -- an ordinary
+    file in the data dir -- and the only gate used to be a probe against a
+    base URL stored in that SAME file, so anything that could write that
+    file (another same-user process, a sync conflict, a stale copy of a
+    checkout) could aim the signal at an arbitrary process of this user on
+    the next deepseaport start.
+
+    So the target is identified before it is signalled: its command line
+    must be the ``opencode serve`` we boot -- the opencode binary as argv[0]
+    with ``serve`` as a real argument (see
+    :func:`_looks_like_managed_serve`), and its ``--port`` must agree with the
+    base URL recorded next to the pid in the SAME serve.json. Anything else --
+    a different program, a recycled pid, an unreadable or unparseable command
+    line -- is skipped, and the reap simply does not happen: ``ensure()`` boots
+    a fresh instance on a new free port anyway, so the cost is a stale process
+    and a busy port, never a stranger's process.
+    """
     if not pid or pid == os.getpid():
+        return
+    try:
+        cmdline = _process_command_line(pid)
+    except Exception:
+        cmdline = ""
+    # The base recorded alongside the pid: an extra "this is the instance we
+    # recorded" check. Read here rather than passed in so the pid and the base
+    # can never come from different snapshots, and so an unreadable/missing
+    # port file simply skips the cross-check instead of blocking a legitimate
+    # reap.
+    try:
+        expected_base = _read_port_file(managed_base_dir() / "serve.json")[0]
+    except Exception:
+        expected_base = ""
+    if not _looks_like_managed_serve(cmdline, expected_base):
+        logger.warning(
+            "managed serve reaper: pid %s does not look like 'opencode "
+            "serve' (command line %s); not signalling it. The stale serve is "
+            "left running and a fresh one boots on a new port -- delete %s "
+            "if that persists.", pid, "unreadable" if not cmdline else "different",
+            managed_base_dir() / "serve.json")
         return
     try:
         import signal
@@ -253,10 +534,139 @@ def _kill_pid(pid: int) -> None:
         pass
 
 
+# Grace between terminate() and the kill() escalation. shutdown() already
+# waited this long for a SIGTERM to land; the reap helpers now share it.
+_TERMINATE_WAIT = 5.0
+
+
+def _terminate_proc(proc, timeout: float = _TERMINATE_WAIT) -> None:
+    """terminate() a managed child, then wait() for it; escalate to kill().
+
+    ``wait()`` is what actually reaps, so every managed-child exit goes
+    through here. A bare ``terminate()`` leaves the child unreaped -- a POSIX
+    zombie until the garbage collector gets round to the ``Popen`` (where its
+    table entry is still busy) and, on Windows, an unowned live process
+    holding its port. On ensure()'s not-ready path nothing else would ever
+    wait on that child at all: ``_proc`` is not assigned before it returns.
+
+    A child that ignores SIGTERM is killed rather than left running: an
+    orphan ``opencode serve`` is a hole in the isolation the managed instance
+    exists to provide. Never raises.
+    """
+    try:
+        alive = proc.poll() is None
+    except Exception:
+        alive = True
+    if alive:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        return
+    try:
+        proc.wait(timeout=timeout)
+    except Exception:
+        pass
+
+
+def _reap_previous_child(recorded_pid: int = 0) -> None:
+    """Retire the managed child a fresh boot is about to replace.
+
+    ``_proc`` is the only handle ``shutdown()`` and the ``atexit`` hook know,
+    so the ``_proc = proc`` assignment at the end of :func:`ensure` makes the
+    previous child unreachable the moment a new instance boots. The scenario
+    is not exotic: the reuse probe is a 2 s ``GET /global/health``, so an
+    *unresponsive* -- not dead -- serve (a loaded box, a wedged agent loop)
+    misses it, and ensure() boots a fresh instance on a new free port. The
+    orphan then keeps its port, its ``work/`` cwd and its per-boot basic-auth
+    password for the life of the bridge, serving an instance (with the
+    managed agent's ``bash: "deny"`` map) that nothing can reach or shut down
+    again -- and ``ensure()`` runs from every serve-down error path
+    (completion_service.py:202, 288), so they accumulated.
+
+    The tracked ``_proc`` is reaped by handle: we spawned it, so it cannot be
+    a stranger and the identity gate is not needed. Only when the handle is
+    gone (module reloaded, the port file written by another process) does the
+    recorded pid go through the gated :func:`_kill_pid`, which refuses to
+    signal anything that does not look like the managed serve. Never raises.
+    """
+    global _proc
+    proc, _proc = _proc, None
+    if proc is not None:
+        _terminate_proc(proc)
+        return
+    if recorded_pid:
+        _kill_pid(recorded_pid)
+
+
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+# Env prefixes stripped from the managed child. The child is an agentic CLI
+# with native read/bash rooted at the operator's cwd, and .env.example
+# documents DEEPSEAPORT_KEYS / DEEPSEEK_EMAIL / DEEPSEEK_PASSWORD /
+# DEEPSEEK_TOKEN — a sourced .env therefore lands verbatim in a process the
+# model can be talked into reading (or echoing) via a prompt-injection chain
+# in a user message. The agent prompt is a prompt-level control only; the env
+# is a real boundary. Everything the child legitimately needs is set
+# explicitly in ensure() right after this strip.
+_CHILD_ENV_STRIP_PREFIXES = ("DEEPSEAPORT_", "DEEPSEEK_", "OPENCODE_")
+
+# ...and the well-known THIRD-PARTY credentials the prefixes do not cover. The
+# operator's own provider keys (Anthropic/OpenAI/GitHub/AWS/Azure/Google) are
+# worth the same protection as deepseaport's: today the exploit path is closed
+# (bash is denied, external_directory is denied, the agent prompt forces text
+# output), but this strip exists for exactly the day a native tool is granted
+# again, and a leaked ANTHROPIC_API_KEY is a bill someone else pays.
+#
+# Deny-shaped on purpose. A prefix rule fails open for every provider that
+# ships after this list was written, and nothing in the codebase would notice;
+# an explicit name has to be consciously added by whoever adds the key. The
+# trade-off is a false negative, which costs nothing here, over a false
+# positive, which would silently break a child that needs the variable. Nothing
+# the child legitimately needs may be listed: the isolation keys and the
+# per-boot password are set explicitly in ensure() AFTER this strip, and
+# ``_CHILD_ENV_STRIP_PREFIXES`` already covers the OPENCODE_* family.
+_CHILD_ENV_DENY_NAMES = frozenset({
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GITHUB_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AZURE_OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+})
+
+
+def _child_env(source: dict | None = None) -> dict:
+    """Copy the parent env with every secret-bearing deepseaport/opencode key
+    removed. Names only are ever logged; values are never touched elsewhere."""
+    env = dict(os.environ if source is None else source)
+    dropped = 0
+    for key in [k for k in env
+                if str(k).upper().startswith(_CHILD_ENV_STRIP_PREFIXES)
+                or str(k).upper() in _CHILD_ENV_DENY_NAMES]:
+        env.pop(key, None)
+        dropped += 1
+    if dropped:
+        try:
+            logger.debug("managed serve child env: dropped %d "
+                         "DEEPSEAPORT_/DEEPSEEK_/OPENCODE_* or known "
+                         "third-party credential key(s)", dropped)
+        except Exception:
+            pass
+    return env
 
 
 def ensure(timeout: float = 30.0) -> str | None:
@@ -282,6 +692,11 @@ def ensure(timeout: float = 30.0) -> str | None:
                 return _managed_base
             old_base, old_password, old_pid, old_hash = _read_port_file(
                 paths["port_file"])
+            # Whether the recorded pid is already retired below, so the
+            # pre-boot reap does not signal the same pid a second time (which
+            # would fail the identity gate on a now-dead process and log a
+            # misleading "not signalling it" warning).
+            old_pid_reaped = False
             if old_base and old_password and _probe(old_base, old_password):
                 if not wanted_hash or old_hash == wanted_hash:
                     _managed_base, _managed_password = old_base, old_password
@@ -291,6 +706,7 @@ def ensure(timeout: float = 30.0) -> str | None:
                     return old_base
                 logger.info("managed serve config changed, restarting it")
                 _kill_pid(old_pid)
+                old_pid_reaped = True
             binary = shutil.which("opencode")
             if not binary:
                 logger.warning("opencode binary not found on PATH; "
@@ -307,14 +723,24 @@ def ensure(timeout: float = 30.0) -> str | None:
                 pass
             logger.info("managed serve binary: %s (log %s)",
                         cli_version or "version unknown", paths["log"])
+            # Past this point a new child is definitely starting, so retire
+            # whatever is running first: replacing `_proc` orphans the old
+            # serve for the life of the process (see _reap_previous_child).
+            # Deliberately after the binary check -- with no binary there is
+            # no replacement to install and the previous child stays.
+            _reap_previous_child(0 if old_pid_reaped else old_pid)
             port = _find_free_port()
             password = secrets.token_urlsafe(32)
             base = f"http://127.0.0.1:{port}"
-            env = dict(os.environ)
+            env = _child_env()
+            # Explicit child-only env, set AFTER the strip above so these
+            # survive it (XDG/OPENCODE isolation keys + the per-boot password).
             env["XDG_CONFIG_HOME"] = str(paths["home"])
             env["OPENCODE_CONFIG_DIR"] = str(paths["cfg"])
             env["OPENCODE_CONFIG_CONTENT"] = managed_config_content()
-            env.pop("OPENCODE_CONFIG", None)
+            # The parent's OPENCODE_CONFIG path was already dropped by the
+            # strip above (config merges additively, so it would otherwise leak
+            # user instructions into the managed instance).
             env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
             env["OPENCODE_DISABLE_CLAUDE_CODE"] = "1"
             env["OPENCODE_SERVER_PASSWORD"] = password
@@ -361,10 +787,9 @@ def ensure(timeout: float = 30.0) -> str | None:
             except Exception:
                 pass
             if not ready:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                # Never adopted (`_proc` is not assigned on this path), so
+                # terminate + wait here or the child stays unreaped forever.
+                _terminate_proc(proc)
                 return None
             _proc = proc
             _managed_base, _managed_password = base, password
@@ -392,17 +817,7 @@ def shutdown() -> None:
     global _proc
     try:
         proc, _proc = _proc, None
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        if proc is not None:
+            _terminate_proc(proc)
     except Exception:
         pass

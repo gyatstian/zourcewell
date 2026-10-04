@@ -14,7 +14,6 @@ this module.
 
 from __future__ import annotations
 
-import asyncio
 import enum
 import logging
 import threading
@@ -34,7 +33,6 @@ from ...core.tools import (
     parse_tool_calls as _parse_tool_calls_local,
 )
 from ...server_concurrency import (
-    _CLEANUP_EXECUTOR,
     _CONSUMER_GRACE_SECONDS,
     _STREAM_EXECUTOR,
     _StreamCancelled,
@@ -96,36 +94,6 @@ def _app_settings(app: FastAPI):
     return _engine.app_settings(app)
 
 
-def _delete_session_bg(session_id: str | None, enabled: bool = True) -> None:
-    """Best-effort session cleanup without blocking the response."""
-    if not enabled or not session_id:
-        return
-
-    def _run() -> None:
-        try:
-            OC.delete_session(session_id)
-        except Exception:
-            pass
-
-    try:
-        _CLEANUP_EXECUTOR.submit(_run)
-    except Exception:
-        pass
-
-
-def _terminal_rate_limit(app, item, prep, token, error, login_note, stream_ban_until) -> None:
-    # login_note/stream_ban_until ignored: no accounts, dispatch uniformity only.
-    _engine.raise_rate_limit("Opencode", error)
-
-
-def _terminal_overload(app, item, prep, token, error, login_note, stream_ban_until) -> None:
-    _engine.raise_overload("Opencode", error)
-
-
-def _terminal_upstream_invalid(app, item, prep, token, error, login_note, stream_ban_until) -> None:
-    _engine.raise_upstream_invalid("Opencode", prep, error)
-
-
 def _terminal_upstream(app, item, prep, token, error, login_note, stream_ban_until) -> None:
     # login_note ignored (dispatch uniformity). Serve-down stays a distinct
     # 502 with an actionable message (managed-serve boot), not generic 502.
@@ -136,18 +104,17 @@ def _terminal_upstream(app, item, prep, token, error, login_note, stream_ban_unt
     _engine.raise_upstream("Opencode", error)
 
 
-_TERMINAL_HANDLERS: dict[RetryKind, Callable[..., None]] = {
-    RetryKind.RATE_LIMIT: _terminal_rate_limit,
-    RetryKind.OVERLOAD: _terminal_overload,
-    RetryKind.UPSTREAM_INVALID: _terminal_upstream_invalid,
-    RetryKind.UPSTREAM: _terminal_upstream,
-}
+# RATE_LIMIT/OVERLOAD/UPSTREAM_INVALID are the label-only handlers every
+# provider shares (core.engine); UPSTREAM is overridden because serve-down
+# needs its own actionable message.
+_TERMINAL_HANDLERS: dict[RetryKind, Callable[..., None]] = _engine.generic_terminal_handlers(
+    RetryKind, "Opencode", upstream=_terminal_upstream)
 
 
 def _raise_for_terminal_error(app, item, prep, token, error, login_note, stream_ban_until) -> None:
     """Map a terminal completion error to its HTTP status. Always raises."""
     _engine.dispatch_terminal(classify_error, _TERMINAL_HANDLERS,
-                              _terminal_upstream, app, item, prep, token,
+                              app, item, prep, token,
                               error, login_note, stream_ban_until)
 
 
@@ -351,8 +318,12 @@ def _attempt_live(prompt: str, model: str, timeout: float,
                 # Live tail never started (SSE/connect failure): fall back to
                 # the blocking POST on a fresh session so the request still
                 # succeeds with buffered (chunked) SSE downstream.
+                # Scrubbed before the 100-char slice: a slice is not a redactor,
+                # and `err` is a raw upstream message. serve is localhost with
+                # no account credential, but it is still a process whose prose
+                # reaches the log file and any shipper reading it.
                 logger.info("opencode live tail failed (%s), falling back to "
-                            "blocking", (err or "")[:100])
+                            "blocking", _engine.scrub_upstream_text(err, 100))
                 try:
                     OC.delete_session(session_id)
                 except Exception:
@@ -438,7 +409,10 @@ def _run_completion_core(
     _do_attempt()
     # Stale-session race: one recreate-and-resend outside the retry budget.
     if error is not None and P.is_session_error(error) and not _cancelled():
-        logger.info("opencode session race (%s), recreating once", (error or "")[:80])
+        # Scrubbed before the 80-char slice: a slice is a length guard, not a
+        # secret guard, and `error` is a raw upstream message.
+        logger.info("opencode session race (%s), recreating once",
+                    _engine.scrub_upstream_text(error, 80))
         _do_attempt()
 
     def _recover_overload() -> None:
@@ -449,7 +423,7 @@ def _run_completion_core(
         wait = min(2.0 * _overload_waits, 8.0)
         logger.info("opencode overloaded (%s), retrying in %.0fs "
                     "(retries left %s)",
-                    (error or "")[:80], wait, max_retries)
+                    _engine.scrub_upstream_text(error, 80), wait, max_retries)
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
             if _cancelled():
@@ -459,15 +433,21 @@ def _run_completion_core(
             return
         _do_attempt()
 
+    # Same shape the two web providers use, so the one-row table here reads the
+    # same way and a second row cannot be added without the guard.
+    def _retryable(kind) -> Callable[[str | None], bool]:
+        def _ok(e: str | None) -> bool:
+            return (classify_error(e) == kind
+                    and not _emit_tracker.emitted)
+
+        return _ok
+
     drive_retries(
         max_retries,
         _cancelled,
         lambda: error,
         (
-            ("overload",
-             lambda e: classify_error(e) == RetryKind.OVERLOAD
-             and not _emit_tracker.emitted,
-             _recover_overload),
+            ("overload", _retryable(RetryKind.OVERLOAD), _recover_overload),
         ),
     )
     if _cancelled():
@@ -516,9 +496,21 @@ async def _stream_completion(app: FastAPI, pool, item, prep: dict):
         live = str(getattr(settings, "stream_mode", "live")).lower() == "live"
     except Exception:
         live = True
+    # `buffered=not live` is the cross-provider contract, not a detail
+    # (ARCHITECTURE.md, "Provider architecture": "stream_mode: buffered must
+    # call new_stream_context(..., buffered=True) so the consumer watchdog
+    # covers the whole producer budget, not one read"); DeepSeek passes the
+    # same argument at providers/deepseek/completion_service.py:1156.
+    #
+    # Without it the consumer waits 180 + 10 s while this producer's own
+    # deadline is create(30) + turn(180) + one overload retry(180) = 390 s, so
+    # a healthy-but-slow serve was answered with
+    # {"error": {"message": "upstream timed out"}} and a valid, fully
+    # assembled reply was thrown away. Live mode keeps the single-read budget
+    # exactly: every delta resets the per-get clock.
     (cid, created, out, cancel_event, consumer_timeout, model,
      _emit, _put) = _engine.new_producer_context(
-        prep, OC.DEFAULT_TIMEOUT, _CONSUMER_GRACE_SECONDS)
+        prep, OC.DEFAULT_TIMEOUT, _CONSUMER_GRACE_SECONDS, buffered=not live)
 
     def _produce(*, live_produce: bool) -> None:
         try:
@@ -536,7 +528,13 @@ async def _stream_completion(app: FastAPI, pool, item, prep: dict):
         except HTTPException as exc:
             _emit(("http_error", exc))
         except Exception as exc:  # noqa: BLE001
-            _emit(("error", str(exc)))
+            # Scrubbed because this is the one emit path that does NOT go
+            # through the terminal ladder: the client helpers raise with a raw
+            # slice of the upstream body in the message, and that body is the
+            # one most likely to echo the Authorization header it was given.
+            # 800 is the scrubber's default and a superset of that 200-char
+            # slice, so no diagnostic text is lost relative to today.
+            _emit(("error", _engine.scrub_upstream_text(exc, 800)))
 
     def produce_buffered():
         _produce(live_produce=False)

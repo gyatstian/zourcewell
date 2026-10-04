@@ -1,0 +1,62 @@
+# deepseaport package
+
+## Purpose
+
+The importable package: configuration, the account pool, the HTTP surface, and
+the three ways a person drives it (CLI, TUI, server-with-chat REPL).
+
+## Ownership
+
+Owned directly by this doc:
+
+- `config.py`: `config.json` plus environment, `Settings`, `load_settings` / `save`, `DEEPSEAPORT_*` resolution, `config._app_dir()`.
+- `accounts.py`: the thread-safe account pool, rotation, cooldowns, one in-flight stream per account, runtime add/remove.
+- `server.py`: `create_app`, kept as thin wiring that calls `register_routes(app)`.
+- `server_routes.py`: every `/v1/*` handler plus `_check_auth` / `_pool` / `_prepare`.
+- `server_concurrency.py`: the three shared executors (`_CHALLENGE_`/`_CLEANUP_`/`_STREAM_`), a local `_DaemonExecutor`, queued-slot acquisition, disconnect helpers, FastAPI lifespan, startup warmup. No completion logic.
+- `server_runner.py`: bind-host resolution, port scanning, uvicorn Config/Server, readiness polling, shutdown.
+- `cli.py`, `tui.py`, `tui_editor.py`, `chat_ui.py`, `chat_repl.py`, `dry_run.py`: the human-facing frontends.
+- `__init__.py` (`__version__`, derived from `pyproject.toml`, never a literal), `__main__.py` (`python -m deepseaport`).
+
+Completion mechanics, provider details and tool parsing belong to the children below, not here.
+
+## Local Contracts
+
+- Handlers resolve completion and stream entry points through a deferred `_server()` reference, so tests that monkeypatch them on `deepseaport.server` keep working. Keep that indirection.
+- `__version__` is the one public version name. `deepseaport/__init__.py` derives it (pyproject `[project] version` first, installed metadata second, `"0.0.0"` when neither exists — which is the frozen exe), `server.py` and `dry_run.py` pass it to `FastAPI(version=...)`, and `server_routes.py` reads it for `/health` and `/v1/models`. `__init__.py` imports stdlib only, so a module-scope `from . import __version__` in `server.py` / `dry_run.py` cannot cycle. Do not add a second literal.
+- Request ceilings in `server_routes.py`: `MAX_REQUEST_BYTES` (8 MB, rejected with 413 before the payload is read), `MAX_TOOLS_PER_REQUEST` (128, 400, counted only when tools render), `MAX_ACCOUNTS` (64, 409, counted PER PROVIDER via `core.pools.accounts_for_provider` because that is what partitions the pool). `MAX_SECRET_CHARS` (4096) is enforced by `_reject_oversized_fields` on BOTH write routes, POST `/v1/accounts` and PUT `/v1/accounts/{identifier}/token`.
+- A pool is built only from accounts bound to its own provider. `server_routes._pool` has no cross-provider fallback: an unregistered or empty-bound provider id gets an EMPTY pool and a 503 that names it. The old unfiltered `list(settings.accounts)` fallback handed provider X provider Y's credentials (a Qwen ES256 JWT replayed to chat.deepseek.com). A registered provider with zero bound accounts is a 503, never a silent borrow — the rule `_reject_unknown_provider`, `accounts.usable_provider` and `tests/test_live_smoke.py` already followed.
+- The non-stream chat route's catch-all converts any non-`HTTPException` provider failure (deepseek/client.py's `create_session` / `pow challenge` RuntimeErrors) into a scrubbed 502 and a scrubbed `logger.warning`; `_StreamCancelled` and `HTTPException` keep their own statuses. Without it uvicorn logged the traceback with the raw upstream body.
+- `_TOKEN_SHAPED_RE` is `^[A-Za-z0-9_-]{32,}$`. Every identifier route refuses it with 400 ahead of the API-key check and never echoes the value. A URL reaches access logs, proxy logs and `Referer`, so this is what stops a 64-char bearer token from being handed back through an old 404 detail. The same rule covers error text: `AccountPool.add`'s duplicate `ValueError` names `email`/`mobile` only, never `AccountConfig.identifier` (`token[:10] + "..."` for a token-only account), because it becomes the 409 detail verbatim.
+- The request access log is off on all three serve paths (plain serve, server-with-chat, dry run). uvicorn's error log is unaffected and redacts what it prints.
+- `GET /v1/waf/status` requires the API key because its payload names absolute binary and profile paths. `GET /health` stays unauthenticated on purpose so existing pollers keep working.
+- `"keys": []` means auth disabled, and a non-loopback bind prints a startup warning naming the bind, what is reachable, and how the gate reads. Keep the warning; it is the only warning between the operator and a LAN-visible unauthenticated API.
+- `max_retries` is clamped 0-5 at load. With `DEEPSEAPORT_MAX_RETRIES` unset the clamp is runtime-only and a hand-edited value survives a save; with the env var set the clamped number is written back.
+- `Settings.save()` holds `_CONFIG_SAVE_LOCK` across the whole read-modify-write: the accounts SNAPSHOT and the file write are one critical section. Locking only the write loses records — two mutators each persist a payload built from a list one has already outgrown, so config.json stays valid JSON and silently drops an account. The lock is a plain `Lock`, so `save()` acquires it exactly once; never nest a second `with _CONFIG_SAVE_LOCK` inside it.
+- `load_settings` validates the configured `provider` and every `providers` entry against `core.registry.registered()` and an unknown id is WARNED ABOUT BY NAME (with the file and the known ids) before falling back to `deepseek`. It is a loud refusal, not a raise: `load_settings` is the shared entry point of serve, dry-run, the TUI and the CLI, and one mistyped letter must not make the server unstartable. Same "name it in the log instead of blocking recovery" rule as `accounts.usable_provider`. A registry that cannot be imported (`_registered_provider_ids()` returns None) leaves the ids alone.
+- `config._app_dir()` returns `Path(sys.executable).parent` when frozen, so a shipped exe reads and writes `config.json` next to the binary. This is why `dist/` doubles as a credential store.
+- `cli.py` and `chat_ui.py` keep thin re-exports of names that moved into `chat_repl.py` and `server_runner.py`, because tests and the TUI import the historical names from there. Do not drop a re-export without fixing its importers first, and do not add one without an importer. The load-bearing sets, all pinned by the suite: `cli` re-exports `_is_port_free` / `_scan_free_ports` / `_next_free_port` / `_ensure_free_port` / `_run_server` / `_resolve_bind_host` / `_watch_stop_keys` from `server_runner`, plus `_unpack_login_result` (note `_browser_login` is NOT one of them — every caller uses the unprefixed name); `chat_ui` re-exports the `chat_repl` helpers and the `server_runner` bootstrap.
+- `_upsert_account`/`provider_is_registered`: a `--provider` on `login`, `serve` and `chat` must name a REGISTERED provider, not merely match `^[a-z0-9-]+$`. The shape check is not membership, and the gap opened a ~30s DeepSeek Obscura window for `login --provider glm` and then stored DeepSeek's `userToken` under `glm` -- an account no UI lists and no request can serve. `cli` refuses with exit 2 and `_unknown_provider_exit` (the one wording all three share); `tui._offer_auto_login` cannot exit, so it refuses in-app and returns the usual `("", False, 0.0)`. `deepseek` is exempt: its login IS the direct browser path, not a registry entry point. Only the FLAG is checked, never `settings.provider` (a hand-edited config id is normalized in `_upsert_account`).
+- `cmd_chat` dispatches through `Provider.complete`, never a provider module's engine. It serves `--provider qwen` / `opencode` too, and calling DeepSeek's `_complete_with_failover_sync` there ran DeepSeek's whole path for every provider -- it closes over its own module globals and never reads `prep["provider"]`, so a Qwen ES256 JWT went to `chat.deepseek.com` as a `userToken`. `complete` (not `complete_request`) is the seam because `cancel_event` defaults to `None` there and every provider forwards it to its OWN `_complete_with_failover_sync` as a keyword, which keeps same-request ban failover and every existing engine-seam test double working. `cli` must not import `providers.*.completion_service`.
+- `tui.py` re-exports only `_read_interactive` and `_unescape_newlines` from `tui_editor`, and `tui.py` must not gain `tui_editor` internals as module attributes: `tests/test_tui_gaps.py` asserts `not hasattr(tui, ...)` for a list of 14 names, including `_ensure_vt`. Anything else it needs from there is imported inside the function that uses it. For the same reason `tui` imports `cli.provider_is_registered` / `cli._unknown_provider_exit` INSIDE `_offer_auto_login` rather than at module scope.
+
+## Work Guidance
+
+- The three shared executors are `_DaemonExecutor`, not `ThreadPoolExecutor`. `ThreadPoolExecutor` has no daemon option -- `initializer` runs inside the worker after it is started, and `Thread.daemon` refuses to change on a live thread -- and `Thread.__init__` inherits the SUBMITTER's flag, so worker daemon-ness was decided by an accident. `_DaemonExecutor` is built from two public pieces (`concurrent.futures.Future` + `queue.SimpleQueue`) and offers only `submit`, because that is all the three call sites use. Reaching past that (overriding `_adjust_thread_count`, importing `concurrent.futures.thread._worker`) is exactly the private coupling to avoid. The flag is deterministic but NOT sufficient on its own: `concurrent.futures.thread._python_exit` joins every worker it created, daemon or not, so a worker parked in an uninterruptible C call is ended by `providers/deepseek/client.py`'s bounded read, not by the flag.
+- Keep the layering as it is: thin `create_app`, routes in `server_routes.py`, the completion engine in the owning provider, mechanics in `core`.
+- Both TUIs and the REPL are stdlib-only and Windows-safe (plain `input()`, no curses). Keep it that way; `serve` has to work without a third-party terminal library. `tui_editor` is the lowest-level terminal module: it imports nothing from `deepseaport`, so it may own shared terminal probes (`_stdin_is_tty`, `_ensure_vt`) that `tui.py` and `cli.py` reuse.
+- The settings menu in `tui.py` declares its 19 rows in one table (`_table()`), read by both the draw and the dispatch. Never declare a row twice: that is how setting 2 came to read "WAF warmup at startup" to the toggle and "Warm up WAF at startup" on screen. Rows 1-19 plus "20. Back" are stable API, so edit a row in place instead of renumbering.
+- `_provider_scope()` is the single provider-scope lookup (`active_ids`, `is_multi`, `single`). Five screens used to spell it out separately and drifted; `accounts_menu` and `main_menu` additionally scope their account list through `single`.
+- OpenAI parameters the web upstreams cannot honor are accepted, ignored, and logged once per request. `tool_choice` honors `auto` and `none`; a forcing value is warn-and-drop.
+- This folder owns one sink of the scrub contract: the non-stream chat route's catch-all (see the bullet above). It scrubs the reason TWICE -- once into the `logger.warning`, once into the 502 detail -- before truncation, because the failure never reached the terminal ladder. `core/AGENTS.md` owns the rest of the contract and the full list of sinks; check that list before adding a new one here, and never echo an upstream body from `server_routes.py` without going through `core.engine.scrub_upstream_text`.
+
+## Verification
+
+- `python -m pytest -m "not live" -q` from the repository root. Every change here needs it green.
+- `python -m pytest -m live -q` after a change to a route, a limit, or a wire format.
+- `python -m deepseaport serve` on a loopback bind is the manual smoke check for a routing or lifespan change.
+
+## Child DOX Index
+
+- `core/AGENTS.md` owns provider-neutral engine, transport, OpenAI shaping, pool helpers, registry, Obscura bridge, MCP client, token parsing.
+- `providers/AGENTS.md` owns the multi-provider contract and the three upstreams beneath it.

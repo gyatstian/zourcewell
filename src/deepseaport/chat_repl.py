@@ -23,6 +23,9 @@ READY_TIMEOUT = 20
 # All loggers that can write to the console while chatting. Background
 # INFO/WARNING records interleave with the input() line and corrupt it,
 # so chat mode raises every one to ERROR (real errors still surface).
+# The deepseaport children are listed even though "deepseaport" is: a child
+# that already carries an EXPLICIT level (not NOTSET) ignores the parent, so
+# only naming it forces it up.
 _CHAT_QUIET_LOGGERS = (
     "deepseaport",
     "deepseaport.server",
@@ -256,6 +259,11 @@ def _warn_chat_workers(args) -> None:
         print("  note: chat mode uses 1 worker (ignoring --workers).")
 
 
+# Last-resort catalogue when even `deepseaport.server` cannot be imported: one
+# usable DeepSeek model, so a chat REPL still starts and can print something.
+_FALLBACK_CATALOGUE = {"deepseek-flash": (False, False, "default")}
+
+
 def resolve_chat_catalogue(settings, instances=None) -> dict:
     """Central chat catalogue dict (F6): union across instances or single.
 
@@ -266,7 +274,7 @@ def resolve_chat_catalogue(settings, instances=None) -> dict:
     try:
         from .server import MODELS, active_models
     except Exception:
-        return {"deepseek-flash": (False, False, "default")}
+        return dict(_FALLBACK_CATALOGUE)
     try:
         if instances:
             catalogue: dict = {}
@@ -275,22 +283,11 @@ def resolve_chat_catalogue(settings, instances=None) -> dict:
                     catalogue.update(active_models(inst) or {})
                 except Exception:
                     pass
-            if not catalogue:
-                try:
-                    catalogue = active_models(settings) or dict(MODELS)
-                except Exception:
-                    catalogue = dict(MODELS)
-            return catalogue or dict(MODELS)
-        try:
-            return active_models(settings) or dict(MODELS)
-        except Exception:
-            return dict(MODELS)
+            if catalogue:
+                return catalogue
+        return active_models(settings) or dict(MODELS)
     except Exception:
-        try:
-            from .server import MODELS as _MODELS
-            return dict(_MODELS)
-        except Exception:
-            return {"deepseek-flash": (False, False, "default")}
+        return dict(MODELS)
 
 
 def resolve_chat_models(settings, instances=None) -> tuple[dict, list[str], str]:
@@ -302,7 +299,7 @@ def resolve_chat_models(settings, instances=None) -> tuple[dict, list[str], str]
     try:
         from .server import MODELS as _MODELS
     except Exception:
-        _MODELS = {"deepseek-flash": (False, False, "default")}  # type: ignore
+        _MODELS = _FALLBACK_CATALOGUE  # type: ignore
     catalogue = resolve_chat_catalogue(settings, instances)
     models = _model_list(catalogue or _MODELS)
     model = _initial_chat_model(settings, models)
@@ -311,21 +308,28 @@ def resolve_chat_models(settings, instances=None) -> tuple[dict, list[str], str]
 
 def run_repl(*, model: str, models: list[str], api_key: str, history: list[dict],
              settings, post, can_continue, print_help, next_target,
-             servers_command=None) -> str:
+             servers_command=None, stop_note=None) -> str:
     """Shared chat REPL loop; returns the (possibly switched) model.
 
     Callers inject target-specific seams so this stays single vs round-robin:
     - `post(base_url, api_key, model, history)` -> assistant text.
-    - `can_continue()` -> False stops the loop (server exited).
+    - `can_continue()` -> False stops the loop (server exited OR its thread
+      died; the callers fold both into it, because `should_exit` is never set
+      by a uvicorn thread that dies from an unhandled exception).
     - `print_help()` -> /help text for this mode.
     - `next_target()` -> (base_url, tag) where tag is "" for single-target
       and "[i/n :port ident]" for multi-target (drives reply/error labels).
     - `servers_command()` -> optional /servers handler (multi only).
+    - `stop_note()` -> optional one-line reason the loop ended on its own,
+      or "" when the servers are fine and the end is unremarkable. Asked only
+      when the loop was NOT ended by /quit, /clear... /exit or Ctrl+C, so a
+      user who asked to leave is never told the server died.
 
     F6 note: the lambdas/closures passed for these seams are intentional
     strategy injection (single vs round-robin), not duplication — verified
     healthy, kept as-is.
     """
+    by_user = False
     while True:
         if not can_continue():
             break
@@ -333,11 +337,13 @@ def run_repl(*, model: str, models: list[str], api_key: str, history: list[dict]
             text = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
+            by_user = True
             break
         if not text:
             continue
         low = text.lower()
         if low in ("/quit", "/exit", "/q"):
+            by_user = True
             break
         if low in ("/help", "/?", "/h"):
             print_help()
@@ -371,9 +377,23 @@ def run_repl(*, model: str, models: list[str], api_key: str, history: list[dict]
         except RuntimeError as exc:
             history.pop()
             print(f"  ! {tag} {exc}" if tag else f"  ! {exc}")
+            # A "Connection refused" here is a client-side rendering of a
+            # server that is not running any more. Keep prompting and every
+            # later message fails the same way with nothing to explain it, so
+            # stop when (and only when) the liveness check agrees; a single
+            # transient failure on a live server falls through to `continue`.
+            if not can_continue():
+                break
             continue
         history.append({"role": "assistant", "content": reply})
         print()
         print(f"Assistant {tag}: {reply}" if tag else f"Assistant: {reply}")
         print()
+    if not by_user and stop_note is not None:
+        try:
+            note = str(stop_note() or "").strip()
+        except Exception:
+            note = ""
+        if note:
+            print(f"  ! {note}")
     return model

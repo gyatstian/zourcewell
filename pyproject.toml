@@ -4,26 +4,70 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deepseaport"
-version = "0.1.0"
+# Single source of truth for the version. src/deepseaport/__init__.py derives
+# __version__ from this file, deepseaport.spec stamps it into the frozen exe,
+# and every bump happens here and only here.
+version = "0.28"
 description = "Unofficial DeepSeek web2api: OpenAI-compatible API over chat.deepseek.com, WAF handled via Obscura headless browser, stable tool_calls for agentic harnesses."
-requires-python = ">=3.10"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+keywords = ["openai", "deepseek", "qwen", "web2api", "llm", "proxy", "agent"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet :: Proxy Servers",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
   "fastapi>=0.110",
   "uvicorn>=0.29",
   "curl-cffi>=0.7",
   "wasmtime>=20",
-  "pydantic>=2",
+  
   "websocket-client>=1.7",
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest>=8", "httpx>=0.27"]
+build = ["pyinstaller>=6"]
 
 [project.scripts]
 deepseaport = "deepseaport.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/gyatstian/deepseaport"
+Source = "https://github.com/gyatstian/deepseaport"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# Nothing at runtime reads these; they ride along so the wheel is the same tree
+# as the checkout (cosmetic — the repo root temple.png cannot be package data,
+# it is not inside any package).
+"deepseaport.providers.qwen" = ["*.txt"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Import the package from this checkout, never from an installed copy
+# (an editable install pointing at another clone silently tests the wrong
+# source tree). See tests/conftest.py for the rest of the isolation.
+pythonpath = ["src"]
+markers = [
+  "live: needs real network / real browser / real upstream account (opt in with `pytest -m live`)",
+]
+# (Deliberately NOT in addopts: see README "Development" - a `-m` there cannot
+# be overridden by a command-line `-m`, which would silently break `-m live`.)
+filterwarnings = [
+  # fastapi's TestClient is built on starlette's httpx shim, which warns about
+  # the upcoming httpx2 switch on import. Not actionable from this project.
+  "ignore::DeprecationWarning:starlette.*",
+]

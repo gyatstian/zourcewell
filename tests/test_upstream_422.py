@@ -24,11 +24,14 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from deepseaport import protocol as P
-from deepseaport.accounts import PooledAccount
+from support import (FakeBridge, app_with_bridge, cached_wasm, settings)
+from deepseaport.providers.deepseek import protocol as P
+from deepseaport.accounts import AccountPool, PooledAccount
 from deepseaport.config import AccountConfig, Settings
-from deepseaport.server import _prepare, _run_completion_core, create_app
-from deepseaport import pow as PoW
+from deepseaport.server import create_app
+from deepseaport.server_routes import _prepare
+from deepseaport.providers.deepseek.completion_service import _run_completion_core
+from deepseaport.providers.deepseek import pow as PoW
 
 
 CHALLENGE = {
@@ -42,53 +45,20 @@ CHALLENGE = {
 }
 
 
-class _FakeState:
-    user_agent = "test-ua"
-    cookies: dict = {}
-
-
-class _FakeBridge:
-    def __init__(self) -> None:
-        self.state = _FakeState()
-
-    def cookie_header(self) -> str:
-        return ""
-
-    def warmup(self) -> dict:
-        return {}
+# Default kwargs differ per file; the shared base dict lives in
+# support.py. Every list here is rebuilt per call on purpose.
 
 
 def _settings(**kw) -> Settings:
-    base = dict(
-        keys=[],
-        accounts=[AccountConfig(email="a@x.com", token="tok")],
-        config_path="",
-        warmup_on_startup=False,
-        max_retries=0,
-        log_level="WARNING",
-        parallel_challenge_fetch=True,
-    )
-    base.update(kw)
-    return Settings(**base)
-
-
-def _app_with_bridge(settings: Settings):
-    app = create_app(settings)
-    app.state.bridge = _FakeBridge()
-    return app
-
-
-def _cached_wasm(monkeypatch, tmp_path):
-    wp = tmp_path / "wasm.bin"
-    wp.write_bytes(b"x" * 2000)
-    monkeypatch.setattr("deepseaport.server.PoW.wasm_path", lambda: wp)
-    return wp
+    kw.setdefault("accounts", [AccountConfig(email="a@x.com", token="tok")])
+    kw.setdefault("max_retries", 0)
+    return settings(**kw)
 
 
 def _stub_session_pow(monkeypatch):
-    monkeypatch.setattr("deepseaport.server.DS.create_session", lambda h: "sess-1")
-    monkeypatch.setattr("deepseaport.server.DS.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.server.PoW.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-1")
+    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
 
 
@@ -114,7 +84,7 @@ class _FakeResp:
 
 def test_stream_completion_preserves_422_text_body(monkeypatch):
     """text/plain 422 must not become bare 'HTTP_422:' with empty detail."""
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     body = '{"detail":[{"loc":["body","prompt"],"msg":"field required"}]}'
     monkeypatch.setattr(
@@ -130,7 +100,7 @@ def test_stream_completion_preserves_422_text_body(monkeypatch):
 
 def test_stream_completion_preserves_422_json_detail(monkeypatch):
     """application/json 422 keeps the FastAPI detail payload."""
-    from deepseaport import client as C
+    from deepseaport.providers.deepseek import client as C
 
     body = '{"detail":[{"loc":["body","prompt"],"msg":"field required","type":"missing"}]}'
     monkeypatch.setattr(
@@ -148,8 +118,8 @@ def test_stream_completion_preserves_422_json_detail(monkeypatch):
 
 def test_run_core_maps_http_422_to_502(monkeypatch, tmp_path):
     """The exact user crash: 'HTTP_422: ' must raise 502, not RuntimeError."""
-    app = _app_with_bridge(_settings())
-    _cached_wasm(monkeypatch, tmp_path)
+    app = app_with_bridge(_settings())
+    cached_wasm(monkeypatch, tmp_path)
     _stub_session_pow(monkeypatch)
     monkeypatch.setattr(
         "deepseaport.providers.deepseek.completion_service._attempt", lambda *a, **k: ("", "", "HTTP_422: ", 0))
@@ -164,8 +134,8 @@ def test_run_core_maps_http_422_to_502(monkeypatch, tmp_path):
 
 
 def test_run_core_maps_422_with_body_to_502(monkeypatch, tmp_path):
-    app = _app_with_bridge(_settings())
-    _cached_wasm(monkeypatch, tmp_path)
+    app = app_with_bridge(_settings())
+    cached_wasm(monkeypatch, tmp_path)
     _stub_session_pow(monkeypatch)
     monkeypatch.setattr(
         "deepseaport.providers.deepseek.completion_service._attempt",
@@ -182,8 +152,8 @@ def test_run_core_maps_422_with_body_to_502(monkeypatch, tmp_path):
 
 def test_run_core_maps_generic_upstream_to_502_not_500(monkeypatch, tmp_path):
     """Any other unknown upstream error is a bad-gateway 502, not a 500."""
-    app = _app_with_bridge(_settings())
-    _cached_wasm(monkeypatch, tmp_path)
+    app = app_with_bridge(_settings())
+    cached_wasm(monkeypatch, tmp_path)
     _stub_session_pow(monkeypatch)
     monkeypatch.setattr(
         "deepseaport.providers.deepseek.completion_service._attempt",
@@ -207,17 +177,17 @@ def test_endpoint_returns_502_on_upstream_422(monkeypatch):
 
     settings = _settings()
     app = create_app(settings)
-    app.state.bridge = _FakeBridge()
+    app.state.bridge = FakeBridge()
 
     def fake_core(app_, item_, prep_, **kw):
         raise HTTPException(status_code=502,
                             detail="DeepSeek rejected the request as invalid (HTTP_422: )")
 
     monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
-    # Stub the pool so no real account/network is touched.
-    import deepseaport.server as S
-
-    real_pool = S._pool
+    # Stub the pool so no real account/network is touched. The pool seam lives
+    # on server_routes (the module that owns pool construction); server
+    # re-exports it only for the monkeypatch route.
+    from deepseaport import server_routes as SR
 
     class _FakePool:
         def __init__(self):
@@ -230,8 +200,8 @@ def test_endpoint_returns_502_on_upstream_422(monkeypatch):
             return self.item
 
     fake_pool = _FakePool()
-    monkeypatch.setattr(S, "_pool", lambda app_: fake_pool)
-    monkeypatch.setattr(S.AccountPool, "release", staticmethod(lambda item: None))
+    monkeypatch.setattr(SR, "_pool", lambda app_: fake_pool)
+    monkeypatch.setattr(AccountPool, "release", staticmethod(lambda item: None))
 
     resp = TestClient(app, raise_server_exceptions=False).post(
         "/v1/chat/completions",

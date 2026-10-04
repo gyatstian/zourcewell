@@ -1,14 +1,25 @@
 # --- secrets / local config: NEVER commit ---
 config.json
-config.local.json
 .env
 .env.*
 !.env.example
 *.pem
 *.key
 secrets*.json
-PROVIDERS.md
-.*/
+
+# Local-only dot-directories. Explicit allowlist, not a blanket `.*/`:
+# a blanket rule silently ignores .github/ (CI workflow), .circleci/, etc.
+.pi/
+.pytest_cache/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Empty leftover browser-profile directory. Git cannot track an empty dir, so
+# name it here instead of leaving it as untracked noise.
+dummy-profile/
 
 # Keep templates
 !config.example.json
@@ -53,7 +64,6 @@ share/python-wheels/
 MANIFEST
 
 # --- venvs ---
-.venv/
 venv/
 ENV/
 env/
@@ -61,12 +71,9 @@ env/
 .virtualenv/
 
 # --- tests / coverage ---
-.pytest_cache/
 .coverage
 .coverage.*
 htmlcov/
-.tox/
-.nox/
 nosetests.xml
 coverage.xml
 *.cover
@@ -74,10 +81,8 @@ coverage.xml
 .hypothesis/
 
 # --- linters / type checkers ---
-.mypy_cache/
 .dmypy.json
 dmypy.json
-.ruff_cache/
 .pyright/
 
 # --- packaging / uv ---

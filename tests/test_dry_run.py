@@ -11,15 +11,18 @@ import inspect
 
 from fastapi.testclient import TestClient
 
+from functools import partial
+from support import settings
 from deepseaport import tui
 from deepseaport.config import Settings
 from deepseaport.dry_run import create_dry_app
 from deepseaport.tui import main_menu
 
 
-def _settings(**kw) -> Settings:
-    kw.setdefault("config_path", "")
-    return Settings(**kw)
+# Default kwargs differ per file; the shared base dict lives in
+# support.py. Every list here is rebuilt per call on purpose.
+_settings = partial(settings, config_path="",
+                     log_level="INFO", warmup_on_startup=True)
 
 
 def test_dry_health_and_models():
@@ -192,5 +195,5 @@ def test_main_menu_signature_has_dry_fn():
     assert "dry_fn" in inspect.signature(main_menu).parameters
 
 
-def _fresh_no_accounts() -> Settings:
-    return Settings(config_path="")
+_fresh_no_accounts = partial(settings, config_path="", log_level="INFO",
+                              warmup_on_startup=True)

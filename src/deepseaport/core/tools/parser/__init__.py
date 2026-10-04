@@ -41,11 +41,9 @@ class ParseResult:
     diagnostics: list[dict] = field(default_factory=list)
 
 
-# Grammar table: the documented first-match-wins order (see
-# parse_tool_calls docstring). One row per format keeps the chain explicit
-# instead of five copy-pasted if-blocks; keep in sync when adding a format.
-PARSE_CHAIN = ("json_array", "tags", "dsml", "fence", "bare")
-
+# The grammar table IS the chain: insertion order is the documented
+# first-match-wins order (see parse_tool_calls docstring). One declaration,
+# iterated directly.
 _CHAIN_FNS = {
     "json_array": try_parse_json_array,
     "tags": try_parse_tags,
@@ -116,8 +114,7 @@ def parse_tool_calls_ex(
     limit_bare = max_bare_objects if max_bare_objects is not None else MAX_BARE_OBJECTS
 
     diagnostics: list[dict] = []
-    for name in PARSE_CHAIN:
-        _parse = _CHAIN_FNS[name]
+    for name, _parse in _CHAIN_FNS.items():
         if name == "dsml":
             calls, rest = _parse(text, valid_or_none, limit_args, forgiving_on,
                                  tools, diagnostics)

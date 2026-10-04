@@ -8,9 +8,8 @@ import re
 from ..common import (
     MAX_SCAN_OBJECTS,
     _LOOSE_JSON_MISS,
-    _clean_rest,
+    _finish,
     _loads_json_lenient,
-    _normalize_calls,
 )
 
 logger = logging.getLogger("deepseaport.tools")
@@ -37,12 +36,9 @@ def try_parse_tags(text, valid_or_none, limit_args, forgiving_on,
         elif isinstance(obj, dict) and isinstance(obj.get("function"), dict):
             tagged.append(obj)
     if tagged:
-        calls, dropped = _normalize_calls(tagged, valid_or_none, limit_args)
-        if diagnostics is not None:
-            diagnostics.append({"format": "tags", "matched": bool(calls),
-                                "kept": len(calls), "dropped": list(dropped),
-                                "raw": len(tagged)})
-        if calls:
-            rest = _clean_rest(_TAG_RE.sub("", text), forgiving_on)
-            return calls, rest
+        hit = _finish(tagged, valid_or_none, limit_args, "tags", forgiving_on,
+                      diagnostics=diagnostics,
+                      on_hit=lambda: _TAG_RE.sub("", text))
+        if hit[0]:
+            return hit
     return None, None

@@ -3,8 +3,9 @@
 Live-verified 2026-09-22: POST /api/v1/auths/signin with a SHA-256-hex
 password returns a flat user object with a JWT ``token`` + ``token_type``
 ``"Bearer"`` + ``expires_at``. The same JWT is planted as a ``token`` cookie
-on ``.qwen.ai`` (the web session key). Self-contained: mirrors the DeepSeek
-``LoginResult``/``unpack_login_result`` contract without importing deepseek.
+on ``.qwen.ai`` (the web session key). Self-contained: ``login`` and
+``login_with_expiry`` return plain tuples, and ``unpack_login_result`` /
+``unpack_login_result_ex`` normalize them, without importing deepseek.
 """
 
 from __future__ import annotations
@@ -13,8 +14,8 @@ import base64
 import json
 import logging
 import time
-from dataclasses import dataclass
 
+from ...core.engine import scrub_upstream_text
 from . import client as QC
 from . import protocol as P
 
@@ -26,7 +27,6 @@ EXPIRY_LEEWAY_SECONDS = 300.0
 
 __all__ = [
     "EXPIRY_LEEWAY_SECONDS",
-    "LoginResult",
     "effective_expiry",
     "is_expired",
     "jwt_exp",
@@ -37,20 +37,6 @@ __all__ = [
     "unpack_login_result",
     "unpack_login_result_ex",
 ]
-
-
-@dataclass(frozen=True)
-class LoginResult:
-    token: str | None = None
-    banned: bool = False
-    detail: str = ""
-    expires_at: float | None = None
-
-    def as_tuple(self) -> tuple[str | None, bool, str]:
-        return self.token, self.banned, self.detail
-
-    def as_tuple_ex(self) -> tuple[str | None, float | None, bool, str]:
-        return self.token, self.expires_at, self.banned, self.detail
 
 
 def _coerce_ts(value) -> float | None:
@@ -149,11 +135,9 @@ def token_expired(cfg, now: float | None = None,
 
 
 def unpack_login_result(res) -> tuple[str | None, bool, str]:
-    """Normalize a LoginResult / legacy tuple / legacy string into a tuple."""
+    """Normalize a legacy tuple / legacy string into a tuple."""
     if res is None:
         return None, False, ""
-    if isinstance(res, LoginResult):
-        return res.as_tuple()
     if isinstance(res, tuple):
         # 4-tuple (token, expires_at, banned, detail) from login_with_expiry.
         if len(res) == 4 and isinstance(res[1], (int, float, type(None))):
@@ -178,8 +162,6 @@ def unpack_login_result_ex(res) -> tuple[str | None, float | None, bool, str]:
     try:
         if res is None:
             return None, None, False, ""
-        if isinstance(res, LoginResult):
-            return res.as_tuple_ex()
         if isinstance(res, tuple):
             if len(res) == 4:
                 token = res[0].strip() if isinstance(res[0], str) else None
@@ -222,7 +204,8 @@ def login_with_expiry(email: str, password: str,
         banned = bool(P.is_ban_error_text(msg))
         return None, None, banned, msg
     except Exception as exc:  # noqa: BLE001
-        logger.warning("qwen signin unexpected error for %s: %s", email, exc)
+        logger.warning("qwen signin unexpected error for %s: %s",
+                       email, scrub_upstream_text(exc, 300))
         return None, None, False, str(exc)
     token = str(user.get("token") or "").strip() or None
     if token is None:

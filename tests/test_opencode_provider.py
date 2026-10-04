@@ -11,13 +11,15 @@ from deepseaport.providers.opencode import client as OC
 from deepseaport.providers.opencode import completion_service as OCS
 from deepseaport.providers.opencode import protocol as OP
 from deepseaport.providers.opencode.models import DEFAULT_MODEL
+from support import settings
+from functools import partial
 from deepseaport.server import create_app
 
 
-def _settings(**kw) -> Settings:
-    base = dict(accounts=[], provider="opencode", config_path="")
-    base.update(kw)
-    return Settings(**base)
+# Default kwargs differ per file; the shared base dict lives in
+# support.py. Every list here is rebuilt per call on purpose.
+_settings = partial(settings, provider="opencode", log_level="INFO",
+                     warmup_on_startup=True)
 
 
 def _patch_serve(monkeypatch, content: str = "hi", thinking: str = "",

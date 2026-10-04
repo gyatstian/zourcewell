@@ -21,6 +21,24 @@ def _int_env(name: str, default: int) -> int:
     return val if val > 0 else default
 
 
+# Default argument-size limit, used only when a caller passes no
+# `max_args_chars`. LIFETIME: this is a SNAPSHOT read once, when this module
+# is first imported, and never refreshed. `config.load_settings()` re-reads
+# the same environment variable on every call, so `Settings.tool_args_max_chars`
+# and this constant CAN disagree — that is the documented behaviour, not a bug:
+#   * They do NOT disagree on the real request path.
+#     `server_routes._prep_tool_limits()` reads `Settings.tool_args_max_chars`
+#     per request and threads it through the prep dict to
+#     `parse_tool_calls(..., max_args_chars=...)`, so the parser honours the
+#     live setting. ARCHITECTURE.md's claim holds because of that explicit
+#     plumbing, not because of this constant.
+#   * The snapshot is only the DEFAULT for callers that pass no limit:
+#     `tool_system_prompt()`, and direct `parse_tool_calls()` calls from a
+#     script or a test. Those keep whatever the environment held at first
+#     import; setting DEEPSEAPORT_MAX_ARGS_CHARS afterwards does not move them.
+# Import this name (re-exported by `deepseaport.core.tools`); do not expect
+# it to track the environment. To honour a live value, read it from `Settings`
+# and pass `max_args_chars` explicitly.
 MAX_ARGS_CHARS = _int_env("DEEPSEAPORT_MAX_ARGS_CHARS", 200_000)
 MAX_BARE_OBJECTS = _int_env("DEEPSEAPORT_MAX_BARE_OBJECTS", 40)
 # Universal bound for parser scans (json_array/fence/tags/DSML) and total
@@ -30,6 +48,10 @@ MAX_TOTAL_CALLS = MAX_BARE_OBJECTS
 MAX_PARAMS_PER_INVOKE = 64
 # Lenient-repair budget: skip Python-loop repairs on huge candidates that
 # would be dropped as oversize anyway (strict path still attempted).
+# Derived from the import-time snapshot (see MAX_ARGS_CHARS): a repair budget
+# is a work heuristic, not the accept/reject limit, so re-reading it per call
+# would only add env lookups to the hot path. The limit itself is applied in
+# _normalize_args, which uses the live value whenever a caller passes one.
 _LENIENT_REPAIR_BUDGET = MAX_ARGS_CHARS + 16_384
 
 # C-level fast guards (avoid Python-loop repair passes that would be no-ops).
@@ -43,6 +65,14 @@ _CLEAN_DSML_FORGIVING_1 = re.compile(
     re.IGNORECASE)
 _CLEAN_DSML_FORGIVING_2 = re.compile(
     r"(?:<|&[lL][tT];)/?\|{1,2}[^>]*?(?:>|&[gG][tT];)", re.IGNORECASE)
+
+# Forgiving tag-open/tag-close pairs for the truncation heuristic. Precompiled
+# like its neighbours above; ``re`` would cache them anyway, but keeping them
+# here means one place owns every pattern in this module.
+_DSML_TAG_COUNTS_RE = tuple(
+    (re.compile(r"(?:<|&[lL][tT];)\|{0,2}\s*dsml\s*\|{0,2}" + tag),
+     re.compile(r"(?:<|&[lL][tT];)/\|{0,2}\s*dsml\s*\|{0,2}" + tag))
+    for tag in ("tool_calls", "calls", "invoke", "parameter"))
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -340,6 +370,11 @@ def _normalize_args(args, call_idx: int, max_args_chars: int | None = None) -> s
     Oversize payloads are rejected (raise _OversizeArgs) instead of being
     truncated: slicing JSON mid-object then wrapping the fragment in
     {"_raw": ...} silently corrupts data and produces invalid arguments.
+
+    ``max_args_chars`` is the live per-call limit (the request path passes
+    ``Settings.tool_args_max_chars``); ``None`` falls back to the
+    import-time ``MAX_ARGS_CHARS`` snapshot, which does NOT track the
+    environment afterwards.
     """
     limit = max_args_chars if max_args_chars is not None else MAX_ARGS_CHARS
     if isinstance(args, dict):
@@ -389,6 +424,18 @@ def _normalize_calls(
     oversize arguments are dropped. Total calls are capped at
     MAX_TOTAL_CALLS so per-argument limits can't combine into unbounded
     memory (first N win, rest dropped with indexes preserved).
+
+    ``valid_names`` is tri-state, and the difference is the whole
+    hallucination guard: ``None`` means the request declared NO tools (a
+    plain chat — there is no allowlist, so nothing is name-checked), while a
+    possibly-empty set means tools WERE declared. ``parse_tool_calls_ex``
+    (core/tools/parser/__init__.py:113-114) is what keeps the two apart: it
+    passes ``None`` only when ``tools`` is falsy, and the set otherwise — so
+    an empty set can only mean "declared, but no name could be extracted"
+    (``_valid_names`` returns set() for a malformed or Anthropic-shaped
+    array). An unverifiable name is therefore treated as unknown and dropped
+    rather than forwarded: a missing call costs the agent one retry, a wrong
+    name costs it a dispatch of a tool that does not exist.
     """
     if len(raw_calls) > MAX_TOTAL_CALLS:
         # Bound total work: callers see first N, extras reported as dropped.
@@ -404,6 +451,16 @@ def _normalize_calls(
                 lower_map[n.lower()] = n
     calls: list[dict] = []
     dropped: list[int] = []
+    # Ids already handed out in THIS response. Model-supplied ids are
+    # arbitrary strings and routinely repeat (the JSON example injected in
+    # tool_system_prompt (core/tools/prompt.py:91) always shows "call_001",
+    # so a model echoing that shape for two invokes emits it twice). A
+    # duplicate id is worse than a renamed one: harnesses map role:"tool"
+    # results back to their call by id, so a collision makes the second
+    # result unmatchable. Renaming is deterministic (no randomness, derived
+    # from position), so the same call keeps the same id in the stream and
+    # non-stream paths.
+    used_ids: set[str] = set()
     for i, call in enumerate(raw_calls):
         if not isinstance(call, dict):
             logger.debug("dropping tool call %d: not an object", i)
@@ -416,11 +473,27 @@ def _normalize_calls(
             dropped.append(i)
             continue
         canonical = name
-        if valid_names:
+        # `is not None`, not truthiness: an empty set means tools were
+        # declared but no usable name could be read out of them, so nothing
+        # is checkable and every name is unverifiable.
+        if valid_names is not None:
             if name in valid_names:
                 canonical = name
             elif name.lower() in lower_map:
                 canonical = lower_map[name.lower()]
+            elif not valid_names:
+                # Declared-but-unusable tool schemas (malformed entries, or
+                # Anthropic-shaped [{"name":..,"input_schema":{..}}] that has
+                # no OpenAI `function` wrapper). Suppress instead of
+                # forwarding: the agent would dispatch a tool that does not
+                # exist. Warning (not debug) so the malformed `tools` array
+                # is visible in the log, as the unknown-name case is.
+                logger.warning("dropping tool call %d: tools were declared but "
+                               "no usable tool name could be read from them "
+                               "(malformed tool schemas); cannot verify %r",
+                               i, name)
+                dropped.append(i)
+                continue
             else:
                 # Unknown tool names are dropped so the harness never
                 # executes a hallucinated call — warning (not debug) so a
@@ -435,8 +508,20 @@ def _normalize_calls(
         except _OversizeArgs:
             dropped.append(i)
             continue
+        raw_id = call.get("id")
+        if isinstance(raw_id, str) and raw_id not in used_ids:
+            call_id = raw_id
+        else:
+            # Mint `call_NNN` that collides with nothing already emitted: the
+            # positional guess can itself duplicate a model-supplied id.
+            n = len(calls) + 1
+            call_id = f"call_{n:03d}"
+            while call_id in used_ids:
+                n += 1
+                call_id = f"call_{n:03d}"
+        used_ids.add(call_id)
         calls.append({
-            "id": call.get("id", f"call_{len(calls) + 1:03d}") if isinstance(call.get("id"), str) else f"call_{len(calls) + 1:03d}",
+            "id": call_id,
             "type": "function",
             "function": {"name": canonical, "arguments": norm_args},
         })
@@ -447,6 +532,29 @@ def _normalize_calls(
 
 
 _THOUGHT_LINE_RE = re.compile(r"^\s*(thought|thinking|reasoning)\s*:.*$", re.IGNORECASE)
+
+
+def _finish(raw_calls, valid_or_none, limit_args, fmt, forgiving_on, *,
+            diagnostics=None, on_hit=None):
+    """Normalize, record the format trail, strip the matched span.
+
+    The tail every parser format shares: ``_normalize_calls`` drops unknown
+    names and oversize args, the diagnostics entry records
+    kept/dropped/raw, and a non-empty result returns ``(calls, rest)``. An
+    empty result returns ``(None, None)`` so the first-match-wins chain falls
+    through to the next format.
+
+    ``on_hit`` computes the text to strip and is called only when calls
+    survive, so a format that matched nothing pays nothing.
+    """
+    calls, dropped = _normalize_calls(raw_calls, valid_or_none, limit_args)
+    if diagnostics is not None:
+        diagnostics.append({"format": fmt, "matched": bool(calls),
+                            "kept": len(calls), "dropped": list(dropped),
+                            "raw": len(raw_calls)})
+    if calls:
+        return calls, _clean_rest(on_hit(), forgiving_on)
+    return None, None
 
 
 def _clean_rest(rest: str, forgiving: bool = False) -> str:
@@ -501,26 +609,14 @@ def _strip_spans(text: str, spans: list[tuple[int, int]]) -> str:
 
 
 def _contains_word(low_text: str, low_name: str) -> bool:
-    """Case-folded word match without per-tool regex compile.
+    """Case-folded word match. Same semantics as ``(?<!\\w)name(?!\\w)``.
 
-    Same semantics as ``(?<!\\w)name(?!\\w)``: neighbors must not be
-    ``[A-Za-z0-9_]``. Uses C-level ``str.find`` loop.
+    ``re`` caches compiled patterns (512 entries), so building the pattern
+    per call costs a dict lookup, not a recompile.
     """
     if not low_name:
         return False
-    start = 0
-    nl = len(low_name)
-    tl = len(low_text)
-    while True:
-        idx = low_text.find(low_name, start)
-        if idx < 0:
-            return False
-        before = low_text[idx - 1] if idx > 0 else ""
-        after = low_text[idx + nl] if idx + nl < tl else ""
-        if ((not before or not (before.isalnum() or before == "_"))
-                and (not after or not (after.isalnum() or after == "_"))):
-            return True
-        start = idx + 1
+    return re.search(rf"(?<!\w){re.escape(low_name)}(?!\w)", low_text) is not None
 
 
 def _looks_like_tool_attempt(text: str, valid: set[str] | None) -> bool:
@@ -584,11 +680,9 @@ def looks_truncated_tool_attempt(text: str, tools: list[dict] | None = None,
         lt = chr(60)
         generic_close = norm_low.count(lt + "/" + chr(62))
         if forgiving_on:
-            for tag in ("tool_calls", "calls", "invoke", "parameter"):
-                opened = len(re.findall(
-                    r"(?:<|&[lL][tT];)\|{0,2}\s*dsml\s*\|{0,2}" + tag, norm_low))
-                closed = len(re.findall(
-                    r"(?:<|&[lL][tT];)/\|{0,2}\s*dsml\s*\|{0,2}" + tag, norm_low))
+            for _open_re, _close_re in _DSML_TAG_COUNTS_RE:
+                opened = len(_open_re.findall(norm_low))
+                closed = len(_close_re.findall(norm_low))
                 if opened > closed + generic_close:
                     return True
         else:

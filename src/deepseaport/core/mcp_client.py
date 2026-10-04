@@ -2,7 +2,7 @@
 
 Obscura is used as an interactive browser only for login and OAuth-style
 flows. The client intentionally supports only what those flows need:
-initialize, tools/call, and tools/list. Responses are routed by request id to
+initialize and tools/call. Responses are routed by request id to
 ``queue.Queue`` objects, so callers wait on an event instead of polling a
 shared list. Stderr is drained into a small tail for diagnostics, which makes
 a broken browser/subprocess far easier to debug.
@@ -25,25 +25,44 @@ class McpClient:
         self.binary = binary
         self.profile = profile
         self.timeout = timeout
-        self.proc = subprocess.Popen(
-            [binary, "--storage-dir", profile, "mcp"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
         self._id = 0
         self._closed = False
         self._state_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._pending: dict[int, queue.Queue] = {}
         self._stderr_tail: list[str] = []
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader.start()
-        self._stderr_reader = threading.Thread(target=self._stderr_loop, daemon=True)
-        self._stderr_reader.start()
-        self._init()
+        # Set to None first so close() is safe on a half-built object (a Popen
+        # that raised must not turn cleanup into a second AttributeError).
+        self.proc = None
+        self._reader = None
+        self._stderr_reader = None
+        try:
+            self.proc = subprocess.Popen(
+                [binary, "--storage-dir", profile, "mcp"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            self._reader = threading.Thread(target=self._read_loop, daemon=True)
+            self._reader.start()
+            self._stderr_reader = threading.Thread(target=self._stderr_loop, daemon=True)
+            self._stderr_reader.start()
+            self._init()
+        except BaseException:
+            # A handshake that never completes (child alive, no `initialize`
+            # reply within self.timeout) used to leave the child AND both
+            # readers running: the threads hold bound methods -> self, so the
+            # object is rooted in threading._active and __del__/close() never
+            # runs. The child keeps --storage-dir open, and the caller
+            # (providers/deepseek/auth.py:154-177) swallows the error and
+            # RELEASES the profile RLock in its finally -- so the next login
+            # spawns a second obscura on the same profile, which is exactly
+            # the cookie-jar corruption profile_lock() exists to prevent, and
+            # each attempt leaked 2 threads. Fail closed instead.
+            self.close()
+            raise
 
     # -- stdio readers -------------------------------------------------
     def _read_loop(self) -> None:
@@ -85,13 +104,13 @@ class McpClient:
             pass
 
     # -- request/response ---------------------------------------------
-    def _send(self, method: str, params=None, timeout: float | None = None):
+    def _send(self, method: str, params=None):
         if self._closed:
             raise RuntimeError("MCP client is closed")
         if self.proc.poll() is not None:
             raise RuntimeError(f"MCP process exited ({self.proc.returncode}): "
                                f"{self._stderr_tail[-1] if self._stderr_tail else ''}")
-        timeout = self.timeout if timeout is None else timeout
+        timeout = self.timeout
         with self._state_lock:
             self._id += 1
             mid = self._id
@@ -136,28 +155,45 @@ class McpClient:
             )
             self.proc.stdin.flush()
 
-    def tools(self):
-        return self._send("tools/list")
-
     def call(self, name: str, arguments: dict):
         return self._send("tools/call", {"name": name, "arguments": arguments})
 
     # -- lifecycle -----------------------------------------------------
     def close(self) -> None:
-        if self._closed:
+        """Stop the child and both reader threads. Idempotent.
+
+        Tolerates a partially constructed object (``proc is None``, no reader
+        threads yet), because the constructor's failure path calls it after
+        anything from ``Popen`` onwards may have raised.
+        """
+        if getattr(self, "_closed", False):
             return
         self._closed = True
+        proc = getattr(self, "proc", None)
         try:
-            if self.proc.poll() is None:
-                self.proc.terminate()
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
                 try:
-                    self.proc.wait(timeout=3)
+                    proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
-                    self.proc.kill()
-                    self.proc.wait(timeout=3)
+                    proc.kill()
+                    proc.wait(timeout=3)
         except Exception:
             pass
-        for pipe in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+        # Join before closing the pipes: _read_loop/_stderr_loop leave their
+        # loop on EOF, i.e. once the child is gone, so a terminated child
+        # releases both readers. Bounded so a wedged child cannot hang close();
+        # the pipe close below is the backstop that breaks the read.
+        for name in ("_reader", "_stderr_reader"):
+            thread = getattr(self, name, None)
+            try:
+                if thread is not None and thread is not threading.current_thread():
+                    thread.join(timeout=2)
+            except Exception:
+                pass
+        if proc is None:
+            return
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
             try:
                 pipe.close()
             except Exception:

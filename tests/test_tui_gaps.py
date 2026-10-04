@@ -6,6 +6,8 @@ import types
 
 import pytest
 
+from functools import partial
+from support import settings
 from deepseaport import tui
 from deepseaport.config import AccountConfig, Settings
 from deepseaport.tui import (
@@ -37,9 +39,10 @@ from deepseaport.tui import (
 )
 
 
-def _fresh(**kw):
-    kw.setdefault("config_path", "")
-    return Settings(**kw)
+# Default kwargs differ per file; the shared base dict lives in
+# support.py. Every list here is rebuilt per call on purpose.
+_fresh = partial(settings, config_path="",
+                  log_level="INFO", warmup_on_startup=True)
 
 
 # --- helpers ---
@@ -324,10 +327,12 @@ def test_preflight_empty_tokenless_ok():
 
 
 def test_refresh_from_disk_missing_no_raise(tmp_path):
+    # A missing file is a no-op, NOT a reload-to-defaults: load_settings()
+    # cannot distinguish "absent" from "unreadable", and treating absent as
+    # empty wiped the in-memory accounts (the next save persisted []).
     s = Settings(active_account="keep", config_path=str(tmp_path / "missing.json"))
-    _refresh_from_disk(s)  # must not raise
-    # missing file reloads to defaults (clears stale selection), never raises
-    assert s.active_account == ""
+    _refresh_from_disk(s)  # must not raise, must not touch state
+    assert s.active_account == "keep"
     s2 = _fresh()
     _refresh_from_disk(s2)  # empty path no-op
     assert s2.active_account == ""
@@ -695,3 +700,69 @@ def test_main_menu_multi_chat_calls_multi_fn(monkeypatch):
                    lambda st: calls.__setitem__("multi", 1) or 0)
     assert rc == 0
     assert calls == {"serve": 0, "chat": 0, "multi": 1}
+
+# --- C11: dead code / duplication cleanup-----------------------------------------
+
+def test_tui_reexports_the_two_pinned_editor_names():
+    """The re-export block existed for exactly these two names; the rest were
+    tui_editor internals leaking into the TUI namespace (and `from tui import *`).
+    """
+    from deepseaport import tui_editor
+
+    assert tui._read_interactive is tui_editor._read_interactive
+    assert tui._unescape_newlines is tui_editor._unescape_newlines
+
+
+def test_ask_password_fallback_announces_echo_and_keeps_spaces(monkeypatch, capsys):
+    """The no-echo-control fallback used _ask(), which stripped spaces -- the
+    opposite of the docstring, and it typed the secret to the screen silently.
+    """
+    prompts = []
+
+    def _boom(*a, **k):
+        raise RuntimeError("no termios")
+
+    monkeypatch.setattr("getpass.getpass", _boom)
+    monkeypatch.setattr("builtins.input",
+                        lambda p="": prompts.append(p) or " pass word ")
+    got = tui._ask_password("Password (Enter=skip)")
+    assert got == " pass word "          # spaces preserved
+    assert prompts == ["Password (Enter=skip): "]
+    out = capsys.readouterr().out
+    assert "echoed" in out              # and the user was told
+
+
+def test_ask_password_hidden_path_still_preserves_spaces(monkeypatch):
+    monkeypatch.setattr("getpass.getpass", lambda p="": " pass word ")
+    assert tui._ask_password() == " pass word "
+
+
+def test_preflight_gate_helper_is_single_and_preserves_jump(monkeypatch, capsys):
+    """The gate was copy-pasted three times; one helper now owns it."""
+    s = _fresh(accounts=[AccountConfig(email="a@x.com", token="")])
+    jumped = {"n": 0}
+    monkeypatch.setattr(tui, "accounts_menu", lambda st: jumped.__setitem__("n", 1))
+    assert tui._preflight_gate(s) is False        # blocked -> user sent to Accounts
+    assert jumped == {"n": 1}
+    out = capsys.readouterr().out
+    assert "no token" in out.lower()
+    assert "userToken needed per account" in out   # TOKEN_HELP for token reasons
+
+
+def test_preflight_gate_passes_a_ready_pool(monkeypatch):
+    s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")])
+    monkeypatch.setattr(tui, "accounts_menu", lambda st: pytest.fail("jumped"))
+    assert tui._preflight_gate(s) is True
+
+
+def test_report_serve_exit_keeps_clean_exit_quiet(capsys):
+    tui._report_serve_exit("Server", SystemExit(0))
+    out = capsys.readouterr().out
+    assert "back to menu" in out
+    assert "exited with code" not in out
+    tui._report_serve_exit("Server", SystemExit(None))
+    assert "exited with code" not in capsys.readouterr().out
+    tui._report_serve_exit("Server", SystemExit(3))
+    out = capsys.readouterr().out
+    assert "exited with code 3" in out
+    assert "Port already in use" in out

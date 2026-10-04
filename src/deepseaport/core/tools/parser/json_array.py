@@ -8,9 +8,8 @@ from ..common import (
     MAX_SCAN_OBJECTS,
     _LOOSE_JSON_MISS,
     _balanced_json,
-    _clean_rest,
+    _finish,
     _loads_json_lenient,
-    _normalize_calls,
 )
 
 logger = logging.getLogger("deepseaport.tools")
@@ -49,13 +48,10 @@ def try_parse_json_array(text, valid_or_none, limit_args, forgiving_on,
             continue
         raw = obj.get("tool_calls") if isinstance(obj, dict) else None
         if isinstance(raw, list) and raw:
-            calls, dropped = _normalize_calls(raw, valid_or_none, limit_args)
-            if diagnostics is not None:
-                diagnostics.append({"format": "json_array", "matched": bool(calls),
-                                    "kept": len(calls), "dropped": list(dropped),
-                                    "raw": len(raw)})
-            if calls:
-                rest = _clean_rest(text[:start] + text[start + len(obj_text):], forgiving_on)
-                return calls, rest
+            hit = _finish(raw, valid_or_none, limit_args, "json_array",
+                          forgiving_on, diagnostics=diagnostics,
+                          on_hit=lambda: text[:start] + text[start + len(obj_text):])
+            if hit[0]:
+                return hit
         pos = start + len(obj_text)
     return None, None

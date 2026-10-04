@@ -9,6 +9,7 @@ compatibility (tests and tui import the historical names from there).
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import time
 import urllib.request
@@ -17,22 +18,83 @@ import uvicorn
 
 logger = logging.getLogger("deepseaport.server_runner")
 
+# Server limits applied to every uvicorn.Config this module builds (serve,
+# chat background server, multi-instance chat). uvicorn's defaults are
+# unlimited concurrency and a 5s keep-alive: an unbounded in-flight pool
+# behind a handful of account slots is how one retry storm turns into socket
+# exhaustion, and a 5s keep-alive re-uses sockets of clients that already
+# left. 256 concurrent requests is far above what a few agent clients need.
+UVICORN_LIMIT_CONCURRENCY = 256
+UVICORN_TIMEOUT_KEEP_ALIVE = 15
 
-def _watch_stop_keys(server) -> None:
+
+def _is_loopback_host(host: str) -> bool:
+    """True when ``host`` binds only this machine (127.0.0.0/8, ::1, localhost).
+
+    Empty is treated as non-loopback because an empty bind host means "every
+    interface" to the socket layer, which is exactly the case to warn about.
+    """
+    text = str(host or "").strip().lower().strip("[]")
+    if not text:
+        return False
+    if text == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
+
+
+def lan_exposure_notice(settings, host: str, port: int) -> str:
+    """Return a warning line for a non-loopback bind, or "" when loopback."""
+    if _is_loopback_host(host):
+        return ""
+    keys = list(getattr(settings, "keys", None) or [])
+    if keys:
+        gate = (f"the {len(keys)} API key(s) in settings.keys are the only "
+                f"gate, and they travel in a plain header on an unencrypted LAN")
+    else:
+        gate = ("AUTH DISABLED: settings.keys is empty, so every request is "
+                "served without a key")
+    return (f"WARNING: serving on {host}:{port} (non-loopback). The whole API "
+            f"is reachable from the network, including /v1/accounts CRUD "
+            f"(read, overwrite and delete account emails, passwords and "
+            f"tokens) and unmetered chat; {gate}. Bind 127.0.0.1 "
+            f"(--host 127.0.0.1, or listen: false in config.json) unless you "
+            f"meant this.")
+
+
+def _watch_stop_keys(server, stop=None) -> None:
     """Daemon: Esc/q stops a running server so TUI returns to menu.
 
     Best-effort, never raises. Ctrl+C is handled by uvicorn/SIGINT;
     this adds Esc (and q) without Enter on Windows (msvcrt) and POSIX.
+
+    `stop` is the caller's own ``threading.Event``, set in a ``finally``
+    around the serve call. It exists because ``server.should_exit`` is NOT
+    a reliable loop exit: uvicorn's ``Server.startup()`` does
+    ``sys.exit(STARTUP_FAILURE)`` when the bind fails (a port that was taken
+    between the pre-flight check and the bind) and never touches
+    ``should_exit``. The thread then outlived the serve call, kept draining
+    CONIN$ every 100 ms and silently swallowed every main-menu keystroke that
+    was not Esc/q/Q - the menu looked frozen, and the one line that explained
+    it ("Stopping server (key pressed), returning to menu...") was a lie
+    because the user was already in the menu. With `stop` the watcher always
+    terminates with the serve call, and waits on the event instead of
+    busy-polling so it wakes immediately rather than up to 100 ms later.
     """
+    def _stopped() -> bool:
+        if stop is not None and stop.is_set():
+            return True
+        return bool(getattr(server, "should_exit", False))
+
     try:
         try:
             import msvcrt  # type: ignore
         except ImportError:
             msvcrt = None  # type: ignore
         if msvcrt is not None:
-            import time as _time
-
-            while not getattr(server, "should_exit", False):
+            while not _stopped():
                 try:
                     if msvcrt.kbhit():
                         ch = msvcrt.getch()
@@ -40,7 +102,11 @@ def _watch_stop_keys(server) -> None:
                             print("\nStopping server (key pressed), returning to menu...")
                             server.should_exit = True
                             break
+                    elif stop is not None:
+                        stop.wait(0.1)
                     else:
+                        import time as _time
+
                         _time.sleep(0.1)
                 except Exception:
                     return
@@ -64,7 +130,7 @@ def _watch_stop_keys(server) -> None:
             return
         try:
             _tty.setcbreak(_fd)
-            while not getattr(server, "should_exit", False):
+            while not _stopped():
                 try:
                     _r, _, _ = _select.select([_sys.stdin], [], [], 0.2)
                 except Exception:
@@ -91,18 +157,35 @@ def _watch_stop_keys(server) -> None:
 
 def _is_port_free(host: str, port: int) -> bool:
     """True when host:port can be bound right now (pre-flight check)."""
+    import os
     import socket
 
     family = socket.AF_INET6 if ":" in (host or "") else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_STREAM)
     try:
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        except OSError:
-            pass
+        # SO_REUSEADDR only where uvicorn's own bind will set it. asyncio
+        # (uvicorn's transport) sets it when `os.name == "posix"` and NOT on
+        # Windows, and the two platforms disagree about what it means: on
+        # POSIX it never lets a bind steal a live listener, on Windows it does
+        # (both sockets must set it, which is exactly what node,
+        # `python -m http.server` and waitress do). Setting it here on Windows
+        # therefore made this pre-check report "free" for a port uvicorn would
+        # then fail to bind - verified on this box - and a wrong answer in that
+        # direction is the one that costs the user a "port busy" dialog
+        # instead of a wrong auto-pick.
+        if os.name == "posix":
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except OSError:
+                pass
         sock.bind((host, int(port)))
         return True
-    except OSError:
+    except (OSError, OverflowError, ValueError):
+        # OverflowError/ValueError: a port outside the legal range or
+        # unparsable. config.load_settings already clamps the loaded value
+        # (config.py PORT_LIMIT); this keeps a hand-built Settings or a future
+        # caller from turning a bad port into a traceback out of the
+        # pre-flight check.
         return False
     finally:
         try:
@@ -251,25 +334,55 @@ def _start_background_server(app, host: str, port: int,
     """
     import threading
 
+    # app.state is a plain attribute bag; missing settings only costs the
+    # warning (a mock app in tests, or an embedder that never set it).
+    state = getattr(app, "state", None)
+    notice = lan_exposure_notice(getattr(state, "settings", None), host, int(port))
+    if notice:
+        # Logged, not printed: the chat/multi-instance entry points own the
+        # terminal and an interleaved warning there would corrupt the REPL.
+        try:
+            logger.warning(notice)
+        except Exception:
+            pass
     config = uvicorn.Config(app, host=host, port=int(port),
-                            log_level=log_level, access_log=access_log)
+                            log_level=log_level, access_log=access_log,
+                            limit_concurrency=UVICORN_LIMIT_CONCURRENCY,
+                            timeout_keep_alive=UVICORN_TIMEOUT_KEEP_ALIVE)
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     return server, thread
 
 
-def _run_server(settings, args, ensure_free=None) -> int:
-    """Blocking serve loop (single worker) or uvicorn.run (multi-worker).
+def _multiworker_rejection(workers: int) -> str:
+    """Return the failure message for an unsupported --workers N, else "".
 
-    Supported mode is ``--workers 1`` (default). ``--workers N>1`` spawns
-    separate OS processes with process-local state: token-refresh
-    singleflight / login backoff (providers.deepseek.completion_service
-    ``_TOKEN_REFRESH_*`` / per-account ``AccountHealth``) and the config-save
-    lock (config ``_CONFIG_SAVE_LOCK``) do not cross workers, so concurrent
-    saves last-writer-win (atomic os.replace keeps valid JSON). No
-    hard-fail here (see test_run_server_workers_calls_uvicorn_run); run
-    one worker per port / per config instead.
+    Kept separate from the call site so the guard is testable without building
+    an app or touching uvicorn.
+    """
+    if int(workers or 1) == 1:
+        return ""
+    return (
+        f"--workers {int(workers)} is not supported. deepseaport serves an "
+        "in-process app object and uvicorn needs an import string for "
+        "workers>1: it logs \"You must pass the application as an import "
+        "string to enable 'reload' or 'workers'\" and exits 3 before the "
+        "menu opens. Run one worker (--workers 1), or one server per port / "
+        "per config file; process-local state (token-refresh singleflight, "
+        "login backoff, the config-save lock) would not cross workers "
+        "anyway, so concurrent saves last-writer-win.")
+
+
+def _run_server(settings, args, ensure_free=None) -> int:
+    """Blocking serve loop (single worker). ``--workers N>1`` is rejected.
+
+    Multi-worker was never actually reachable: `uvicorn.run(app, ...)` with an
+    app *instance* and workers>1 is a startup failure in uvicorn (it logs the
+    import-string requirement and calls sys.exit(3)), so the old branch fell
+    through to a hard exit with a process-local-state warning as the only
+    explanation. Fail loudly and specifically instead
+    (see `_multiworker_rejection`).
 
     `ensure_free` is an injection seam for deepseaport.cli so the historical
     cli-level `_ensure_free_port` monkeypatch keeps working.
@@ -285,36 +398,64 @@ def _run_server(settings, args, ensure_free=None) -> int:
     port = int(getattr(settings, "port", 5001))
     log_level = str(getattr(settings, "log_level", "info")).lower()
     workers = int(getattr(args, "workers", 1) or 1)
+    # Before the port fix-up: no config save, no prompt, no bind for a mode
+    # that cannot start.
+    if workers != 1:
+        raise SystemExit(_multiworker_rejection(workers))
     if ensure_free is None:
         ensure_free = _ensure_free_port
     port = ensure_free(settings, host, port)
-    if workers != 1:
-        # Multi-worker spawns subprocesses; Esc listener can't reach them.
-        # Ctrl+C still stops; TUI main_menu loop returns to menu.
-        # Explicit runtime limit: singleflight (token refresh/login backoff),
-        # the config-save lock, and the ban-label TTL cache are process-local,
-        # so N workers duplicate warmups and last-writer-win on config.json
-        # (atomic os.replace keeps valid JSON). Run one worker per port /
-        # per config instead.
-        msg = (f"--workers {workers}: process-local state (token-refresh "
-               "singleflight, login backoff, config-save lock) does not cross "
-               "workers; concurrent saves last-writer-win. Prefer --workers 1.")
+    config = uvicorn.Config(app, host=host, port=port, log_level=log_level,
+                            # Access log OFF, same as dry_run and the
+                            # background/chat server. Reason: an account
+                            # identifier may be a FULL token (accounts._matches
+                            # allows a full-token match so
+                            # `DELETE /v1/accounts/<token>` can remove a
+                            # token-only account) and uvicorn's access line
+                            # prints the raw request target, so that one
+                            # request writes a live 64-char bearer token --
+                            # and the whole query string -- into the log.
+                            # Chosen over dropping full-token matching from the
+                            # HTTP route layer because that would break a
+                            # documented route and would not actually close the
+                            # hole: the CLI keeps the match, and the access log
+                            # is a plain file on the same machine.
+                            # Untouched: uvicorn's error log (startup banner,
+                            # unhandled exceptions, shutdown) is a different
+                            # logger and still configured by `log_level`; only
+                            # the `uvicorn.access` per-request lines go away.
+                            access_log=False,
+                            limit_concurrency=UVICORN_LIMIT_CONCURRENCY,
+                            timeout_keep_alive=UVICORN_TIMEOUT_KEEP_ALIVE)
+    server = uvicorn.Server(config)
+    keys = list(getattr(settings, "keys", None) or [])
+    print(f"deepseaport: serving on {host}:{port} - "
+          + (f"auth: {len(keys)} API key(s) required on every endpoint"
+             if keys else
+             "auth: DISABLED (no keys configured, local dev default)"))
+    notice = lan_exposure_notice(settings, host, port)
+    if notice:
+        print(notice)
         try:
-            logger.warning(msg)
+            logger.warning(notice)
         except Exception:
             pass
-        print(f"WARNING: {msg}")
-        try:
-            uvicorn.run(app, host=host, port=port,
-                        log_level=log_level, workers=workers)
-        except KeyboardInterrupt:
-            print("\nServer stopped, back to menu.")
-        return 0
-    config = uvicorn.Config(app, host=host, port=port, log_level=log_level)
-    server = uvicorn.Server(config)
-    threading.Thread(target=_watch_stop_keys, args=(server,), daemon=True).start()
+    stop_keys = threading.Event()
+    watcher = threading.Thread(target=_watch_stop_keys, args=(server, stop_keys),
+                               daemon=True)
+    watcher.start()
     try:
         server.run()
     except KeyboardInterrupt:
         print("\nServer stopped (Ctrl+C), back to menu.")
+    finally:
+        # Own stop flag, set on every exit path (including the SystemExit from
+        # uvicorn's failed-bind startup, which never sets should_exit) so the
+        # watcher thread cannot outlive this call and eat menu keystrokes. See
+        # _watch_stop_keys. The join makes the guarantee synchronous instead of
+        # "within one 100ms poll": the watcher is either in kbhit() (returns at
+        # once) or in stop.wait() (returns on set), so this cannot block for
+        # long, and it is bounded either way.
+        stop_keys.set()
+        watcher.join(timeout=1.0)
     return 0

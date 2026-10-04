@@ -26,8 +26,6 @@ from .login_policy import (
     CDP_SNAPSHOT_JS,
     COOKIE_DISMISS_DELAY_CDP,
     DEFAULT_LOGIN_TIMEOUT,
-    LOGIN_BAN_PHRASES,
-    LOGIN_CREDENTIAL_PHRASES,
     NAVIGATE_RENDER_TIMEOUT,
     REACT_COMMIT_DELAY,
     REAL_POLL_INTERVAL,
@@ -39,9 +37,10 @@ from .login_policy import (
 logger = logging.getLogger("deepseaport.real_browser")
 
 # Page policy (selectors, phrase lists, visibility/snapshot JS, poll/timeout
-# constants, verdict helpers) lives in ``login_policy``; names above are
-# re-exported here for backward compat (``real_browser.SIGN_IN_URL``,
-# ``real_browser._clean``, ``DEFAULT_LOGIN_TIMEOUT``, etc.).
+# constants, verdict helpers) lives in ``login_policy``; the names imported
+# above are the ones this driver actually uses. The login loop classifies each
+# snapshot through ``snapshot_verdict`` (the shared helper the Obscura driver
+# also uses) instead of re-deriving phrase matches locally.
 
 
 class RealBrowser:
@@ -57,6 +56,41 @@ class RealBrowser:
         self.ws = None
         self._id = 0
 
+    def launch_args(self) -> list[str]:
+        """Argv for the sign-in browser.
+
+        The DevTools endpoint is pinned to loopback
+        (``--remote-debugging-address=127.0.0.1``) so no other host on the LAN
+        can attach. ``--remote-allow-origins=*`` is deliberately ABSENT: it
+        turns Chrome's CDP Origin check off, which would let any local process
+        attach to this debug port and drive the live sign-in session (typing
+        into the password field, reading the resulting token). The websocket
+        client already sends no ``Origin`` header at all
+        (``suppress_origin=True`` in :meth:`_connect`), so the check the flag
+        disables is not even hit by the legitimate client.
+
+        Kept as a method (not an inline list in ``start``) so the security
+        shape of the launch is unit-testable without spawning a browser.
+        """
+        args = [
+            self.binary,
+            "--remote-debugging-port=0",
+            "--remote-debugging-address=127.0.0.1",
+            f"--user-data-dir={self.profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-blink-features=AutomationControlled",
+            "--window-size=1200,900",
+            "--window-position=50,50",
+            "about:blank",
+        ]
+        if self.headless:
+            args.insert(-1, "--headless=new")
+        return args
+
     def start(self) -> None:
         try:
             import websocket  # noqa: F401  (dependency checked here)
@@ -65,23 +99,7 @@ class RealBrowser:
                 "real-browser login needs websocket-client; "
                 "install it with `pip install websocket-client`") from exc
 
-        args = [
-            self.binary,
-            "--remote-debugging-port=0",
-            f"--user-data-dir={self.profile}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--disable-background-networking",
-            "--disable-sync",
-            "--remote-allow-origins=*",
-            "--disable-blink-features=AutomationControlled",
-            "--window-size=1200,900",
-            "--window-position=50,50",
-            "about:blank",
-        ]
-        if self.headless:
-            args.insert(-1, "--headless=new")
+        args = self.launch_args()
         creationflags = 0
         try:
             creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
@@ -265,6 +283,7 @@ class RealBrowser:
         deadline = time.monotonic() + self.timeout
         detail = ""
         ban_hint = False
+        ban_streak = 0
         while time.monotonic() < deadline:
             time.sleep(REAL_POLL_INTERVAL)
             try:
@@ -275,17 +294,59 @@ class RealBrowser:
             if not snap:
                 continue
             body = _clean(snap.get("body"))
-            low = body.lower()
             detail = body[:800]
-            if snap.get("captcha_visible"):
-                return None, False, f"real browser login captcha: {body[:300]}"
-            if any(w in low for w in LOGIN_BAN_PHRASES):
-                ban_hint = True
+            # Page semantics come from login_policy (single source of truth for
+            # both drivers) via snapshot_verdict: the captcha_visible overlay
+            # flag AND the LOGIN_CAPTCHA_PHRASES list. Checking only the flag
+            # meant a text-only challenge ("Slide to verify", no overlay
+            # element) was never detected: the driver burned the full 75s login
+            # timeout and returned "no token", which sets the wrong (generic)
+            # login backoff instead of a captcha one.
+            kind, phrase = snapshot_verdict(snap)
             token = str(snap.get("token") or "").strip()
-            if token and token != "null":
-                return token, ban_hint, body[:800]
-            if any(w in low for w in LOGIN_CREDENTIAL_PHRASES):
-                return None, ban_hint, f"real browser login rejected: {body[:400]}"
+            if token == "null":
+                token = ""
+            if kind == "captcha":
+                return None, ban_hint, (
+                    f"real browser login captcha (phrase={phrase!r}): "
+                    f"{body[:300]}")
+            if kind == "ban":
+                # One sighting is a HINT, not a verdict -- same rule as the MCP
+                # driver (auth.py:267-274, ban_streak >= 2). LOGIN_BAN_PHRASES
+                # holds bare tokens ("muted", "banned", "suspend", "violation")
+                # and this loop takes ~125 snapshots over 75s, so latching on a
+                # single frame (a terms block, a footer, a toast, a route
+                # transition) permanently bans a healthy account: auth.py:347
+                # throws the freshly obtained token away and _refresh_token_once
+                # persists `banned: true` to config.json, with a cooldown of up
+                # to a year when parse_ban_until finds a date in the body. A
+                # persisted false ban is near-unrecoverable from the user's
+                # side, so confirmation is required.
+                ban_streak += 1
+                # Sticky hint for the exits below that cannot report a verdict
+                # of their own (captcha/credential/no token): the user still
+                # deserves to hear that ban wording was seen.
+                ban_hint = True
+                if ban_streak >= 2:
+                    # Confirmed. Still hand back a token the page is serving: a
+                    # suspended account can log in (see parse_ban_until) and the
+                    # caller decides what to do with the pair.
+                    return (token or None), True, (
+                        f"real browser login suspension (phrase={phrase!r}): "
+                        f"{body[:400]}")
+                # One sighting: keep polling rather than returning. A transient
+                # frame clears on the next poll; a real one confirms above.
+                continue
+            ban_streak = 0
+            if token:
+                # A page serving a real userToken is positive evidence the
+                # account is NOT banned, so this path never reports banned=True:
+                # an ambiguous earlier frame must not veto a working credential.
+                return token, False, body[:800]
+            if kind == "credential":
+                return None, ban_hint, (
+                    f"real browser login rejected (phrase={phrase!r}): "
+                    f"{body[:400]}")
         return None, ban_hint, f"real browser login no token: {detail[:600]}"
 
 

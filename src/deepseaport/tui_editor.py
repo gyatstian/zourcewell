@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import unicodedata
 
 
@@ -22,6 +23,21 @@ def _unescape_newlines(raw: str) -> str:
     return (raw.replace("\\\\", sentinel)
                .replace("\\n", "\n")
                .replace(sentinel, "\\"))
+
+
+def _stdin_is_tty() -> bool:
+    """True only when there is a console to prompt on. Never raises.
+
+    The lowest-level terminal helper in the package (this module imports
+    nothing from deepseaport), so tui and cli reuse it instead of each spelling
+    their own probe. getattr-style because sys.stdin is None under pythonw.exe
+    and some frozen launchers, where a bare sys.stdin.isatty() raises.
+    """
+    _stdin = getattr(sys, "stdin", None)
+    try:
+        return bool(getattr(_stdin, "isatty", None) and _stdin.isatty())
+    except Exception:
+        return False
 
 
 def _ensure_vt() -> None:
@@ -52,13 +68,7 @@ def _read_interactive(prompt: str, initial: str = "") -> str | None:
     Esc / Ctrl+C / Ctrl+Z cancel. Returns None on cancel. Falls back to
     plain ``input()`` + unescape when stdin is not a tty (pipes, tests).
     """
-    import sys
-
-    try:
-        is_tty = bool(sys.stdin.isatty())
-    except Exception:
-        is_tty = False
-    if not is_tty:
+    if not _stdin_is_tty():
         try:
             return _unescape_newlines(input(prompt))
         except (EOFError, KeyboardInterrupt):
@@ -81,32 +91,6 @@ def _read_interactive(prompt: str, initial: str = "") -> str | None:
             print()
             return None
     return _read_interactive_posix(prompt, _select, _termios, _tty, initial)
-
-
-def _read_keys_react(buf: list[str], out, ch: str, get_special) -> str:
-    """Legacy append-only key handler (kept for compat; editor below is cursor-aware)."""
-    if ch in ("\x03", "\x1a"):
-        return "cancel"  # Ctrl+C / Ctrl+Z
-    if ch in ("\x00", "\xe0"):
-        get_special()
-        return "more"  # arrows etc: ignored, never echoed
-    if ch in ("\x08", "\x7f"):
-        if not buf:
-            return "more"
-        old = buf.pop()
-        if old == "\n":
-            prev = "".join(buf).split("\n")[-1]
-            out.write("\x1b[1F")
-            if prev:
-                out.write(f"\x1b[{len(prev)}C")
-        else:
-            out.write("\b \b")
-        out.flush()
-        return "more"
-    buf.append(ch)
-    out.write(ch)
-    out.flush()
-    return "more"
 
 
 _WIN_SPECIAL_MAP = {
