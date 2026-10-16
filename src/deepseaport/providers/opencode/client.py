@@ -1,16 +1,30 @@
-"""Opencode local-CLI client: session lifecycle over plain HTTP (sync).
+"""Opencode local-CLI client: session lifecycle over the v2 HTTP API (sync).
 
-Stdlib ``urllib`` only (localhost HTTP, no TLS fingerprinting needed):
-``health`` -> ``create_session`` -> ``send_message`` (blocking: serve waits
-for the agent loop) -> best-effort ``delete_session``. Any transport or
-upstream failure surfaces as ``RuntimeError`` carrying a short code prefix
-(``OPENCODE_SERVE_DOWN`` / ``OPENCODE_HTTP_<status>``) that the engine
-classifier maps to a terminal. Never raises raw ``URLError``/``KeyError``.
+Stdlib ``urllib`` only (localhost HTTP, no TLS fingerprinting needed). v2
+removed the blocking message endpoint, so a turn is prompt-then-poll:
 
-Sessions are pinned to a working directory via ``?directory=`` (see
-``protocol.session_directory``): native tools (bash/read) run there, not in
-the serve's own cwd. Resolution is ``DEEPSEAPORT_OPENCODE_WORKDIR`` env >
-process cwd; the serve registers the project on demand.
+``GET /api/info`` (alive) -> ``POST /api/session`` (create) ->
+``POST /api/session/:id/model`` + ``/agent`` (v2 made the model, its
+reasoning ``variant`` and the agent SESSION-scoped) ->
+``POST /api/session/:id/prompt`` (returns at once, the agent loop runs
+async) -> poll ``GET /api/session/:id/message`` until this turn's assistant
+item carries ``time.completed`` -> best-effort ``DELETE /api/session/:id``.
+:func:`stream_message` subscribes to the ``GET /api/event`` bus FIRST so no
+early delta is missed, forwards ``session.text.delta`` /
+``session.reasoning.delta`` through the callbacks, and then reads the same
+authoritative timeline for the final answer.
+
+Success bodies are enveloped as ``{"data": ...}``, failures are a flat
+``{"_tag": "...", "message": "..."}`` object. Any transport or upstream
+failure surfaces as ``RuntimeError`` carrying a short code prefix
+(``OPENCODE_SERVE_DOWN`` / ``OPENCODE_HTTP_<status>`` / ``OPENCODE_UPSTREAM``)
+that the engine classifier maps to a terminal. Never raises raw
+``URLError``/``KeyError``.
+
+Sessions are pinned to a working directory via ``location.directory`` in the
+create body (see ``protocol.session_directory``): the agent's permitted file
+tools run there, not in the serve's own cwd. Resolution is
+``DEEPSEAPORT_OPENCODE_WORKDIR`` env > process cwd.
 """
 
 from __future__ import annotations
@@ -18,6 +32,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -25,17 +41,16 @@ from . import protocol as P
 
 logger = logging.getLogger("deepseaport.client")
 
-# Per-request stream/HTTP timeout for the blocking message POST. The server's
-# consumer wait is derived from this so the two cannot drift apart.
+# Per-request HTTP timeout, and in send_message the deadline for the whole
+# prompt-then-poll turn (the prompt POST itself returns at once).
 DEFAULT_TIMEOUT = 180
 
-# Sentinel: caller did not choose a native tool allowlist -> use the
-# gatekeeper-minimal declared pair (bash declared-but-denied + read; see
-# protocol.NATIVE_TOOLS_MINIMAL). Pass an explicit None to omit the `tools`
-# key entirely (plain chat; live-verified on opencode 1.18.32: tool-less
-# passes via agent defaults, only an explicit all-false allowlist triggers
-# the free-tier FreeTierError envelope).
-_DEFAULT_TOOLS: object = object()
+# Poll cadence for the turn loop. The first poll happens before any sleep;
+# localhost, so a fixed interval is cheaper than a backoff ladder.
+_POLL_INTERVAL = 0.5
+# Timeline window per poll, newest first (see get_session_messages), so a long
+# session keeps the current turn in view.
+_POLL_LIMIT = 50
 
 
 def _auth_header() -> dict[str, str]:
@@ -88,8 +103,9 @@ def _request(method: str, path: str, body: dict | None = None,
 def _serve_error_message(data: dict, fallback: str) -> str:
     """Pull the human message out of a serve error envelope.
 
-    Failures look like ``{"name":"UnknownError","data":{"message":...}}``;
-    fall back to the raw body when the shape is unknown. Never raises.
+    v2 failures are flat (``{"_tag": "...", "message": "..."}``); older or
+    unexpected shapes nest it under ``data`` or carry it in ``error`` as a
+    ``{type, message}`` object. Never raises.
     """
     try:
         inner = data.get("data")
@@ -99,36 +115,102 @@ def _serve_error_message(data: dict, fallback: str) -> str:
             val = data.get(key)
             if isinstance(val, str) and val.strip():
                 return val
+            if isinstance(val, dict) and val.get("message"):
+                return str(val["message"])
     except Exception:
         pass
     return fallback
 
 
+def _error_detail(raw) -> str:
+    """Human text of one v2 error value (string or ``{type, message}``)."""
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, dict):
+        return str(raw.get("message") or raw.get("type")
+                   or json.dumps(raw))[:300]
+    return ""
+
+
+def _raise_for_status(status: int, data: dict, action: str,
+                      session_id: str) -> None:
+    """Raise RuntimeError with the classifier code prefix, or return on 2xx.
+
+    One home for the status mapping shared by the session-scoped calls
+    (model/agent select, prompt): 401 auth, 404 unknown session vs missing
+    v2 route, 429 rate limit, everything else as ``OPENCODE_HTTP_<status>``.
+    """
+    if 200 <= status < 300:
+        return
+    detail = _serve_error_message(data, json.dumps(data)[:300])[:300]
+    if status == 401:
+        raise RuntimeError(
+            "OPENCODE_HTTP_401: serve rejected basic auth "
+            "(check DEEPSEAPORT_OPENCODE_USERNAME/PASSWORD "
+            "vs OPENCODE_SERVER_PASSWORD).")
+    if status == 404:
+        if P.is_session_error(detail):
+            raise RuntimeError(
+                f"OPENCODE_INVALID_SESSION: session {session_id} unknown "
+                f"(stale session, recreate): {detail[:200]}")
+        raise RuntimeError(
+            f"OPENCODE_HTTP_404: {action} route missing at {P.base_url()} "
+            f"(opencode v2 /api required, v1 routes are gone): {detail[:200]}")
+    if status == 429:
+        raise RuntimeError(f"OPENCODE_RATE_LIMITED: {detail}")
+    raise RuntimeError(f"OPENCODE_HTTP_{status}: {action} failed: {detail}")
+
+
+def _raise_turn_error(detail: str, provider_id: str, model_id: str) -> None:
+    """One home for a turn the serve refused or failed -> RuntimeError.
+
+    The free-tier gatekeeper is terminal and gets its own prefix; everything
+    else is ``OPENCODE_UPSTREAM``. The detail keeps the serve's own words
+    ("Variant unavailable for ...", "rate limit exceeded") because
+    completion_service.classify_error and its variant-resend check read them.
+    """
+    detail = str(detail or "")[:500]
+    if P.is_free_tier_error(detail):
+        raise RuntimeError(
+            "OPENCODE_FREE_TIER_DENIED: opencode free tier refused the "
+            "request (upstream client-fingerprint check). Upgrade the "
+            "`opencode` CLI and retry; key-gated models need "
+            "`opencode auth login`. "
+            f"Upstream: {detail[:300]}")
+    raise RuntimeError(
+        f"OPENCODE_UPSTREAM: agent loop failed for {provider_id}/{model_id}: "
+        f"{detail}")
+
+
 def health(timeout: float = 10) -> bool:
-    """True when the serve instance answers healthy (never raises)."""
+    """True when ``GET /api/info`` answers 200 (never raises)."""
     try:
-        status, data = _request("GET", "/global/health", timeout=timeout)
-        return status == 200 and bool(data.get("healthy", True))
+        status, _data = _request("GET", "/api/info", timeout=timeout)
+        return status == 200
     except Exception:
         return False
 
 
 def create_session(timeout: float = 20,
-                     directory: str | None = None) -> str:
-    """POST /session {} -> session id (raises RuntimeError on failure).
+                    directory: str | None = None) -> str:
+    """POST /api/session -> session id (raises RuntimeError on failure).
 
-    ``directory`` pins the session worktree (native tools run here);
-    None resolves via ``protocol.session_directory()`` (WORKDIR env > cwd).
+    ``directory`` pins the session worktree (native tools run here) as
+    ``location.directory``; None resolves via
+    ``protocol.session_directory()`` (WORKDIR env > cwd). The model, variant
+    and agent are NOT set here -- v2 can only be born with a model, and
+    :func:`send_message` sets all three per turn (see :func:`_select`).
     """
-    query = P.session_query(
-        directory if directory is not None else P.session_directory())
-    status, data = _request("POST", f"/session{query}", {}, timeout=timeout)
+    resolved = directory if directory is not None else P.session_directory()
+    body: dict = {"location": {"directory": resolved}} if resolved else {}
+    status, data = _request("POST", "/api/session", body, timeout=timeout)
     if status != 200:
         raise RuntimeError(
             f"OPENCODE_HTTP_{status}: create_session failed: "
             f"{_serve_error_message(data, json.dumps(data)[:300])[:300]}. "
             f"{P.serve_hint()}")
-    sid = str(data.get("id") or "").strip()
+    inner = data.get("data") if isinstance(data.get("data"), dict) else data
+    sid = str(inner.get("id") or "").strip()
     if not sid:
         raise RuntimeError(
             f"OPENCODE_UPSTREAM: create_session returned no id: "
@@ -136,78 +218,132 @@ def create_session(timeout: float = 20,
     return sid
 
 
-def send_message(session_id: str, provider_id: str, model_id: str,
-                 agent: str, prompt: str,
-                 timeout: float = DEFAULT_TIMEOUT,
-                 variant: str | None = None,
-                 directory: str | None = None,
-                 tools: dict | None | object = _DEFAULT_TOOLS) -> dict:
-    """POST one message; return {content, thinking, usage_total, finish}.
-
-    Raises RuntimeError on transport/upstream failure (the message carries a
-    code prefix for the classifier). Empty agent replies surface as
-    ``OPENCODE_EMPTY`` so the engine retries once on a fresh session.
-    ``tools`` selects the per-message native allowlist: the default keeps
-    the gatekeeper-minimal declared pair (bash declared but denied, read
-    allowed; everything else hidden so pi-harness tools with the same
-    names, via the DSML prompt, stay unambiguous); an explicit None omits
-    the key (plain chat, no pi tools).
-    """
-    body = P.message_payload(
-        provider_id, model_id, agent, prompt,
-        variant=variant,
-        tools=(P.native_tools_minimal() if tools is _DEFAULT_TOOLS
-               else (dict(tools) if isinstance(tools, dict) else None)))
-    query = P.session_query(
-        directory if directory is not None else P.session_directory())
-    status, data = _request(
-        "POST", f"/session/{session_id}/message{query}", body, timeout=timeout,
-        session_id=session_id)
-    if status == 401:
-        raise RuntimeError(
-            "OPENCODE_HTTP_401: serve rejected basic auth "
-            "(check DEEPSEAPORT_OPENCODE_USERNAME/PASSWORD "
-            "vs OPENCODE_SERVER_PASSWORD).")
-    if status == 404:
-        raise RuntimeError(
-            f"OPENCODE_INVALID_SESSION: session {session_id} unknown "
-            f"(stale session, recreate): {json.dumps(data)[:200]}")
-    if status == 429:
-        raise RuntimeError(
-            f"OPENCODE_RATE_LIMITED: {json.dumps(data)[:300]}")
-    if status != 200:
-        raise RuntimeError(
-            f"OPENCODE_HTTP_{status}: message failed: "
-            f"{_serve_error_message(data, json.dumps(data)[:500])[:500]}")
-    # 200 with an error envelope (flaky agent loop): fail loudly instead of
-    # serving the error text as a normal reply (single home below).
-    return _parse_message_result(data, provider_id, model_id)
-
-
 def delete_session(session_id: str | None, timeout: float = 10,
-                     directory: str | None = None) -> None:
-    """Best-effort DELETE /session/:id; never raises."""
+                   directory: str | None = None) -> None:
+    """Best-effort DELETE /api/session/:id (204); never raises."""
     if not session_id:
         return
     try:
-        query = P.session_query(
-            directory if directory is not None else P.session_directory())
-        _request("DELETE", f"/session/{session_id}{query}", timeout=timeout,
+        _request("DELETE", f"/api/session/{session_id}", timeout=timeout,
                  session_id=session_id)
     except Exception:
         pass
 
 
-def _parse_message_result(data: dict, provider_id: str,
-                          model_id: str) -> dict:
-    """Shared blocking-result parser -> {content, thinking, usage_total, finish}.
+def abort_session(session_id: str | None,
+                  directory: str | None = None) -> None:
+    """Best-effort POST /api/session/:id/interrupt; never raises."""
+    if not session_id:
+        return
+    try:
+        _request("POST", f"/api/session/{session_id}/interrupt", {},
+                 timeout=10, session_id=session_id)
+    except Exception:
+        pass
 
-    Raises RuntimeError with the classifier code prefix on error/empty
-    (same contract as :func:`send_message`). Never raises KeyError.
+
+def get_session_messages(session_id: str, timeout: float = 20,
+                         directory: str | None = None,
+                         limit: int = _POLL_LIMIT) -> list:
+    """Session timeline, OLDEST FIRST; [] on failure, never raises.
+
+    v2 answers ``{"data": [items], "cursor": {...}}``. ``order=desc`` plus a
+    limit keeps the newest window (the current turn) in view on a long
+    session, so the list is reversed back into chronological order here.
+    ``directory`` is accepted and ignored: v2 has no ``?directory=`` query.
     """
-    info = data.get("info") if isinstance(data.get("info"), dict) else {}
-    info_error = info.get("error") if isinstance(info, dict) else None
-    parts = data.get("parts")
+    del directory
+    try:
+        status, data = _request(
+            "GET", f"/api/session/{session_id}/message"
+                   f"?limit={int(limit)}&order=desc",
+            timeout=timeout, session_id=session_id)
+        if status != 200:
+            return []
+        items = data.get("data")
+        if not isinstance(items, list):
+            return []
+        return items[::-1]
+    except Exception:
+        return []
+
+
+def _select(session_id: str, provider_id: str, model_id: str, agent: str,
+            variant: str | None, timeout: float) -> None:
+    """POST the session's model (with ``variant``) and its agent; 204 = ok.
+
+    v2 made all three session-scoped. ``POST /api/session`` is the only place
+    a session can be born with a model and :func:`create_session`'s signature
+    cannot carry one, so the turn sets them here instead -- without it the
+    serve answers with whatever model the session happens to carry (nothing,
+    for a session created with an empty body), so a request for
+    ``anthropic/claude-x`` would silently come back from another model.
+
+    An unusable model or variant is accepted here and fails the turn with
+    ``Model/Variant unavailable for ...`` on the timeline, which is why the
+    "variant" word has to survive into the error text:
+    completion_service keys its variant-less resend off it.
+    """
+    model: dict = {"id": str(model_id or ""),
+                   "providerID": str(provider_id or "")}
+    if variant:
+        model["variant"] = str(variant)
+    if model["id"]:
+        status, data = _request(
+            "POST", f"/api/session/{session_id}/model", {"model": model},
+            timeout=timeout, session_id=session_id)
+        _raise_for_status(status, data, "select model", session_id)
+    if agent:
+        status, data = _request(
+            "POST", f"/api/session/{session_id}/agent", {"agent": str(agent)},
+            timeout=timeout, session_id=session_id)
+        _raise_for_status(status, data, "select agent", session_id)
+
+
+def _turn_outcome(items: list, user_id: str, provider_id: str,
+                  model_id: str) -> tuple[str, object]:
+    """State of the turn that starts at ``user_id`` -> (outcome, payload).
+
+    ``("done", result_dict)`` once its assistant item carries
+    ``time.completed``, ``("error", detail)`` on a failed turn, else
+    ``("pending", "")``. Only items AFTER the user item count, so a resend on
+    the same session (the variant-less retry) can never read the previous
+    turn's answer or its error. ``user_id`` is the id the prompt POST
+    returned; when it is not in the window the whole window is used, which
+    still resolves to the newest completed assistant item.
+    """
+    start = 0
+    if user_id:
+        for idx, item in enumerate(items):
+            if isinstance(item, dict) and str(item.get("id") or "") == user_id:
+                start = idx + 1
+                break
+    tail = [i for i in items[start:] if isinstance(i, dict)]
+    failed = ""
+    for item in tail:
+        detail = _error_detail(item.get("error"))
+        if detail:
+            failed = detail
+    for item in reversed(tail):
+        if str(item.get("type") or "") != "assistant":
+            continue
+        time_info = item.get("time")
+        if isinstance(time_info, dict) and time_info.get("completed"):
+            return "done", _parse_message_result(item, provider_id, model_id)
+    if failed:
+        return "error", failed
+    return "pending", ""
+
+
+def _parse_message_result(item: dict, provider_id: str,
+                          model_id: str) -> dict:
+    """One v2 assistant item -> {content, thinking, usage_total, finish}.
+
+    ``item`` is the timeline entry itself (``content[]`` parts, ``tokens``,
+    ``finish``, ``error``). Raises RuntimeError with the classifier code
+    prefix on error/empty, never KeyError.
+    """
+    parts = item.get("content")
     if not isinstance(parts, list):
         parts = []
     content = "".join(str(p.get("text") or "")
@@ -215,27 +351,18 @@ def _parse_message_result(data: dict, provider_id: str,
                       if isinstance(p, dict) and p.get("type") == "text")
     thinking = "".join(str(p.get("text") or "")
                        for p in parts
-                       if isinstance(p, dict) and p.get("type") in ("reasoning",))
+                       if isinstance(p, dict) and p.get("type") == "reasoning")
     usage_total = 0
     try:
-        tokens = info.get("tokens") if isinstance(info, dict) else None
+        tokens = item.get("tokens")
         if isinstance(tokens, dict):
             usage_total = int(tokens.get("output") or 0)
     except (TypeError, ValueError):
         usage_total = 0
-    finish = str((info.get("finish") if isinstance(info, dict) else "") or "stop")
-    if info_error:
-        detail = info_error if isinstance(info_error, str) else json.dumps(info_error)
-        if P.is_free_tier_error(detail):
-            raise RuntimeError(
-                "OPENCODE_FREE_TIER_DENIED: opencode free tier refused the "
-                "request (upstream client-fingerprint check). Upgrade the "
-                "`opencode` CLI and retry; key-gated models need "
-                "`opencode auth login`. "
-                f"Upstream: {detail[:300]}")
-        raise RuntimeError(
-            f"OPENCODE_UPSTREAM: agent loop failed for {provider_id}/{model_id}: "
-            f"{detail[:500]}")
+    finish = str(item.get("finish") or "stop")
+    detail = _error_detail(item.get("error"))
+    if detail:
+        _raise_turn_error(detail, provider_id, model_id)
     if not content and not thinking:
         raise RuntimeError(
             f"OPENCODE_EMPTY: empty completion for {provider_id}/{model_id} "
@@ -244,145 +371,89 @@ def _parse_message_result(data: dict, provider_id: str,
             "usage_total": usage_total, "finish": finish}
 
 
-def _session_message_path(session_id: str, directory: str,
-                          extra: str = "") -> str:
-    """`/session/:id/message` path with directory + extra query merged."""
-    base_q = P.session_query(directory)
-    if not extra:
-        return f"/session/{session_id}/message{base_q}"
-    sep = "&" if base_q else "?"
-    return f"/session/{session_id}/message{base_q}{sep}{extra.lstrip('?&')}"
-
-
 def prompt_async(session_id: str, provider_id: str, model_id: str,
                  agent: str, prompt: str,
                  timeout: float = 30,
-                 variant: str | None = None,
-                 directory: str | None = None,
-                 tools: dict | None | object = _DEFAULT_TOOLS) -> None:
-    """POST prompt_async (204 on accept); raises RuntimeError otherwise.
+                 variant: str | None = None) -> str:
+    """Select model+agent, POST the prompt; returns this turn's user item id.
 
-    ``tools`` mirrors :func:`send_message` (default minimal, None omits).
+    v2 has no separate async endpoint: ``POST /api/session/:id/prompt``
+    enqueues the turn and answers at once with the created user message, so
+    the caller polls the timeline for the reply. Raises RuntimeError (with
+    the classifier code prefix) when the prompt itself is refused.
     """
-    body = P.message_payload(
-        provider_id, model_id, agent, prompt,
-        variant=variant,
-        tools=(P.native_tools_minimal() if tools is _DEFAULT_TOOLS
-               else (dict(tools) if isinstance(tools, dict) else None)))
-    resolved = directory if directory is not None else P.session_directory()
-    query = P.session_query(resolved)
+    _select(session_id, provider_id, model_id, agent, variant, timeout)
     status, data = _request(
-        "POST", f"/session/{session_id}/prompt_async{query}", body,
+        "POST", f"/api/session/{session_id}/prompt",
+        P.message_payload(prompt),
         timeout=timeout, session_id=session_id)
-    if status == 204:
-        return
-    if status == 401:
-        raise RuntimeError(
-            "OPENCODE_HTTP_401: serve rejected basic auth "
-            "(check DEEPSEAPORT_OPENCODE_USERNAME/PASSWORD "
-            "vs OPENCODE_SERVER_PASSWORD).")
-    if status == 404:
-        raise RuntimeError(
-            f"OPENCODE_INVALID_SESSION: session {session_id} unknown "
-            f"(stale session, recreate): {json.dumps(data)[:200]}")
-    if status == 429:
-        raise RuntimeError(
-            f"OPENCODE_RATE_LIMITED: {json.dumps(data)[:300]}")
-    raise RuntimeError(
-        f"OPENCODE_HTTP_{status}: prompt_async failed: "
-        f"{_serve_error_message(data, json.dumps(data)[:500])[:500]}")
+    _raise_for_status(status, data, "prompt", session_id)
+    inner = data.get("data") if isinstance(data.get("data"), dict) else data
+    return str(inner.get("id") or "")
 
 
-def abort_session(session_id: str | None,
-                  directory: str | None = None) -> None:
-    """Best-effort POST /session/:id/abort; never raises."""
-    if not session_id:
-        return
-    try:
-        resolved = directory if directory is not None else P.session_directory()
-        query = P.session_query(resolved)
-        _request("POST", f"/session/{session_id}/abort{query}", {},
-                 timeout=10, session_id=session_id)
-    except Exception:
-        pass
+def _await_turn(session_id: str, user_id: str, provider_id: str,
+                model_id: str, timeout: float) -> dict:
+    """Poll the timeline until this turn finishes, fails or times out."""
+    deadline = time.monotonic() + max(5.0, float(timeout))
+    while True:
+        items = get_session_messages(session_id, timeout=20)
+        outcome, payload = _turn_outcome(items, user_id, provider_id, model_id)
+        if outcome == "done":
+            return payload
+        if outcome == "error":
+            _raise_turn_error(str(payload), provider_id, model_id)
+        if time.monotonic() >= deadline:
+            logger.warning("opencode turn produced no assistant message "
+                           "within %.0fs for %s/%s",
+                           float(timeout), provider_id, model_id)
+            # "timed out" on purpose: classify_error reads it as a retryable
+            # overload, so a slow-but-healthy serve gets a fresh attempt.
+            raise RuntimeError(
+                f"OPENCODE_UPSTREAM: turn timed out after "
+                f"{float(timeout):.0f}s for {provider_id}/{model_id} "
+                f"(session {session_id})")
+        time.sleep(_POLL_INTERVAL)
 
 
-def get_session_messages(session_id: str, timeout: float = 20,
-                         directory: str | None = None,
-                         limit: int = 20) -> list:
-    """GET session messages (newest last); [] on failure, never raises."""
-    try:
-        resolved = directory if directory is not None else P.session_directory()
-        path = _session_message_path(session_id, resolved, f"limit={int(limit)}")
-        # Messages endpoint returns a JSON list (not an object), so fetch
-        # raw instead of via _request (which coerces non-dict bodies to {}).
-        url = P.base_url() + path
-        headers = {"Accept": "application/json"}
-        headers.update(_auth_header())
-        headers.update(P.client_headers(session_id))
-        req = urllib.request.Request(url, method="GET", headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if int(getattr(resp, "status", 200) or 200) != 200:
-                return []
-            raw = resp.read().decode("utf-8", "replace")
-        parsed = json.loads(raw) if raw.strip() else []
-        return parsed if isinstance(parsed, list) else []
-    except Exception:
-        return []
+def send_message(session_id: str, provider_id: str, model_id: str,
+                 agent: str, prompt: str,
+                 timeout: float = DEFAULT_TIMEOUT,
+                 variant: str | None = None) -> dict:
+    """Run one turn; return {content, thinking, usage_total, finish}.
 
-
-def _final_result_from_messages(messages: list, provider_id: str,
-                                model_id: str) -> dict | None:
-    """Newest assistant message with text/reasoning -> parsed result.
-
-    Returns None when no usable assistant message exists (caller falls back
-    to the blocking path or surfaces OPENCODE_EMPTY). Never raises.
+    Prompt, then poll: v2 returns from the prompt at once and runs the agent
+    loop in the background, so the authoritative reply is the newest
+    assistant item carrying ``time.completed``. Raises RuntimeError on
+    transport/upstream failure (the message carries a code prefix for the
+    classifier) and ``OPENCODE_EMPTY`` on a contentless reply, so the engine
+    retries once on a fresh session.
     """
-    try:
-        for msg in reversed(messages or []):
-            if not isinstance(msg, dict):
-                continue
-            info = msg.get("info") if isinstance(msg.get("info"), dict) else {}
-            if str(info.get("role") or "") != "assistant":
-                continue
-            parts = msg.get("parts")
-            if not isinstance(parts, list) or not parts:
-                continue
-            try:
-                return _parse_message_result(
-                    {"info": info, "parts": parts}, provider_id, model_id)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return None
+    user_id = prompt_async(
+        session_id, provider_id, model_id, agent, prompt,
+        timeout=min(30.0, max(5.0, float(timeout))),
+        variant=variant)
+    return _await_turn(session_id, user_id, provider_id, model_id, timeout)
 
 
 def stream_message(session_id: str, provider_id: str, model_id: str,
                    agent: str, prompt: str,
                    timeout: float = DEFAULT_TIMEOUT,
                    variant: str | None = None,
-                   directory: str | None = None,
                    on_content=None, on_thinking=None,
-                   cancel_event=None,
-                   tools: dict | None | object = _DEFAULT_TOOLS) -> dict:
-    """prompt_async + /event SSE tail -> final result dict (live deltas).
+                   cancel_event=None) -> dict:
+    """/api/event SSE tail + prompt -> final result dict (live deltas).
 
-    Subscribes to ``GET /event?directory=`` first (so early deltas are not
-    missed), sends ``prompt_async``, forwards ``message.part.delta`` text /
-    reasoning deltas via the callbacks as they arrive, waits for
-    ``session.idle`` for this session, then returns the authoritative final
-    result fetched via ``GET /session/:id/message`` (same shape as
-    :func:`send_message`). Raises RuntimeError on transport/upstream failure
-    with the classifier code prefix; never returns partial text as the
-    result (partials only ride the callbacks). ``tools`` mirrors
-    :func:`send_message` (default minimal, None omits).
+    Subscribes to ``GET /api/event`` first (so early deltas are not missed),
+    selects the session's model+agent, sends the prompt, forwards
+    ``session.text.delta`` / ``session.reasoning.delta`` through the callbacks
+    as they arrive, and waits for this session's
+    ``session.execution.succeeded`` (or ``session.execution.failed``). The
+    returned value is the authoritative final read from the timeline, never
+    the assembled tail, so a partial stream can never be served as the
+    answer. Raises RuntimeError on transport/upstream failure with the
+    classifier code prefix; partial text only ever rides the callbacks.
     """
-    import threading
-    import time as _time
-
-    resolved = directory if directory is not None else P.session_directory()
-    query = P.session_query(resolved)
 
     def _cancelled() -> bool:
         try:
@@ -394,7 +465,6 @@ def stream_message(session_id: str, provider_id: str, model_id: str,
     _connected = threading.Event()
     _idle = threading.Event()
     _sse_error: list[str] = []
-    _finish_seen: list[str] = []
     _stop_reader = threading.Event()
 
     def _emit_content(text: str) -> None:
@@ -414,52 +484,38 @@ def stream_message(session_id: str, provider_id: str, model_id: str,
             pass
 
     def _handle_event(payload: dict) -> None:
+        """One ``data: {...}`` frame; payload fields live under ``data``."""
         try:
             etype = str(payload.get("type") or "")
-            props = payload.get("properties")
+            props = payload.get("data")
             if not isinstance(props, dict):
                 return
             if str(props.get("sessionID") or "") != session_id:
                 return
-            if etype == "message.part.delta":
-                field = str(props.get("field") or "").lower()
-                delta = props.get("delta")
-                delta_text = str(delta) if isinstance(delta, str) else ""
-                if not delta_text:
-                    return
-                if field in ("reasoning", "thinking", "reasoning_text"):
-                    _emit_thinking(delta_text)
-                elif field in ("text", ""):
-                    _emit_content(delta_text)
-            elif etype == "message.updated":
-                info = props.get("info")
-                if isinstance(info, dict):
-                    fin = str(info.get("finish") or "").strip()
-                    if fin:
-                        _finish_seen.append(fin)
-                    err = info.get("error")
-                    if err:
-                        detail = err if isinstance(err, str) else json.dumps(err)
-                        _sse_error.append(detail[:500])
-            elif etype in ("session.idle",):
+            if etype == "session.reasoning.delta":
+                _emit_thinking(str(props.get("delta") or ""))
+            elif etype == "session.text.delta":
+                _emit_content(str(props.get("delta") or ""))
+            elif etype == "session.execution.succeeded":
                 _idle.set()
-            elif etype in ("session.error", "session.next.step.failed"):
-                try:
-                    _sse_error.append(json.dumps(props)[:500])
-                except Exception:
-                    _sse_error.append(str(props)[:500])
+            elif etype in ("session.execution.failed", "session.error"):
+                # Stop waiting on the first failure; the timeline carries the
+                # same error and the final read below turns it into the raise.
+                detail = _error_detail(props.get("error")) or json.dumps(props)
+                _sse_error.append(detail[:500])
+                _idle.set()
         except Exception:
             pass
 
     def _read_sse() -> None:
         try:
-            url = P.base_url() + f"/event{query}"
+            url = P.base_url() + "/api/event"
             headers = {"Accept": "text/event-stream"}
             headers.update(_auth_header())
             headers.update(P.client_headers(session_id))
             req = urllib.request.Request(url, method="GET", headers=headers)
             # Short socket timeout so cancel/idle checks stay responsive;
-            # the outer loop re-reads until idle/timeout.
+            # the serve sends ": heartbeat" comments, so silence is expected.
             with urllib.request.urlopen(req, timeout=10) as resp:
                 _connected.set()
                 buf = b""
@@ -509,18 +565,19 @@ def stream_message(session_id: str, provider_id: str, model_id: str,
     # the first deltas race the subscription and streaming starts mid-reply.
     _connected.wait(timeout=10.0)
     try:
-        prompt_async(session_id, provider_id, model_id, agent, prompt,
-                     timeout=min(30.0, timeout), variant=variant,
-                     directory=resolved, tools=tools)
+        user_id = prompt_async(session_id, provider_id, model_id, agent,
+                               prompt,
+                               timeout=min(30.0, max(5.0, float(timeout))),
+                               variant=variant)
     except Exception:
         _stop_reader.set()
         raise
 
-    deadline = _time.monotonic() + max(10.0, float(timeout) + 30.0)
-    while _time.monotonic() < deadline:
+    deadline = time.monotonic() + max(10.0, float(timeout) + 30.0)
+    while time.monotonic() < deadline:
         if _cancelled():
             try:
-                abort_session(session_id, directory=resolved)
+                abort_session(session_id)
             except Exception:
                 pass
             _stop_reader.set()
@@ -533,7 +590,7 @@ def stream_message(session_id: str, provider_id: str, model_id: str,
             raise _Cancelled()
         if _idle.is_set():
             break
-        _time.sleep(0.05)
+        time.sleep(0.05)
     _stop_reader.set()
     try:
         reader.join(timeout=5.0)
@@ -548,13 +605,14 @@ def stream_message(session_id: str, provider_id: str, model_id: str,
                 pass
 
         raise _Cancelled2()
-    # Authoritative final: newest assistant message (covers multi-step tool
-    # loops; deltas already streamed live via callbacks).
-    messages = get_session_messages(session_id, timeout=20,
-                                    directory=resolved, limit=20)
-    final = _final_result_from_messages(messages, provider_id, model_id)
-    if final is not None:
-        return final
+    # Authoritative final: this turn's completed assistant item (covers
+    # multi-step tool loops; deltas already streamed live via callbacks).
+    items = get_session_messages(session_id, timeout=20)
+    outcome, payload = _turn_outcome(items, user_id, provider_id, model_id)
+    if outcome == "done":
+        return payload
+    if outcome == "error":
+        _raise_turn_error(str(payload), provider_id, model_id)
     if _sse_error and not _idle.is_set():
         # SSE-level failure without a usable message: surface for retry.
         raise RuntimeError(f"OPENCODE_UPSTREAM: live stream failed: "

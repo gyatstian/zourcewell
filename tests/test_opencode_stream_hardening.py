@@ -16,8 +16,8 @@ Three defects, each pinned by a test that fails on the pre-change code:
   hand-rolled one-byte SSE frame splitter and the event dispatch) and
   ``completion_service._attempt_live`` had never run under a test, so the two
   rules that make live streaming safe -- content suppressed when the caller
-  sent ``tools``, and the authoritative ``GET /session/:id/message`` result
-  returned instead of the assembled tail -- were unpinned.
+  sent ``tools``, and the authoritative ``GET /api/session/:id/message``
+  result returned instead of the assembled tail -- were unpinned.
 * **``managed_serve.ensure()`` orphaned the child it replaced.** ``_proc`` is
   the only handle ``shutdown()`` and the ``atexit`` hook know, so overwriting
   it stranded a managed ``opencode serve`` -- holding its port, its ``work/``
@@ -39,6 +39,8 @@ import asyncio
 import contextlib
 import json
 import subprocess
+import time
+import types
 import urllib.parse
 
 import pytest
@@ -56,6 +58,8 @@ from functools import partial
 from deepseaport.server_routes import _prepare
 
 SESSION = "ses_live"
+# The id the prompt POST answers with: it anchors the poll to THIS turn.
+USER_ID = "msg_u"
 # Text that only exists in the deltas, and text that only exists in the
 # authoritative GET: they must never be confused for one another.
 TAIL_TEXT = "Partial tail"
@@ -77,7 +81,8 @@ def _texts(deltas: list[dict], key: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Fake `opencode serve` at the urllib seam, so the real client code runs
+# Fake `opencode serve` (opencode v2 HttpApi) at the urllib seam, so the real
+# client code runs
 # ---------------------------------------------------------------------------
 
 
@@ -107,43 +112,56 @@ def _frame(event: dict) -> str:
     return "data: " + json.dumps(event) + "\n\n"
 
 
-def _delta(field: str, text: str) -> str:
-    return _frame({"type": "message.part.delta",
-                   "properties": {"sessionID": SESSION, "messageID": "msg_1",
-                                  "partID": "prt_1", "field": field,
-                                  "delta": text}})
+def _json_body(obj) -> _FakeResp:
+    return _FakeResp(json.dumps(obj).encode("utf-8"), 200)
 
 
-def _fake_serve(monkeypatch, *, messages: list, sse: str | None = None) -> list[str]:
-    """Route the four endpoints the opencode client uses; return the call log.
+def _event(kind: str, **data) -> str:
+    """One bus frame; v2 carries the payload under ``data``, not properties."""
+    return _frame({"type": kind, "data": {"sessionID": SESSION, **data}})
 
-    ``sse`` is what the ``GET /event`` tail replays byte for byte; without it
-    the bus answers 200 with an empty body (the live tail never starts, which
-    is the fallback path). Anything else is a test bug and raises.
+
+def _fake_serve(monkeypatch, *, messages: list, sse: str | None = None,
+                sse_up: bool = True) -> list[str]:
+    """Route the v2 endpoints the opencode client uses; return the call log.
+
+    ``sse`` is what ``GET /api/event`` replays byte for byte; without it the
+    bus answers 200 with an empty body. ``sse_up=False`` refuses that
+    connection outright, which is the "the live tail never started" case the
+    blocking fallback exists for. ``messages`` is the CHRONOLOGICAL timeline;
+    the ``/message`` route reverses it like the real serve does for
+    ``order=desc``, so the client's own re-reverse is what these tests read.
+    Anything else is a test bug and raises.
     """
     monkeypatch.setenv("DEEPSEAPORT_OPENCODE_USER_AGENT", "opencode/1.18.32")
     seen: list[str] = []
 
     def _urlopen(req, timeout=None):
         url = str(getattr(req, "full_url", "") or "")
-        path = urllib.parse.urlsplit(url).path
+        split = urllib.parse.urlsplit(url)
+        path, query = split.path, split.query
         try:
             method = str(req.get_method()).upper()
         except Exception:
             method = "GET"
         seen.append(f"{method} {path}")
-        if path.endswith("/event"):
+        if path.endswith("/api/event"):
+            if not sse_up:
+                raise OSError("connection refused (no live tail)")
             return _FakeResp((sse or "").encode("utf-8"), 200)
-        if path.endswith("/prompt_async"):
-            return _FakeResp(b"", 204)
+        if path.endswith("/api/info"):
+            return _json_body({"version": "2.4.0"})
         if path.endswith("/message"):
-            return _FakeResp(json.dumps(messages).encode("utf-8"), 200)
-        if path.endswith("/global/health"):
-            return _FakeResp(b'{"healthy": true}', 200)
-        if method == "POST" and path.endswith("/session"):
-            return _FakeResp(json.dumps({"id": SESSION}).encode("utf-8"), 200)
-        if method == "DELETE" and f"/session/{SESSION}" in path:
-            return _FakeResp(b"", 200)
+            items = list(reversed(messages)) if "order=desc" in query else list(messages)
+            return _json_body({"data": items, "cursor": {}})
+        if method == "POST" and path.endswith("/api/session"):
+            return _json_body({"data": {"id": SESSION}})
+        if method == "POST" and path.endswith("/prompt"):
+            return _json_body({"data": {"id": USER_ID}})
+        if method == "POST" and (path.endswith("/model") or path.endswith("/agent")):
+            return _FakeResp(b"", 204)
+        if method == "DELETE" and path.endswith(f"/api/session/{SESSION}"):
+            return _FakeResp(b"", 204)
         raise AssertionError(f"unexpected serve request: {method} {url}")
 
     monkeypatch.setattr("urllib.request.urlopen", _urlopen)
@@ -151,7 +169,7 @@ def _fake_serve(monkeypatch, *, messages: list, sse: str | None = None) -> list[
 
 
 def _live_sse() -> str:
-    """The frame stream the serve's /event bus writes for one turn.
+    """The frame stream the serve's /api/event bus writes for one turn.
 
     The leading comment line and ``event:`` line exercise two branches of the
     hand-rolled splitter that no other test reaches: it must skip an SSE
@@ -160,26 +178,41 @@ def _live_sse() -> str:
     """
     return "".join([
         ": keep-alive\n",
-        "event: message.part.delta\n",
-        _delta("reasoning", "weigh"),
-        _delta("text", "Par"),
-        _delta("text", "tial tail"),
-        _delta("reasoning", "ing"),
-        # Real serve shape: `message.updated` nests the session id under
-        # `info`, not at the properties level, so the client's sessionID gate
-        # drops it. Kept here to pin that the frame is tolerated either way.
-        _frame({"type": "message.updated",
-                "properties": {"info": {"role": "assistant", "sessionID": SESSION,
-                                        "finish": "stop"}}}),
-        _frame({"type": "session.idle", "properties": {"sessionID": SESSION}}),
+        "event: session.text.delta\n",
+        _event("session.reasoning.delta", messageID="msg_a", delta="weigh"),
+        _event("session.text.delta", messageID="msg_a", delta="Par"),
+        _event("session.text.delta", messageID="msg_a", delta="tial tail"),
+        _event("session.reasoning.delta", messageID="msg_a", delta="ing"),
+        # Another session on the same bus: the sessionID gate must drop it.
+        _frame({"type": "session.text.delta",
+                "data": {"sessionID": "ses_other", "delta": "NOT OURS"}}),
+        # An event the client does not dispatch must be tolerated, not fatal.
+        _frame({"type": "session.updated",
+                "data": {"sessionID": SESSION, "info": {"title": "x"}}}),
+        _event("session.execution.succeeded", messageID="msg_a"),
     ])
 
 
+def _assistant_item(text: str, thinking: str = "", usage: int = 11) -> dict:
+    return {"id": "msg_a", "type": "assistant", "agent": "deepseaport-passthrough",
+            "model": {"providerID": "opencode",
+                      "modelID": "muse-spark-1.3-contributor-free"},
+            "time": {"created": 1.0, "streamed": 2.0, "completed": 3.0},
+            "content": [{"type": "reasoning", "text": thinking},
+                        {"type": "text", "text": text}],
+            "finish": "stop", "rawFinish": "stop", "cost": 0.0,
+            "tokens": {"input": 5, "output": usage, "reasoning": 3,
+                       "cache": {"read": 0, "write": 0}}}
+
+
+def _user_item() -> dict:
+    return {"id": USER_ID, "type": "user",
+            "time": {"created": 1.0, "completed": 1.0}, "text": "hi"}
+
+
 def _final_messages(content: str = FINAL_TEXT, thinking: str = "weighing") -> list:
-    return [{"info": {"role": "assistant", "sessionID": SESSION,
-                      "finish": "stop", "tokens": {"output": 11}},
-             "parts": [{"type": "reasoning", "text": thinking},
-                       {"type": "text", "text": content}]}]
+    """The timeline of the turn that just ran, oldest first."""
+    return [_user_item(), _assistant_item(content, thinking)]
 
 
 # ---------------------------------------------------------------------------
@@ -266,8 +299,8 @@ def test_live_attempt_forwards_deltas_in_order_and_returns_the_final_result(
     """``stream_message``'s frame splitter and event dispatch, end to end.
 
     The deltas deliberately spell a text (``Partial tail``) that is NOT the
-    reply: the value returned must come from ``GET /session/:id/message``, so
-    a partial tail can never be served as the answer.
+    reply: the value returned must come from ``GET /api/session/:id/message``,
+    so a partial tail can never be served as the answer.
     """
     calls = _fake_serve(monkeypatch, messages=_final_messages(), sse=_live_sse())
     content_seen: list[str] = []
@@ -278,31 +311,51 @@ def test_live_attempt_forwards_deltas_in_order_and_returns_the_final_result(
         on_content=content_seen.append, on_thinking=thinking_seen.append)
 
     assert error is None
-    # Reasoning and text are dispatched by `field`, interleaved, in order.
+    # Reasoning and text are dispatched by event type, interleaved, in order.
     assert content_seen == ["Par", "tial tail"], content_seen
     assert thinking_seen == ["weigh", "ing"], thinking_seen
+    # The foreign session's delta never reached the callbacks.
+    assert "NOT OURS" not in "".join(content_seen)
     # Authoritative result, not the assembled tail ("Partial tail").
     assert content == FINAL_TEXT and TAIL_TEXT not in content
     assert thinking == "weighing"
     assert usage == 11
-    # prompt_async went out on the same session the tail was scoped to, and
-    # the session was cleaned up.
-    assert f"POST /session/{SESSION}/prompt_async" in calls
-    assert f"DELETE /session/{SESSION}" in calls
+    # v2 is session-scoped: the model, the agent and the prompt all went out
+    # on the same session the bus tail was scoped to, and it was cleaned up.
+    assert f"POST /api/session/{SESSION}/model" in calls
+    assert f"POST /api/session/{SESSION}/agent" in calls
+    assert f"POST /api/session/{SESSION}/prompt" in calls
+    assert f"DELETE /api/session/{SESSION}" in calls
+
+
+@contextlib.contextmanager
+def _fast_client_clock(monkeypatch):
+    """Jump the client's monotonic clock past the wait-until-deadline loop.
+
+    ``stream_message`` waits out its full budget when the bus never goes idle,
+    so a test for the post-wait fallback would otherwise burn real seconds.
+    """
+    now = {"t": 0.0}
+
+    def _monotonic() -> float:
+        now["t"] += 30.0
+        return now["t"]
+
+    monkeypatch.setattr(OC, "time", types.SimpleNamespace(
+        monotonic=_monotonic, sleep=lambda _s: None, time=time.time))
+    yield
 
 
 def test_live_attempt_falls_back_to_blocking_when_the_tail_never_starts(
         monkeypatch):
-    """No assistant turn behind ``session.idle`` -> blocking fallback.
+    """No SSE subscription -> blocking fallback.
 
     The live tail produced nothing, so the request must still succeed on the
-    blocking POST (which is the same code path as ``stream_mode: buffered``)
-    rather than fail with ``OPENCODE_EMPTY``.
+    blocking turn (the same code path as ``stream_mode: buffered``) rather
+    than fail with ``OPENCODE_UPSTREAM``.
     """
     monkeypatch.setattr(OC, "create_session", lambda timeout=20, **kw: SESSION)
-    _fake_serve(
-        monkeypatch, messages=[],
-        sse=_frame({"type": "session.idle", "properties": {"sessionID": SESSION}}))
+    calls = _fake_serve(monkeypatch, messages=[], sse_up=False)
     blocking: list[str] = []
 
     def _send(sid, pid, mid, agent, prompt, timeout=180, variant=None, **kw):
@@ -312,12 +365,17 @@ def test_live_attempt_falls_back_to_blocking_when_the_tail_never_starts(
 
     monkeypatch.setattr(OC, "send_message", _send)
 
-    content, _thinking, error, _usage = OCS._attempt_live(
-        "hi", DEFAULT_MODEL, 30, on_content=lambda _t: None)
+    with _fast_client_clock(monkeypatch):
+        content, _thinking, error, _usage = OCS._attempt_live(
+            "hi", DEFAULT_MODEL, 30, on_content=lambda _t: None)
 
     assert error is None
     assert content == "blocking answer"
-    # The blocking POST is what answered: the live tail produced nothing.
+    # The live turn really was attempted and only the bus was missing, so the
+    # fallback is not masking a broken prompt route.
+    assert "GET /api/event" in calls, calls
+    assert f"POST /api/session/{SESSION}/prompt" in calls, calls
+    # The blocking turn is what answered: the live tail produced nothing.
     assert blocking == [SESSION]
 
 
@@ -405,6 +463,25 @@ class _FakeProc:
         return 0
 
 
+def _posix_reap(monkeypatch):
+    """Pin the reap to the POSIX channel and record the tree kill.
+
+    ``_terminate_proc`` picks its channel from ``os.name``, and the two are
+    genuinely different: Windows kills the process TREE (the tracked handle is
+    the ``cmd.exe`` wrapper and the serve is its child), POSIX terminates the
+    child it spawned. The reap-sequence assertions below are about the sequence
+    -- terminate, wait, escalate -- so they pin one platform and stay
+    identical on every runner; the Windows branch is pinned separately in
+    ``test_managed_serve_hardening.py``. Stubbing ``_kill_tree`` here also
+    keeps a fake pid away from a real taskkill.
+    """
+    monkeypatch.setattr(MS.os, "name", "posix")
+    trees: list[int] = []
+    monkeypatch.setattr(MS, "_kill_tree",
+                        lambda pid: trees.append(pid) or True, raising=False)
+    return trees
+
+
 @contextlib.contextmanager
 def _managed_state(proc=None, base: str = "", password: str = ""):
     """Isolate (and restore) the module-level managed-serve state.
@@ -458,6 +535,7 @@ def test_boot_reaps_the_child_it_replaces(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("DEEPSEAPORT_KEYS", "sk-parent-secret")
     old = _FakeProc(pid=1111)
+    trees = _posix_reap(monkeypatch)
     captured = _stub_managed_boot(monkeypatch, tmp_path,
                                   healthy_bases={NEW_BASE})
 
@@ -465,6 +543,7 @@ def test_boot_reaps_the_child_it_replaces(monkeypatch, tmp_path):
                         password="old-pw"):
         assert MS.ensure(timeout=1.0) == NEW_BASE
         assert old.calls == ["terminate", "wait(5.0)"], old.calls
+        assert trees == [], "the POSIX channel must not shell out to taskkill"
         assert MS._proc is captured["proc"] and MS._proc is not old
 
     # The reap must not have disturbed the child env boundary: the parent
@@ -520,6 +599,7 @@ def test_not_ready_child_is_terminated_and_reaped(monkeypatch, tmp_path, stubbor
     live process on Windows. A child that ignores SIGTERM is killed.
     """
     proc = _FakeProc(pid=2222, ignore_sigterm=stubborn)
+    _posix_reap(monkeypatch)
     captured = _stub_managed_boot(monkeypatch, tmp_path, healthy_bases=(),
                                   proc=proc)
     # The readiness loop probes for max(5.0, timeout) with a 0.25 s sleep.
@@ -545,8 +625,9 @@ def test_not_ready_child_is_terminated_and_reaped(monkeypatch, tmp_path, stubbor
         assert proc.calls == ["terminate", "wait(5.0)"], proc.calls
 
 
-def test_shutdown_reaps_the_tracked_child():
+def test_shutdown_reaps_the_tracked_child(monkeypatch):
     """The reap helper is the single exit path, atexit included."""
+    _posix_reap(monkeypatch)
     proc = _FakeProc()
     with _managed_state(proc=proc):
         MS.shutdown()

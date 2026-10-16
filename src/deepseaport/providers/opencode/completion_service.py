@@ -1,13 +1,13 @@
 """Opencode completion engine: thin adapter over ``deepseaport.core.engine``.
 
 No accounts, no tokens, no PoW, no WAF: one completion is create-session ->
-message -> best-effort delete-session. Retries are limited to transient
+one turn -> best-effort delete-session. Retries are limited to transient
 overload/empty turns (fresh session each); serve-down, auth, and validation
 errors are terminal with an actionable message. Streaming is live
-token-by-token via ``prompt_async`` + ``GET /event`` SSE tailing (deltas
-forward as OpenAI chunks as they arrive); when the live tail cannot start,
-the producer falls back to the blocking result fanned out as SSE chunks.
-Sessions are pinned to the caller's workdir via ``?directory=`` so native
+token-by-token off the serve's ``GET /api/event`` SSE deltas (forwarded as
+OpenAI chunks as they arrive); when the live tail cannot start, the producer
+falls back to the blocking turn fanned out as SSE chunks. Sessions are pinned
+to the caller's workdir via the create body (``location.directory``) so file
 tools run where the harness expects. The canonical monkeypatch surface is
 this module.
 """
@@ -118,41 +118,17 @@ def _raise_for_terminal_error(app, item, prep, token, error, login_note, stream_
                               error, login_note, stream_ban_until)
 
 
-def _native_tools_for(prep: dict | None) -> dict | None:
-    """Native allowlist for one turn: minimal when pi asked for tools.
-
-    Pi (and any OpenAI harness) sends its tools as DSML text in the prompt;
-    the serve still needs its gatekeeper-minimal bash+read declaration or
-    an explicit all-false allowlist 403s the free tier. Plain chat (no pi
-    tools) omits the key entirely: live-verified on opencode 1.18.32 that
-    tool-less passes via agent defaults, keeping the turn a pure text call.
-    """
-    try:
-        if prep is not None and bool(prep.get("tools")):
-            return P.native_tools_minimal()
-    except Exception:
-        return P.native_tools_minimal()
-    return None
-
-
-_USE_MINIMAL: object = object()
-
-
 def _attempt(prompt: str, model: str, timeout: float,
              on_content=None, on_thinking=None,
              cancel_event: threading.Event | None = None,
              variant: str | None = None,
-             native_tools: dict | None | object = _USE_MINIMAL,
              ) -> tuple[str, str, str | None, int]:
     """One session lifecycle -> (content, thinking, error, usage).
 
     Never raises transport errors: they become the ``error`` string the
     retry table classifies. ``cancel_event`` aborts between checkpoints.
     ``variant`` is the one-shot reasoning effort; when the serve rejects
-    it as unknown the turn is resent once without it. ``native_tools`` is
-    the explicit per-message allowlist (None omits the serve ``tools``
-    key for plain chat); the default keeps the historical gatekeeper-minimal
-    pair. ``_run_completion_core`` always passes an explicit value.
+    it as unknown the turn is resent once without it.
     """
     provider_id, model_id = P.split_model(model)
     agent = P.agent_name()
@@ -178,13 +154,9 @@ def _attempt(prompt: str, model: str, timeout: float,
         if cancel_event is not None and cancel_event.is_set():
             return "", "", _error_text("CANCELLED", "client disconnected"), 0
         try:
-            resolved_tools = (P.native_tools_minimal()
-                              if native_tools is _USE_MINIMAL
-                              else (dict(native_tools)
-                                    if isinstance(native_tools, dict) else None))
             result = OC.send_message(session_id, provider_id, model_id,
                                      agent, prompt, timeout=timeout,
-                                     variant=variant, tools=resolved_tools)
+                                     variant=variant)
         except _StreamCancelled:
             raise
         except Exception as exc:
@@ -195,8 +167,7 @@ def _attempt(prompt: str, model: str, timeout: float,
                 try:
                     result = OC.send_message(
                         session_id, provider_id, model_id,
-                        agent, prompt, timeout=timeout,
-                        tools=resolved_tools)
+                        agent, prompt, timeout=timeout)
                 except _StreamCancelled:
                     raise
                 except Exception as exc2:
@@ -227,18 +198,16 @@ def _attempt_live(prompt: str, model: str, timeout: float,
                    on_content=None, on_thinking=None,
                    cancel_event: threading.Event | None = None,
                    variant: str | None = None,
-                   native_tools: dict | None | object = _USE_MINIMAL,
                    ) -> tuple[str, str, str | None, int]:
-    """Live session lifecycle via prompt_async + /event -> (content, ...).
+    """Live session lifecycle via /api/event -> (content, ...).
 
     Deltas ride ``on_content``/``on_thinking`` as they arrive (true
     token-by-token streaming); the returned content is the authoritative
-    final assembled from ``GET /session/:id/message``. When the live tail
+    final assembled from the session timeline. When the live tail
     fails before emitting anything, falls back to the blocking
     :func:`_attempt` on the same session shape (new session) so a transient
     SSE failure does not fail the request. Same error-string contract as
     :func:`_attempt` (never raises transport errors except cancellation).
-    ``native_tools`` mirrors :func:`_attempt`.
     """
     provider_id, model_id = P.split_model(model)
     agent = P.agent_name()
@@ -283,17 +252,13 @@ def _attempt_live(prompt: str, model: str, timeout: float,
                 except Exception:
                     pass
 
-        resolved_live_tools = (P.native_tools_minimal()
-                               if native_tools is _USE_MINIMAL
-                               else (dict(native_tools)
-                                     if isinstance(native_tools, dict) else None))
         try:
             result = OC.stream_message(
                 session_id, provider_id, model_id, agent, prompt,
                 timeout=timeout, variant=variant,
                 on_content=(_track_content if on_content is not None else None),
                 on_thinking=(_track_thinking if on_thinking is not None else None),
-                cancel_event=cancel_event, tools=resolved_live_tools)
+                cancel_event=cancel_event)
         except _StreamCancelled:
             raise
         except Exception as exc:
@@ -308,8 +273,7 @@ def _attempt_live(prompt: str, model: str, timeout: float,
                         timeout=timeout,
                         on_content=(_track_content if on_content is not None else None),
                         on_thinking=(_track_thinking if on_thinking is not None else None),
-                        cancel_event=cancel_event,
-                        tools=resolved_live_tools)
+                        cancel_event=cancel_event)
                 except _StreamCancelled:
                     raise
                 except Exception as exc2:
@@ -331,8 +295,7 @@ def _attempt_live(prompt: str, model: str, timeout: float,
                 session_id = None
                 return _attempt(prompt, model, timeout,
                                 on_content=on_content, on_thinking=on_thinking,
-                                cancel_event=cancel_event, variant=variant,
-                                native_tools=native_tools)
+                                cancel_event=cancel_event, variant=variant)
             else:
                 return "", "", err, 0
         content = result.get("content") or ""
@@ -362,8 +325,8 @@ def _run_completion_core(
     ``item`` is accepted for route-signature compatibility (the opencode
     provider needs no accounts) and ignored. One stale-session recreate is
     attempted inline before the overload retry table runs. ``live=True``
-    uses prompt_async + /event deltas (token-by-token); False uses the
-    blocking POST (buffered).
+    tails the serve's ``/api/event`` deltas (token-by-token); False uses the
+    blocking prompt-then-poll turn (buffered).
     """
     settings = _app_settings(app)
     max_retries = max(0, int(getattr(settings, "max_retries", 1)))
@@ -371,7 +334,6 @@ def _run_completion_core(
     prompt = str(prep.get("prompt") or "")
     model = str(prep.get("model") or "")
     variant = str(prep.get("reasoning_effort") or "") or None
-    native_tools = _native_tools_for(prep)
 
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -395,15 +357,13 @@ def _run_completion_core(
                 prompt, model, timeout,
                 on_content=(_wrapped_content if on_content is not None else None),
                 on_thinking=(_wrapped_thinking if on_thinking is not None else None),
-                cancel_event=cancel_event, variant=variant,
-                native_tools=native_tools)
+                cancel_event=cancel_event, variant=variant)
         else:
             outcome = _attempt(
                 prompt, model, timeout,
                 on_content=(_wrapped_content if on_content is not None else None),
                 on_thinking=(_wrapped_thinking if on_thinking is not None else None),
-                cancel_event=cancel_event, variant=variant,
-                native_tools=native_tools)
+                cancel_event=cancel_event, variant=variant)
         content, think, error, usage_total = outcome
 
     _do_attempt()

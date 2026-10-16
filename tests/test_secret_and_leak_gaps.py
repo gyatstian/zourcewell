@@ -377,15 +377,26 @@ def test_ban_failover_current_switch_persists_when_the_app_owns_settings(
 
 
 def _no_signals(monkeypatch) -> list:
+    """Record every channel the reaper could use, as ``(channel, pid)``.
+
+    Windows kills with ``taskkill /T`` and POSIX with ``os.kill``, so both are
+    stubbed: an unstubbed ``_kill_tree`` would put a REAL taskkill against the
+    fake pid 4242 on the Windows runner.
+    """
     from deepseaport.providers.opencode import managed_serve as ms
 
     signalled: list[tuple] = []
 
     def _kill(pid, sig):
-        signalled.append((pid, sig))
+        signalled.append(("os.kill", pid))
         raise OSError("no such process")
 
+    def _tree(pid):
+        signalled.append(("taskkill", pid))
+        return True
+
     monkeypatch.setattr(ms.os, "kill", _kill)
+    monkeypatch.setattr(ms, "_kill_tree", _tree, raising=False)
     return signalled
 
 
@@ -423,7 +434,7 @@ def test_reaper_signals_a_matching_opencode_serve(monkeypatch):
 
     MS._kill_pid(4242)
 
-    assert [pid for pid, _sig in signalled] == [4242], \
+    assert [pid for _channel, pid in signalled] == [4242], \
         "the stale managed serve was not signalled"
 
 
@@ -477,7 +488,7 @@ def test_reaper_never_signals_its_own_process_group(monkeypatch):
     # "never signal anything".
     MS._kill_pid(4242)
     assert seen == [4242], seen
-    assert [pid for pid, _sig in signalled] == [4242], \
+    assert [pid for _channel, pid in signalled] == [4242], \
         "a real opencode serve pid must still be reaped, not swallowed"
 
 

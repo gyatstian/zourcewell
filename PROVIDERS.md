@@ -44,16 +44,18 @@ src/deepseaport/
     real_browser.py      CDP login driver (deepseek)
     README.md            per-provider reversing notes — see below for which are real
   providers/opencode/    local-CLI reference: no accounts, no pool slot, no
-                         login (`requires_accounts = False`; stateless session
-                         per request against a managed isolated serve, or
+                         login (`requires_accounts = False`; a session per
+                         request against a managed isolated serve, or
                          user-managed `opencode serve` via
-                         DEEPSEAPORT_OPENCODE_BASE). Plain chat omits the
-                         serve `tools` key; tool turns declare a 14-key
-                         native map of which only `read` is granted and
-                         `bash` is declared-but-denied; `reasoning_effort`
-                         forwards as `variant`; pi tools ride DSML text ->
-                         OpenAI `tool_calls` (see README "Pi harness +
-                         opencode").
+                         DEEPSEAPORT_OPENCODE_BASE). Speaks the opencode v2
+                         HttpApi (all routes under `/api`); a turn is
+                         prompt-then-poll because v2 has no blocking message
+                         endpoint, and the model, its `variant` and the agent
+                         are set per session, not per message;
+                         `reasoning_effort` forwards as that `variant`;
+                         native tools are bounded only by the managed agent's
+                         permission map; pi tools ride DSML text -> OpenAI
+                         `tool_calls` (see README "Pi harness + opencode").
   server.py              thin wiring: create_app + re-exports (historical surface)
   server_routes.py       FastAPI endpoints (dispatch via provider.complete_request / stream_response; shaping via _server()._openai_response)
   accounts.py            AccountPool (per-provider instances via core.pools)
@@ -70,26 +72,27 @@ App shell (`server.py`, `server_routes.py`, `server_concurrency.py`, `tui.py`,
   DeepSeek-only shape, it just has no PoW/wasm/browser-refresh (see its own
   module docstring, lines 1-9). opencode is the third adapter, with a reduced
   retry table (overload only; there are no accounts to fail over to) and a
-  live `/event` SSE path. What a NEW provider must not do is copy one of
+  live `/api/event` SSE path. What a NEW provider must not do is copy one of
   those files — write a thin adapter over `core.engine` (see
   "Reuse vs per-provider").
 - **Which `README.md` is real.** `providers/qwen/README.md` and
   `providers/opencode/README.md` are substantial, tracked reversing notes for
   finished providers. `providers/deepseek/` has no README at all — its
   reversing notes live in the top-level `ARCHITECTURE.md`.
-- **The opencode tool map is 14 keys declared, 1 granted.** Plain chat sends no
-  `tools` key at all (the gatekeeper passes on agent defaults). Tool turns must
-  send an explicit map or the free tier refuses them with 403. The map declares
-  14 native keys and grants exactly one: `read`. `bash` is **declared but
-  `False`**, and that is deliberate — the free-tier gate only needs the key
-  *present*, never *granted*. It matters because **the per-message `tools` map
-  overrides the managed agent's permission map**, so `bash: True` in the
-  message would silently re-grant a native shell on every tool turn, undoing
-  the `bash: "deny"` that `managed_serve.managed_config_content` pins. Both
-  layers must deny `bash`; neither one suffices on its own. Pin:
-  `protocol.NATIVE_TOOLS_MINIMAL` (the map), `protocol.native_tools_minimal()`
-  (a fresh copy per call), `managed_serve.managed_config_content()["permission"]`
-  (the agent map).
+- **The opencode catalogue is live, with a static fallback.** `models.py` reads
+  `GET /api/model` from the serve instance (which also lists the operator's
+  other authenticated providers, all exposed as `providerID/modelID`) and falls
+  back to the eight hand-verified entries when no serve answers; the two
+  are never merged. Cached process-wide: a success for five minutes, a failure
+  for thirty. When nothing answers at the configured base the read boots the
+  managed serve and retries, so the ids do not depend on which process asks;
+  both opt-outs (an operator-pinned `DEEPSEAPORT_OPENCODE_BASE`, and
+  `DEEPSEAPORT_OPENCODE_MANAGED=0`, which the hermetic tier sets) are honored.
+  `default_model()` is the explicit `opencode/muse-spark-1.3-contributor-free`,
+  NOT the first catalogue key — the live catalogue is in upstream order and
+  turns over weekly. Pin: `models.live_specs` (the read, and its cache),
+  `models.MODELS_SPEC` (the fallback), `models.DEFAULT_MODEL`,
+  `provider.OpencodeProvider.default_model`.
 
 ## Provider lifecycle
 

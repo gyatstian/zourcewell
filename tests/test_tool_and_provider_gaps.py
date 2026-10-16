@@ -30,7 +30,6 @@ import pytest
 from deepseaport.core import tools as T
 from deepseaport.core.tools import common as TC
 from deepseaport.providers.deepseek import login_policy as LP
-from deepseaport.providers.opencode import protocol as OP
 from deepseaport.providers.qwen import client as QC
 
 
@@ -135,59 +134,9 @@ def test_param_cap_is_the_documented_hardcoded_64():
         "the cap became configurable (or moved); update this test and the docs"
 
 
-# --- H2: the per-message tool map must not re-grant native bash ------------
-
-def test_resolved_tools_payload_denies_bash_and_allows_read():
-    assert OP.NATIVE_TOOLS_MINIMAL["bash"] is False
-    assert OP.NATIVE_TOOLS_MINIMAL["read"] is True
-    # Only read is granted; the managed agent pins bash to "deny" and the
-    # per-message map overrides that permission, so bash must stay False.
-    assert {k for k, v in OP.NATIVE_TOOLS_MINIMAL.items() if v is True} == {"read"}
-    # The gatekeeper contract is the key's PRESENCE, not its value.
-    assert "bash" in OP.native_tools_minimal()
-
-
-def test_message_payload_carries_denied_bash(monkeypatch):
-    body = OP.message_payload("opencode", "m", OP.agent_name(), "hi",
-                              tools=OP.native_tools_minimal())
-    assert "tools" in body
-    assert body["tools"]["bash"] is False
-    assert body["tools"]["read"] is True
-    # message_payload copies: mutating the payload must not corrupt the module.
-    body["tools"]["bash"] = True
-    assert OP.NATIVE_TOOLS_MINIMAL["bash"] is False
-
-
-def test_native_tools_minimal_is_a_fresh_copy_each_call():
-    first = OP.native_tools_minimal()
-    first["bash"] = True
-    assert OP.native_tools_minimal()["bash"] is False
-
-
-def test_send_message_and_prompt_async_send_denied_bash(monkeypatch):
-    from deepseaport.providers.opencode import client as client_mod
-
-    seen = []
-
-    def _fake_request(method, path, body=None, timeout=20, session_id=None,
-                      **kw):
-        seen.append(body)
-        if "prompt_async" in path:
-            return 204, {}
-        return 200, {"info": {"finish": "stop"},
-                     "parts": [{"type": "text", "text": "hi"}]}
-
-    monkeypatch.setattr(client_mod, "_request", _fake_request)
-    client_mod.send_message("ses_1", "opencode", "m", OP.agent_name(), "hi",
-                            timeout=5)
-    client_mod.prompt_async("ses_2", "opencode", "m", OP.agent_name(), "hi",
-                            timeout=5)
-    assert len(seen) == 2
-    for body in seen:
-        assert "tools" in body, "the tools key must stay declared"
-        assert body["tools"]["bash"] is False
-        assert body["tools"]["read"] is True
-
+# --- H2: native tools must stay bounded by the managed permission map ------
+# opencode v2 removed the per-message tool map, so there is no override left
+# that could re-grant a native tool: this map is the only authority.
 
 def test_managed_permission_map_still_denies_bash():
     from deepseaport.providers.opencode import managed_serve as MS

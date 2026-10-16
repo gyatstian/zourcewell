@@ -31,10 +31,39 @@ def test_default_agent_is_passthrough():
     assert OP.agent_name() == "deepseaport-passthrough"
 
 
-def test_message_payload_carries_no_system_or_tools():
-    body = OP.message_payload("opencode", "m", OP.agent_name(), "hi")
-    assert set(body) == {"model", "agent", "parts"}
-    assert body["agent"] == "deepseaport-passthrough"
+def _fake_v2_serve(monkeypatch, items: list, prompt_id: str = "msg_u") -> list:
+    """v2 `_request` fake: session-scoped select + prompt; timeline via `items`.
+
+    Returns the ``(path, body)`` log of everything that went out, so a test can
+    assert WHAT rides the wire (v2 moved the model, its reasoning ``variant``
+    and the agent off the message body and onto the session).
+    """
+    bodies: list = []
+
+    def _fake_request(method, path, body=None, timeout=20, session_id=None, **kw):
+        bodies.append((path, body))
+        if path.endswith("/prompt"):
+            return 200, {"data": {"id": prompt_id}}
+        return 204, {}
+
+    monkeypatch.setattr(OC, "_request", _fake_request)
+    monkeypatch.setattr(OC, "get_session_messages",
+                        lambda sid, timeout=20, **kw: list(items))
+    return bodies
+
+
+def _assistant_item(text: str = "hi", thinking: str = "", usage: int = 3,
+                    error=None) -> dict:
+    """One v2 timeline assistant item (content parts, tokens, error)."""
+    item = {"id": "msg_a", "type": "assistant", "agent": OP.agent_name(),
+            "time": {"created": 1.0, "streamed": 2.0, "completed": 3.0},
+            "content": [{"type": "reasoning", "text": thinking},
+                        {"type": "text", "text": text}],
+            "finish": "error" if error else "stop",
+            "tokens": {"input": 2, "output": usage}}
+    if error is not None:
+        item["error"] = error
+    return item
 
 
 def test_managed_config_content_is_minimal():
@@ -42,9 +71,7 @@ def test_managed_config_content_is_minimal():
     assert cfg["instructions"] == []
     assert MANAGED_AGENT_PRESENT(cfg)
     perms = cfg["agent"][MS.MANAGED_AGENT]["permission"]
-    # edit/bash/webfetch stay denied; read stays allowed (free-tier gatekeeper
-    # rejects tool-less upstream requests, so the keys must stay DECLARED —
-    # read is the one value that must remain "allow").
+    # read stays allowed, everything that can touch the host stays denied.
     assert perms["edit"] == "deny" and perms["read"] == "allow"
     assert perms["bash"] == "deny" and perms["webfetch"] == "deny"
     assert perms["external_directory"] == "deny"
@@ -53,11 +80,12 @@ def test_managed_config_content_is_minimal():
 
 
 def test_managed_config_denies_native_shell():
-    """F5: the map granted bash while the comment claimed it was unused.
+    """The map granted bash while the comment claimed it was unused.
 
     The child is an agentic CLI rooted at the operator's cwd; a
-    prompt-injection chain must not get native shell access. The free-tier
-    gate needs the key DECLARED, not allowed.
+    prompt-injection chain must not get native shell access. On opencode v2
+    this map is also the ONLY thing bounding native tools -- there is no
+    per-message override left to grant one back.
     """
     cfg = json.loads(MS.managed_config_content())
     for scope in (cfg["permission"], cfg["agent"][MS.MANAGED_AGENT]["permission"]):
@@ -112,17 +140,67 @@ def test_free_tier_denied_is_terminal(monkeypatch):
 
     gatekeeper = ("Error from provider (Console): OpenCode's free tier can "
                   "only be used from within OpenCode")
-    monkeypatch.setattr(
-        OC, "_request",
-        lambda method, path, body=None, timeout=20, session_id=None:
-        (200, {"info": {"error": gatekeeper, "finish": "error"},
-               "parts": []}))
+    # v2 answers the prompt at once and fails the TURN: the error rides the
+    # assistant timeline item, not a status code on the POST.
+    _fake_v2_serve(monkeypatch, [_assistant_item(error={
+        "type": "ProviderAuthError", "message": gatekeeper})])
     try:
         OC.send_message("ses_1", "opencode", "m", "agent", "hi", timeout=5)
         raise AssertionError("must raise")
     except RuntimeError as exc:
         assert "OPENCODE_FREE_TIER_DENIED" in str(exc)
         assert OCS.classify_error(str(exc)) is OCS.RetryKind.UPSTREAM
+
+
+def test_probe_rejects_an_html_200_body(monkeypatch):
+    """A status-only probe calls any local web server healthy.
+
+    An unknown GET path on an opencode v2 serve falls back to the web-app
+    index and answers 200 with HTML, so ``_probe`` has to require a JSON dict
+    body before it calls the instance (and its basic-auth password) live.
+    """
+    seen = {}
+
+    class _Resp:
+        status = 200
+
+        def __init__(self, body: bytes):
+            self._body = body
+
+        def read(self, n=-1):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _urlopen(req, timeout=None):
+        seen["url"] = getattr(req, "full_url", "")
+        return _Resp(b"<!doctype html><title>opencode</title>")
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    assert MS._probe("http://127.0.0.1:4096", "pw", timeout=1.0) is False
+    assert seen["url"] == "http://127.0.0.1:4096/api/info"
+
+
+def test_probe_accepts_a_json_info_body(monkeypatch):
+    """The same probe on a real v2 ``/api/info``: 200 + JSON dict is healthy."""
+    class _Resp:
+        status = 200
+
+        def read(self, n=-1):
+            return json.dumps({"version": "2.4.0", "hostname": "localhost"}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=None: _Resp())
+    assert MS._probe("http://127.0.0.1:4096/", "", timeout=1.0) is True
 
 
 def MANAGED_AGENT_PRESENT(cfg: dict) -> bool:
@@ -316,10 +394,27 @@ def _capturing_popen(captured: dict):
     return _popen
 
 
-def test_payload_variant_only_when_set():
-    assert "variant" not in OP.message_payload("opencode", "m", "a", "hi")
-    body = OP.message_payload("opencode", "m", "a", "hi", variant="medium")
-    assert body["variant"] == "medium"
+def test_payload_variant_only_when_set(monkeypatch):
+    """v2 made the model, its ``variant`` and the agent SESSION-scoped.
+
+    They ride ``POST /api/session/:id/model`` and ``.../agent`` now, and the
+    prompt body carries the text and nothing else (no system, no model, no
+    tools key to declare).
+    """
+    bodies = _fake_v2_serve(monkeypatch, [_assistant_item("hi")])
+    assert OC.send_message("ses_1", "opencode", "m", OP.agent_name(), "hi",
+                           timeout=5)["content"] == "hi"
+    assert next(b for p, b in bodies if p.endswith("/model")) == {
+        "model": {"id": "m", "providerID": "opencode"}}
+    assert next(b for p, b in bodies if p.endswith("/agent")) == {
+        "agent": "deepseaport-passthrough"}
+    assert next(b for p, b in bodies if p.endswith("/prompt")) == {"text": "hi"}
+
+    bodies.clear()
+    OC.send_message("ses_1", "opencode", "m", OP.agent_name(), "hi",
+                    timeout=5, variant="medium")
+    assert next(b for p, b in bodies if p.endswith("/model"))["model"] == {
+        "id": "m", "providerID": "opencode", "variant": "medium"}
 
 
 def test_prepare_carries_reasoning_effort():
@@ -390,103 +485,6 @@ def test_ensure_without_binary_returns_none(monkeypatch, tmp_path):
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
     assert MS.ensure() is None
     assert os.environ.get("DEEPSEAPORT_OPENCODE_BASE", "") == ""
-
-
-def test_native_tools_omitted_without_pi_tools():
-    assert OCS._native_tools_for({}) is None
-    assert OCS._native_tools_for({"tools": []}) is None
-    assert OCS._native_tools_for(None) is None
-    minimal = OCS._native_tools_for({"tools": [{"type": "function"}]})
-    assert isinstance(minimal, dict) and minimal.get("bash") is False
-    assert minimal.get("read") is True and minimal.get("edit") is False
-
-
-def test_per_message_tools_deny_bash_and_allow_read(monkeypatch):
-    """The per-message allowlist must not re-grant native shell access.
-
-    managed_serve pins the agent permission map to ``bash: "deny"``, but the
-    per-message `tools` map OVERRIDES it: declaring ``bash: True`` handed the
-    model a native shell on every tool turn. The free-tier gatekeeper only
-    needs the key DECLARED, not granted, so the value must be False while
-    `read` stays True (see managed_serve.managed_config_content).
-    """
-    minimal = OP.native_tools_minimal()
-    assert minimal["bash"] is False
-    assert minimal["read"] is True
-    # The key must still be present: omitting it (or an all-false map) 403s
-    # the free tier with "only be used from within OpenCode".
-    assert "bash" in minimal and "read" in minimal
-    # The declared value must not hand the model a native shell.
-    assert {k for k, v in minimal.items() if v} == {"read"}
-
-    # Same contract through the resolved per-message payload.
-    body = OP.message_payload("opencode", "m", OP.agent_name(), "hi",
-                              tools=OP.native_tools_minimal())
-    assert "tools" in body
-    assert body["tools"]["bash"] is False
-    assert body["tools"]["read"] is True
-
-    # And through the transport seam (what actually rides on the wire).
-    seen = {}
-
-    def _fake_request(method, path, body=None, timeout=20, session_id=None,
-                      **kw):
-        seen["body"] = body
-        return 200, {"info": {"finish": "stop"},
-                     "parts": [{"type": "text", "text": "hi"}]}
-
-    monkeypatch.setattr(OC, "_request", _fake_request)
-    OC.send_message("ses_1", "opencode", "m", OP.agent_name(), "hi", timeout=5)
-    assert "tools" in seen["body"]
-    assert seen["body"]["tools"]["bash"] is False
-    assert seen["body"]["tools"]["read"] is True
-
-    # The managed agent permission map stays the authority (defence in depth).
-    perms = json.loads(MS.managed_config_content())["permission"]
-    assert perms["bash"] == "deny" and perms["read"] == "allow"
-
-
-def test_send_message_omits_tools_key_when_none(monkeypatch):
-    seen = {}
-
-    def _fake_request(method, path, body=None, timeout=20, session_id=None,
-                      **kw):
-        seen["body"] = body
-        return 200, {"info": {"finish": "stop"},
-                     "parts": [{"type": "text", "text": "hi"}]}
-
-    monkeypatch.setattr(OC, "_request", _fake_request)
-    out = OC.send_message("ses_1", "opencode", "m", "agent", "hi",
-                          timeout=5, tools=None)
-    assert out["content"] == "hi"
-    assert "tools" not in seen["body"]
-    out2 = OC.send_message("ses_1", "opencode", "m", "agent", "hi",
-                           timeout=5)
-    assert "tools" in seen["body"] and seen["body"]["tools"]["bash"] is False
-
-
-def test_attempt_uses_omit_for_plain_chat(monkeypatch):
-    seen = {}
-    monkeypatch.setattr(OC, "create_session", lambda timeout=20, **kw: "ses_o")
-
-    def _send(sid, pid, mid, agent, prompt, timeout=180, variant=None,
-              tools=None, **kw):
-        seen["tools"] = tools
-        return {"content": "ok", "thinking": "",
-                "usage_total": 1, "finish": "stop"}
-
-    monkeypatch.setattr(OC, "send_message", _send)
-    monkeypatch.setattr(OC, "delete_session",
-                        lambda sid, timeout=10, **kw: None)
-    app = create_app(_settings())
-    prep = {"prompt": "hi", "model": DEFAULT_MODEL, "tools": [],
-            "reasoning_effort": None}
-    out = OCS._run_completion_core(app, None, prep)
-    assert out["content"] == "ok" and seen["tools"] is None
-    prep_tools = {"prompt": "hi", "model": DEFAULT_MODEL,
-                  "tools": [{"type": "function"}], "reasoning_effort": None}
-    OCS._run_completion_core(app, None, prep_tools)
-    assert isinstance(seen["tools"], dict) and seen["tools"]["bash"] is False
 
 
 def test_managed_prompt_forbids_native_and_allows_dsml():

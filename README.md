@@ -64,8 +64,6 @@ Obscura binary (`h4ckf0r0day/obscura`, i personally use no-render stealth): drop
 **B. python:**
 ```powershell
 pip install -e .
-python -m deepseaport login --email you@x.com  # real Helium/Chrome login, saves token
-python -m deepseaport waf                      # verify Obscura + WAF cookie
 python -m deepseaport serve                    # :5001
 ```
 
@@ -252,11 +250,13 @@ DeepSeek — `deepseek-flash`, `deepseek-flash-reasoner`,
 `deepseek-flash-search`, `deepseek-flash-reasoner-search` (reasoner models
 return `reasoning_content` alongside `content`); Qwen — `qwen3.7-plus`
 (default), `qwen3.8-max`, `qwen3.8-omni-flash`;
-opencode (local CLI, no accounts) — 8 static entries, `opencode/muse-spark-1.3-contributor-free`
-(default) first, and any `provider/model` you configured on your own
-`opencode serve` passes through. Seven of the eight carry a `-free` suffix;
-the eighth, `opencode/big-pickle`, does not — it is still served and
-still listed, it just is not named `-free`.
+opencode (local CLI, no accounts) — whatever the running `opencode serve`
+lists on `GET /api/model` (default `opencode/muse-spark-1.3-contributor-free`),
+with the eight hand-verified entries as the offline fallback; two of those
+eight are no longer served upstream and exist only in the fallback. Seven
+carry a `-free` suffix; `opencode/big-pickle` does not — it is still
+served and still listed, it just is not named `-free`. Any `provider/model`
+you configured on your own `opencode serve` passes through.
 
 Note: OpenAI params the web upstreams cannot honor (`temperature`, `top_p`,
 `max_tokens`, `stop`, `n`, penalties, `response_format`, `parallel_tool_calls`)
@@ -269,9 +269,9 @@ like the rest, because the web model may answer in prose where the caller is
 waiting on a `tool_call`. `stream_options.include_usage` is honored locally.
 The opencode provider additionally honors `reasoning_effort`
 (`none/minimal/low/medium/high/xhigh`, also as `reasoning.effort`) as the
-serve message `variant` — the only per-request parameter the serve API
-supports (`temperature` has no per-message field upstream, so it stays
-warn-and-drop like the web providers).
+session's reasoning `variant` — the only request-level parameter the serve API
+supports (`temperature` has no field upstream, so it stays warn-and-drop like
+the web providers).
 
 ## Pi harness + opencode (no accounts, tool_calls out of the box)
 
@@ -287,17 +287,16 @@ warn-and-drop like the web providers).
    and model `opencode/muse-spark-1.3-contributor-free`, then work
    normally: pi's tools arrive as DSML text, the model replies with DSML
    `tool_calls`, and the bridge returns OpenAI `tool_calls` for pi to
-   execute. Plain chat sends no native `tools` key at all. A tool turn has to
-   send one — an explicit all-false allowlist is what the free tier 403s — so
-   it declares 14 native keys and grants exactly one, `read`. `bash` is
-   declared with the value `false`: the free-tier gate needs the key
-   *present*, not *granted*. That matters because the per-message `tools` map
-   **overrides** the managed agent's permission map, so a granted `bash` here
-   would hand the model a native shell on every tool turn; the agent map denies
-   `bash` too, and both layers have to agree.
-4. If pi runs in a different directory than the bridge, set
+   execute. The agent the bridge runs has `read` allowed and
+   `edit`/`bash`/`webfetch`/`external_directory` denied — pi's own tools
+   ride the prompt text, not the model's native ones.
+4. opencode v2 requires a basic-auth password on every serve instance. The
+   managed one pins a per-boot `OPENCODE_SERVER_PASSWORD` itself, so nothing
+   to do. If you point `DEEPSEAPORT_OPENCODE_BASE` at your own serve, mirror
+   the password it printed at boot in `DEEPSEAPORT_OPENCODE_PASSWORD`.
+5. If pi runs in a different directory than the bridge, set
    `DEEPSEAPORT_OPENCODE_WORKDIR` to the project dir so sessions pin
-   (`?directory=`) where pi expects file tools to run.
+   (`location.directory` on session create) where pi expects file tools to run.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for protocol details, auth/PoW/SSE
 notes, and the tool-calling design, and [PROVIDERS.md](PROVIDERS.md) for

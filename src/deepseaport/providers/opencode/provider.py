@@ -1,10 +1,12 @@
 """Opencode provider implementation (local CLI via ``opencode serve``).
 
 Unlike the web2api providers this one needs no accounts, no tokens, no
-browser, and no warmup: free models work with zero CLI auth, and anything
-needing keys is authenticated inside the CLI itself. Every
-method delegates to the local engine (``.completion_service``), the
-canonical monkeypatch surface; ``deepseaport.server`` is never imported.
+browser and no WAF warmup: free models work with zero CLI auth, and anything
+needing keys is authenticated inside the CLI itself. ``warmup`` is still used,
+for what only this provider can do -- booting the managed serve instance and
+priming the live model catalogue off the request path. Every method delegates
+to the local engine (``.completion_service``), the canonical monkeypatch
+surface; ``deepseaport.server`` is never imported.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from __future__ import annotations
 import logging
 
 from ...core.provider import ModelSpec, Provider
-from .models import DEFAULT_MODEL, MODELS_SPEC
+from .models import DEFAULT_MODEL, MODELS_SPEC, live_specs
 
 logger = logging.getLogger("deepseaport.providers")
 
@@ -31,12 +33,28 @@ class OpencodeProvider(Provider):
     # No WAF bridge either: localhost serve needs no Obscura warmup.
     needs_bridge = False
 
+    def catalogue(self) -> dict[str, ModelSpec]:
+        """The live serve catalogue when there is one, else the static set.
+
+        One view for ``models()`` and ``model_spec()``, so a model the serve
+        advertises resolves with its own spec (thinking flag included) even
+        when it is not one of the eight verified entries. The static set is a
+        fallback, not a floor: it is not merged in.
+        """
+        return live_specs() or dict(MODELS_SPEC)
+
     def models(self) -> dict[str, ModelSpec]:
-        """Return a copy of the static opencode catalogue (see models.py)."""
-        return dict(MODELS_SPEC)
+        """Return the opencode catalogue (live from serve, else static)."""
+        return self.catalogue()
 
     def default_model(self) -> str:
-        """Return the canonical default opencode model id."""
+        """Return the canonical default opencode model id.
+
+        Explicit, NOT the first catalogue key: the live catalogue is served in
+        upstream order and turns over weekly, so inheriting ``models()`` would
+        let the default change underneath the TUI picker and every
+        defaulting client.
+        """
         return DEFAULT_MODEL
 
     def model_spec(self, model: str) -> ModelSpec | None:
@@ -51,7 +69,7 @@ class OpencodeProvider(Provider):
         key = str(model or "").strip()
         if not key:
             return None
-        for mid, spec in MODELS_SPEC.items():
+        for mid, spec in self.catalogue().items():
             if str(mid).strip().lower() == key.lower():
                 return spec
         if "/" not in key:
@@ -84,19 +102,28 @@ class OpencodeProvider(Provider):
         plugin via child-only env; the user's own opencode config is never
         touched. An explicit DEEPSEAPORT_OPENCODE_BASE opts out of this and
         uses the user's serve as-is.
+
+        The model catalogue is primed here, off the request path, with a
+        generous timeout: a serve that has just booted answers its first
+        ``GET /api/model`` slowly (it builds the registry on that read), which
+        is longer than the short timeout ``/v1/models`` itself can afford.
         """
         try:
             from . import client as OC
             from . import managed_serve as MS
-            if OC.health(timeout=10):
-                return None
-            base = MS.ensure()
-            if base and OC.health(timeout=10):
+            from .models import live_specs
+            if not OC.health(timeout=10):
+                base = MS.ensure()
+                if not (base and OC.health(timeout=10)):
+                    logger.warning(
+                        "opencode serve not reachable (managed boot failed; "
+                        "first request retries, or set "
+                        "DEEPSEAPORT_OPENCODE_BASE)")
+                    return None
                 logger.info("opencode managed serve ready at %s", base)
-            else:
-                logger.warning(
-                    "opencode serve not reachable (managed boot failed; "
-                    "first request retries, or set DEEPSEAPORT_OPENCODE_BASE)")
+            models = live_specs(timeout=30.0)
+            if models:
+                logger.info("opencode catalogue: %d live model(s)", len(models))
         except Exception as exc:  # noqa: BLE001
             logger.debug("opencode warmup ignored: %s", exc)
         return None

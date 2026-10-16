@@ -1,18 +1,33 @@
 """Opencode local-CLI protocol: base URL, payloads, model splitting.
 
 Talks to a locally running ``opencode serve`` instance (default
-``http://127.0.0.1:4096``). ``opencode serve`` exposes a control-plane HTTP
-API (``POST /session``, ``POST /session/:id/message``, ``DELETE
-/session/:id``, ``GET /config/providers``, ``GET /global/health``); this
-module builds the small subset the provider needs. No auth by default
-(localhost, no password); when ``OPENCODE_SERVER_PASSWORD`` is set on the
-serve instance, the matching password rides HTTP basic auth.
+``http://127.0.0.1:4096``). The v2 HttpApi (opencode 2.x) serves everything
+under ``/api`` and no longer has a blocking message endpoint; the subset the
+provider needs is:
+
+  GET    /api/info                                   -> alive
+  POST   /api/session  {location?}                   -> {data:{id}}
+  POST   /api/session/:id/model  {model}            -> 204 (session-scoped)
+  POST   /api/session/:id/agent  {agent}            -> 204 (session-scoped)
+  POST   /api/session/:id/prompt {text}             -> {data:{id}} at once
+  GET    /api/session/:id/message?limit=&order=     -> {data:[items]}
+  POST   /api/session/:id/interrupt {}              -> abort
+  DELETE /api/session/:id                           -> 204
+  GET    /api/event                                  -> SSE deltas
+  GET    /api/model                                  -> dynamic catalogue
+
+Success is enveloped as ``{"data": ...}``; failures are a flat
+``{"_tag": "...", "message": "..."}`` object (no envelope). Since opencode
+v2 a serve instance always requires HTTP basic auth: it generates a password at
+boot and prints it, unless ``OPENCODE_SERVER_PASSWORD`` pins one. The managed
+instance sets that env and passes the same value here; for your own serve,
+mirror its password in ``DEEPSEAPORT_OPENCODE_PASSWORD``.
 
 Env overrides (no Settings fields):
   DEEPSEAPORT_OPENCODE_BASE      base URL (default: managed isolated serve;
                                  set this to use your own `opencode serve`)
   DEEPSEAPORT_OPENCODE_AGENT     agent name (default deepseaport-passthrough)
-  DEEPSEAPORT_OPENCODE_TIMEOUT   per-request seconds (default 180)
+  DEEPSEAPORT_OPENCODE_TIMEOUT   per-turn seconds (default 180)
   DEEPSEAPORT_OPENCODE_USERNAME  basic-auth username (default opencode)
   DEEPSEAPORT_OPENCODE_PASSWORD  basic-auth password (default "")
   DEEPSEAPORT_OPENCODE_MANAGED   0/false/no/off disables the managed serve
@@ -20,15 +35,13 @@ Env overrides (no Settings fields):
   DEEPSEAPORT_OPENCODE_PROJECT   project identity header (default global)
   DEEPSEAPORT_OPENCODE_USER_AGENT  User-Agent header (default opencode/<cli version>)
   DEEPSEAPORT_OPENCODE_WORKDIR   session working directory for tool execution
-                                 (default: deepseaport process cwd; native
-                                 tools run here via `?directory=` on session
-                                 create/message/delete/event)
+                                 (default: deepseaport process cwd; sent as
+                                 `location.directory` on session create)
 """
 
 from __future__ import annotations
 
 import os
-import urllib.parse
 
 from .managed_serve import MANAGED_AGENT
 
@@ -137,76 +150,19 @@ def split_model(model: str, default: str = "opencode/muse-spark-1.3-contributor-
     return "opencode", raw
 
 
-def message_payload(provider_id: str, model_id: str, agent: str, prompt: str,
-                    variant: str | None = None,
-                    tools: dict | None = None) -> dict:
-    """POST /session/:id/message body for one stateless turn.
+def message_payload(prompt: str) -> dict:
+    """POST /api/session/:id/prompt body for one turn: ``{"text": prompt}``.
 
-    ``variant`` is the one-shot reasoning effort (none/minimal/low/medium/
-    high/xhigh); omitted when unset so models without that variant keep
-    their default behavior. ``tools`` is the per-message native tool
-    allowlist (name -> bool); None omits the key so the serve uses the
-    agent defaults (live-verified on opencode 1.18.32: tool-less passes via
-    those defaults). Pass :func:`native_tools_minimal` when the harness
-    asked for tools: the free-tier gatekeeper needs bash+read *declared*
-    (an explicit all-false allowlist 403s with "only be used from within
-    OpenCode") but NOT granted — ``bash`` is declared False so the map
-    cannot override the managed agent's ``bash: "deny"`` permission.
+    v2 moved everything else off the message body. The model and its
+    reasoning ``variant`` are SESSION-scoped (``POST /api/session/:id/model``;
+    an unusable variant surfaces as a failed turn, not a 4xx on the prompt),
+    the agent is session-scoped too (``POST /api/session/:id/agent``), and
+    native tools have no per-message map at all: the agent config's permission
+    map is the single authority for what the model may call (see
+    ``managed_serve.managed_config_content``: bash/edit/webfetch denied, read
+    allowed).
     """
-    body = {
-        "model": {"providerID": provider_id, "modelID": model_id},
-        "agent": agent or DEFAULT_AGENT,
-        "parts": [{"type": "text", "text": prompt}],
-    }
-    if variant:
-        body["variant"] = variant
-    if tools is not None:
-        body["tools"] = dict(tools)
-    return body
-
-
-# The free-tier gatekeeper needs bash+read effective upstream: omitting the
-# per-message `tools` key passes (agent defaults count, live-verified on
-# opencode 1.18.32), but an explicit all-false allowlist 403s with "only be
-# used from within OpenCode". So plain chat omits the key, while tool turns
-# declare this minimal pair and hide everything else: the model then only
-# sees pi's tools (via the DSML prompt) for file edits/writes/globs, and
-# native edit/write/glob/grep would otherwise shadow pi's same-named tools
-# and run in the serve cwd.
-#
-# The declared VALUE must not hand the model native shell access. The
-# managed agent's permission map pins ``bash: "deny"`` (see
-# ``managed_serve.managed_config_content``), but this per-message map
-# OVERRIDES that permission map — so ``bash: True`` silently re-granted a
-# native shell on every tool turn, which is exactly what the managed serve
-# exists to prevent. The gatekeeper only needs the key DECLARED, not granted,
-# hence False. ``read`` stays True: the serve pins ``read: "allow"`` and
-# reads are harmless here (the prompt still routes file access through pi's
-# own tools).
-NATIVE_TOOLS_MINIMAL: dict[str, bool] = {
-    "bash": False,
-    "read": True,
-    "edit": False,
-    "write": False,
-    "glob": False,
-    "grep": False,
-    "task": False,
-    "webfetch": False,
-    "websearch": False,
-    "todowrite": False,
-    "skill": False,
-    "question": False,
-    "apply_patch": False,
-    "invalid": False,
-}
-
-
-def native_tools_minimal() -> dict[str, bool]:
-    """Copy of the minimal gatekeeper-passing native allowlist (never raises)."""
-    try:
-        return dict(NATIVE_TOOLS_MINIMAL)
-    except Exception:
-        return {"bash": False, "read": True}
+    return {"text": str(prompt)}
 
 
 def serve_hint() -> str:
@@ -215,6 +171,9 @@ def serve_hint() -> str:
             "Deepseaport boots a managed isolated serve automatically "
             "(needs the `opencode` binary on PATH); or run your own "
             "(`opencode serve --port 4096`) and set DEEPSEAPORT_OPENCODE_BASE. "
+            "opencode v2 prints a server password at boot: set it (or "
+            "OPENCODE_SERVER_PASSWORD) on the serve and mirror it in "
+            "DEEPSEAPORT_OPENCODE_PASSWORD. "
             "Free models need no login; `opencode auth login [--provider ...]` "
             "only for providers requiring keys.")
 
@@ -239,11 +198,17 @@ def is_free_tier_error(error: str | None) -> bool:
 
 
 def is_session_error(error: str | None) -> bool:
-    """True for stale-session races worth one recreate-and-resend."""
+    """True for stale-session races worth one recreate-and-resend.
+
+    v2 answers an unknown session with 404 and
+    ``{"_tag": "SessionNotFoundError", "message": "Session not found: ..."}``,
+    so both the tag and the prose are matched.
+    """
     low = (error or "").lower()
     return any(k in low for k in (
         "invalid_session", "invalid session", "session not found",
-        "no such session", "unknown session",
+        "sessionnotfound", "session_not_found", "no such session",
+        "unknown session",
     ))
 
 
@@ -251,8 +216,9 @@ def session_directory(explicit: str | None = None) -> str:
     """Working directory for new sessions (native tools run here).
 
     Resolution: explicit arg > DEEPSEAPORT_OPENCODE_WORKDIR env > process
-    cwd. Returns "" when nothing usable (caller omits `?directory=` and the
-    serve falls back to its own cwd). Never raises.
+    cwd. Returns "" when nothing usable (the caller omits
+    ``location.directory`` and the serve falls back to its own cwd). Never
+    raises.
     """
     candidates: list[str] = []
     try:
@@ -283,16 +249,12 @@ def session_directory(explicit: str | None = None) -> str:
 
 
 def session_query(directory: str | None = None) -> str:
-    """`?directory=...` suffix for session-scoped endpoints ("" when unset).
+    """Always "" — v2 has no ``?directory=`` query parameter.
 
-    Pass the result of :func:`session_directory` (or an explicit dir) so
-    create/message/prompt_async/delete/event all target the same worktree.
-    The serve registers the project on demand; unknown dirs 400 downstream.
+    Kept for callers that still thread a directory through: the working
+    directory now travels as ``location.directory`` in the ``POST
+    /api/session`` body (see :func:`session_directory`) and the session id
+    alone addresses every other route, so no query string is built and no
+    unknown parameter is sent.
     """
-    try:
-        d = str(directory or "").strip()
-        if not d:
-            return ""
-        return "?" + urllib.parse.urlencode({"directory": d})
-    except Exception:
-        return ""
+    return ""

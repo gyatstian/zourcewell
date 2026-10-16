@@ -1,6 +1,6 @@
 """Managed opencode serve hardening: reap identity, secret dir, child env.
 
-Five confirmed findings, each pinned here by a test that fails on the
+Six confirmed findings, each pinned here by a test that fails on the
 pre-change code:
 
 * P2-1 -- the stale-serve reaper's identity check was a SUBSTRING search
@@ -24,6 +24,12 @@ pre-change code:
 * P2-5 -- ``_invalid_token_401_detail`` kept a dead, UNSCRUBBED second return
   (the raw ``error[:200]``) below an unconditional one: a live leak the day
   someone reorders the ``if refreshed:`` block above it.
+* P2-6 -- the whole reap was DEAD on Windows. CPython hands a ``.cmd``
+  launcher to the OS shell, so the pid recorded in serve.json is
+  ``cmd.exe /c .../opencode.CMD serve ...``: argv[0] is ``cmd``, the identity
+  gate refused it on every single run ("does not look like 'opencode serve'"),
+  and even a signalled wrapper left the real ``opencode.exe`` child holding its
+  port. Every deepseaport restart leaked one.
 
 No network, no opencode binary, no credentials: every process identity is a
 monkeypatched command line and every "os.kill" is a fake.
@@ -37,6 +43,7 @@ import json
 import logging
 import os
 import stat
+import subprocess
 import textwrap
 
 import pytest
@@ -77,6 +84,27 @@ REAL_CMDLINES = [
     r'"/c/Users/op/.bun/bin/opencode" serve --port 45999 --hostname 127.0.0.1',
     r'"C:\Program Files\opencode\opencode.exe" serve --port=45999',
     "OPENCODE serve --port 45999",  # argv[0] case is irrelevant
+    # Windows: CPython hands a .cmd/.bat launcher to the OS shell, so the pid
+    # recorded in serve.json is the cmd.exe wrapper and the serve is its child.
+    r"C:\WINDOWS\system32\cmd.exe /c C:\Users\op\AppData\Roaming\npm\opencode.CMD "
+    r"serve --port 45999 --hostname 127.0.0.1",
+    r'cmd.exe /c "C:\Users\op\AppData\Roaming\npm\opencode.cmd" serve --port 45999',
+    r"C:\Windows\System32\cmd.exe /c C:\oc\opencode.exe serve --port=45999",
+]
+
+# The wrapper branch is the one that can loosen the gate, so it gets its own
+# spoofs: a cmd.exe that merely mentions opencode LATER in the line is not the
+# launcher we spawned, and neither is one whose /c target is another program.
+WRAPPER_SPOOFED_CMDLINES = [
+    "cmd.exe /c start opencode serve --port 45999",
+    "cmd.exe /c notepad.exe serve --port 45999",
+    r"cmd.exe /c echo opencode serve --port 45999",
+    # right launcher, wrong subcommand
+    r"cmd.exe /c C:\npm\opencode.CMD run --port 45999",
+    # right launcher, but the port belongs to another instance
+    r"cmd.exe /c C:\npm\opencode.CMD serve --port 1234",
+    # not a /c invocation at all
+    r"cmd.exe C:\npm\opencode.CMD serve --port 45999",
 ]
 
 
@@ -99,6 +127,28 @@ def test_reaper_gate_accepts_the_real_managed_serve_shape(cmdline):
     stale serve holds its port forever."""
     assert MS._looks_like_managed_serve(cmdline) is True, (
         f"the real managed serve was rejected: {cmdline!r}")
+
+
+@pytest.mark.parametrize("cmdline", WRAPPER_SPOOFED_CMDLINES)
+def test_reaper_gate_rejects_a_cmd_wrapper_that_is_not_our_launcher(cmdline):
+    """The Windows wrapper branch, pinned from the other side.
+
+    Accepting ``cmd.exe`` lines is only safe because exactly three tokens are
+    allowed in front of the subcommand (``cmd`` ``/c`` ``<opencode>``). Every
+    case here is a cmd.exe line that mentions opencode or a matching --port
+    somewhere and must still be refused, or a writable serve.json could aim the
+    reap at a stranger.
+    """
+    assert MS._looks_like_managed_serve(cmdline, "http://127.0.0.1:45999") is False, (
+        f"a cmd wrapper that is not the managed launcher was accepted: {cmdline!r}")
+
+
+def test_reaper_gate_accepts_the_wrapper_only_when_the_recorded_port_agrees():
+    """The wrapper does not buy an exemption from the port cross-check."""
+    line = (r"C:\WINDOWS\system32\cmd.exe /c C:\npm\opencode.CMD serve "
+            r"--port 45999 --hostname 127.0.0.1")
+    assert MS._looks_like_managed_serve(line, "http://127.0.0.1:45999") is True
+    assert MS._looks_like_managed_serve(line, "http://127.0.0.1:1234") is False
 
 
 def test_reaper_gate_requires_serve_as_an_argument_not_a_word():
@@ -140,13 +190,23 @@ def test_reaper_gate_skips_a_port_that_disagrees_with_the_port_file():
 
 
 def _no_signals(monkeypatch) -> list:
+    """Record every channel the reaper could use, as ``(channel, pid)``.
+
+    Windows kills with ``taskkill /T`` and POSIX with ``os.kill``, so both are
+    stubbed: a test that only watched ``os.kill`` would pass vacuously there.
+    """
     signalled: list[tuple] = []
 
     def _kill(pid, sig):
-        signalled.append((pid, sig))
+        signalled.append(("os.kill", pid))
         raise OSError("no such process")
 
+    def _tree(pid):
+        signalled.append(("taskkill", pid))
+        return True
+
     monkeypatch.setattr(MS.os, "kill", _kill)
+    monkeypatch.setattr(MS, "_kill_tree", _tree, raising=False)
     return signalled
 
 
@@ -181,7 +241,140 @@ def test_reaper_still_signals_the_real_serve_with_matching_port(monkeypatch, tmp
 
     MS._kill_pid(4242)
 
-    assert [pid for pid, _sig in signalled] == [4242]
+    assert [pid for _channel, pid in signalled] == [4242]
+
+
+def test_reaper_signals_the_windows_wrapper_that_spawned_the_serve(monkeypatch,
+                                                                   tmp_path):
+    """The recorded pid on Windows is ``cmd.exe``, not the serve.
+
+    Pre-fix the gate read argv[0] as ``cmd``, refused the pid, and every
+    restart logged "does not look like 'opencode serve'" and left the old
+    serve running on its port.
+    """
+    signalled = _no_signals(monkeypatch)
+    monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
+    (tmp_path / "m").mkdir()
+    monkeypatch.setattr(MS, "_process_command_line",
+                        lambda pid: (
+                            r"C:\WINDOWS\system32\cmd.exe /c "
+                            r"C:\Users\op\AppData\Roaming\npm\opencode.CMD serve "
+                            r"--port 45999 --hostname 127.0.0.1"),
+                        raising=False)
+    MS._write_port_file(tmp_path / "m" / "serve.json", "http://127.0.0.1:45999",
+                        "pw", 4242, "hash")
+
+    MS._kill_pid(4242)
+
+    assert [pid for _channel, pid in signalled] == [4242]
+
+
+# --------------------------------------------------------------------------
+# P2-6: terminating the Windows wrapper left the serve itself running
+# --------------------------------------------------------------------------
+
+
+def test_kill_tree_is_the_windows_kill_and_a_noop_elsewhere(monkeypatch):
+    """``taskkill /T`` is the only way to reach the serve behind the shim.
+
+    ``Popen.terminate()`` on Windows kills ``cmd.exe`` and orphans
+    ``opencode.exe``, which keeps holding its port; the tree flag is what makes
+    a shutdown or a restart actually give the port back.
+    """
+    calls: list[list[str]] = []
+
+    def _run(argv, **kw):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(MS.subprocess, "run", _run)
+    monkeypatch.setattr(MS.os, "name", "nt")
+
+    assert MS._kill_tree(4242) is True
+    assert calls and calls[0][:2] == ["taskkill", "/PID"]
+    assert "4242" in calls[0]
+    assert "/T" in calls[0] and "/F" in calls[0], \
+        "without /T the serve behind the cmd wrapper survives"
+
+    calls.clear()
+    monkeypatch.setattr(MS.os, "name", "posix")
+    assert MS._kill_tree(4242) is False
+    assert calls == [], "POSIX must not shell out to taskkill"
+
+
+def test_kill_tree_never_raises(monkeypatch):
+    """A missing taskkill, a dead pid or a timeout is a stale serve, not a
+    failed boot."""
+    monkeypatch.setattr(MS.os, "name", "nt")
+
+    def _boom(*a, **k):
+        raise OSError("taskkill is not available")
+
+    monkeypatch.setattr(MS.subprocess, "run", _boom)
+    assert MS._kill_tree(4242) is False
+
+
+@pytest.mark.skipif(os.name != "nt",
+                    reason="the wrapper child only exists on Windows")
+def test_terminate_proc_kills_the_tree_not_just_the_handle(monkeypatch):
+    """The tracked child is the wrapper, so terminate() alone would leak."""
+    monkeypatch.setattr(MS.os, "name", "nt")
+    killed: list[int] = []
+    monkeypatch.setattr(MS, "_kill_tree", lambda pid: killed.append(pid) or True)
+
+    class _Proc:
+        pid = 4242
+
+        def __init__(self):
+            self.terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            raise AssertionError("escalation must not run after the tree kill")
+
+    proc = _Proc()
+    MS._terminate_proc(proc)
+
+    assert killed == [4242], "the serve behind the wrapper was not killed"
+    assert proc.terminated is False, \
+        "terminate() kills only the wrapper and would orphan the serve"
+
+
+@pytest.mark.skipif(os.name == "nt",
+                    reason="POSIX keeps the SIGTERM path")
+def test_terminate_proc_on_posix_still_terminates_the_child(monkeypatch):
+    """The tree kill is Windows-only; POSIX keeps terminate() then kill()."""
+    monkeypatch.setattr(MS.os, "name", "posix")
+    monkeypatch.setattr(MS, "_kill_tree",
+                        lambda pid: pytest.fail("taskkill on POSIX"))
+    events: list[str] = []
+
+    class _Proc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            events.append("terminate")
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            events.append("kill")
+
+    MS._terminate_proc(_Proc())
+
+    assert events == ["terminate"]
 
 
 def test_reaper_skips_when_the_recorded_port_disagrees(monkeypatch, tmp_path):

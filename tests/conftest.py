@@ -248,6 +248,12 @@ def pytest_configure(config: pytest.Config) -> None:
         del os.environ[name]
     os.environ["DEEPSEAPORT_CONFIG"] = str(cfg)
     os.environ["DEEPSEAPORT_DATA"] = str(data_dir)
+    # The opencode model catalogue BOOTS the managed serve when nothing
+    # answers at the configured base, so that a fresh process reports the same
+    # ids as the running server. A suite must never spawn that process: every
+    # catalogue test fakes `client._request` instead. The socket guard cannot
+    # catch it -- it wraps connect(), not subprocesses.
+    os.environ["DEEPSEAPORT_OPENCODE_MANAGED"] = "0"
 
 
 def pytest_report_header(config: pytest.Config) -> list[str]:

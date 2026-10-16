@@ -52,6 +52,20 @@ logger = logging.getLogger("deepseaport.server")
 # strip plugin below is the backstop for the remaining base layers.
 MANAGED_AGENT = "deepseaport-passthrough"
 
+# The managed agent's system prompt, and the ONLY system text the managed
+# instance should carry: the strip plugin splices exactly this into
+# `event.system` (see STRIP_PLUGIN_JS) and the config below sets it as the
+# agent prompt, so the two layers cannot drift apart. It carries the DSML
+# tool-call contract the harness (pi and friends) depends on.
+PASSTHROUGH_SYSTEM = (
+    "You are a plain chat model behind an OpenAI-compatible API. Answer the "
+    "user message directly in text and never execute native tools yourself "
+    "(no bash/read/edit/glob/grep/task calls, even when they share names with "
+    "tools described in the user message). When the user message describes "
+    "tools with a DSML tool_calls format, your ONLY way to act is to output the "
+    "tool call in that exact DSML (or JSON tool_calls) format as text so the "
+    "outer harness executes it. If no tool is needed, answer normally.")
+
 _MANAGED_FLAG = "DEEPSEAPORT_OPENCODE_MANAGED"
 _BASE_ENV = "DEEPSEAPORT_OPENCODE_BASE"
 _PASSWORD_ENV = "DEEPSEAPORT_OPENCODE_PASSWORD"
@@ -85,34 +99,52 @@ def managed_base_dir() -> Path:
     return Path(DATA_DIR) / "opencode-managed"
 
 
-STRIP_PLUGIN_JS = """// deepseaport-managed: collapse the opencode system prompt to one line.
-// Loaded only by the deepseaport-owned `opencode serve` child process
-// (OPENCODE_CONFIG_DIR); the user's own opencode never sees this file.
-export const DeepSeaportStripSystem = async () => ({
-  "experimental.chat.system.transform": async (_input, output) => {
-    // In-place mutation is required (reassignment is a silent no-op) and
-    // one entry must remain (empty restores the original upstream).
-    output.system.splice(
-      0,
-      output.system.length,
-      "You are a concise assistant. Follow the user message directly.",
-    );
+STRIP_PLUGIN_JS = """// deepseaport-managed: replace the opencode system prompt with the managed
+// agent's own passthrough instruction. Loaded only by the deepseaport-owned
+// `opencode serve` child process (OPENCODE_CONFIG_DIR/plugins); the user's own
+// opencode never sees this file.
+//
+// v2 plugin shape: a default-exported {id, setup(ctx)} module registering a
+// session hook. The v1 `experimental.chat.system.transform` hook object no
+// longer exists in opencode 2.x; `context` is the replacement (it runs for the
+// agent loop just before dispatch). In-place mutation is required (reassignment
+// is a silent no-op) and one entry must remain (empty restores the original
+// upstream).
+//
+// It injects PASSTHROUGH_SYSTEM, the SAME text the managed config sets as the
+// agent prompt: on v2 `event.system` carries the stock opencode prompt AND the
+// agent's own prompt in one array, so stripping it to a generic one-liner would
+// also erase the DSML tool-call contract the harness depends on.
+export default {
+  id: "deepseaport-strip-system",
+  setup(ctx) {
+    ctx.session.hook("context", (event) => {
+      if (Array.isArray(event.system)) {
+        event.system.splice(0, event.system.length, {
+          type: "text",
+          text: %s,
+        });
+      }
+    });
   },
-});
-"""
+};
+""" % json.dumps(PASSTHROUGH_SYSTEM, ensure_ascii=False)
 
 
 def managed_config_content() -> str:
-    """Inline opencode config (highest precedence) for the managed instance."""
-    # read stays allowed, bash is DENIED: the free-tier gatekeeper needs both
-    # keys *declared* (an explicit all-false tool list 403s with "only be used
-    # from within OpenCode"; omitting the per-message key passes via these
-    # agent defaults on opencode 1.18.32), but the declared value must not hand
-    # the model native shell access — a prompt-injection chain must not be able
-    # to run commands in a process that already holds the operator's env (see
-    # _child_env) and cwd. The agent prompt forces text-only output so the
-    # harness (e.g. pi) owns execution; sessions are pinned to the caller's
-    # workdir via `?directory=` (see protocol.session_directory).
+    """Inline opencode config (highest precedence) for the managed instance.
+
+    opencode v2 accepts these keys and normalizes them (``agent`` to
+    ``agents``, ``prompt`` to ``system``, ``bash`` to ``shell``); the
+    permission map below is the ONLY thing that bounds what the model may
+    call on v2, since v2 has no per-message tool map left to override it.
+    bash is DENIED for the reason that map exists at all: a prompt-injection
+    chain must not be able to run commands in a process that holds the
+    operator's env (see _child_env) and cwd. The agent prompt forces
+    text-only output so the harness (e.g. pi) owns execution; sessions are
+    pinned to the caller's workdir via the create body's
+    ``location.directory`` (see protocol.session_directory).
+    """
     perms = {"read": "allow", "edit": "deny", "bash": "deny",
              "webfetch": "deny", "external_directory": "deny"}
     cfg = {
@@ -123,16 +155,7 @@ def managed_config_content() -> str:
             MANAGED_AGENT: {
                 "mode": "primary",
                 "description": "Raw passthrough for API use (managed by deepseaport)",
-                "prompt": ("You are a plain chat model behind an OpenAI-compatible "
-                           "API. Answer the user message directly in text and "
-                           "never execute native tools yourself (no bash/read/"
-                           "edit/glob/grep/task calls, even when they share "
-                           "names with tools described in the user message). "
-                           "When the user message describes tools with a DSML "
-                           "tool_calls format, your ONLY way to act is to output "
-                           "the tool call in that exact DSML (or JSON tool_calls) "
-                           "format as text so the outer harness executes it. "
-                           "If no tool is needed, answer normally."),
+                "prompt": PASSTHROUGH_SYSTEM,
                 "permission": dict(perms),
             }
         },
@@ -209,9 +232,15 @@ def write_isolated_files(base: Path) -> dict[str, Path]:
 
 
 def _probe(base: str, password: str, timeout: float = 2.0) -> bool:
-    """True when /global/health answers 200 (never raises)."""
+    """True when ``GET /api/info`` answers 200 with a JSON body (never raises).
+
+    The body check is load-bearing, not decoration: an unknown GET path on an
+    opencode v2 serve falls back to the web-app index and answers 200 with
+    HTML, so a status-only probe would call a v1 instance (or any other local
+    server) healthy.
+    """
     try:
-        req = urllib.request.Request(base.rstrip("/") + "/global/health",
+        req = urllib.request.Request(base.rstrip("/") + "/api/info",
                                      method="GET",
                                      headers={"Accept": "application/json"})
         if password:
@@ -219,7 +248,10 @@ def _probe(base: str, password: str, timeout: float = 2.0) -> bool:
                 f"opencode:{password}".encode("utf-8")).decode("ascii")
             req.add_header("Authorization", f"Basic {token}")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return int(getattr(resp, "status", 0) or 0) == 200
+            if int(getattr(resp, "status", 0) or 0) != 200:
+                return False
+            raw = resp.read(4096).decode("utf-8", "replace")
+        return isinstance(json.loads(raw), dict)
     except Exception:
         return False
 
@@ -274,6 +306,9 @@ _CMDLINE_PROBE_TIMEOUT = 5.0
 # could write serve.json could still aim the SIGTERM at a stranger.
 _SERVE_BIN_NAME = "opencode"
 _SERVE_SUBCOMMAND = "serve"
+# The shell CPython hands a .cmd/.bat launcher to on Windows. The recorded pid
+# is THIS process, not the serve, which is its child.
+_CMD_WRAPPER_NAME = "cmd"
 
 
 def _posix_command_line(pid: int) -> str:
@@ -406,6 +441,31 @@ def _serve_binary_names() -> set[str]:
     return names
 
 
+# Suffixes a launcher may carry: the real binary is ``.exe``, and an npm /
+# bun install puts a ``.cmd`` / ``.bat`` shim next to it. The identity check
+# compares STEMS so one rule covers every shape.
+_LAUNCHER_SUFFIXES = (".exe", ".cmd", ".bat")
+
+
+def _exe_stem(command: str) -> str:
+    """``opencode.exe`` / ``opencode.CMD`` -> ``opencode``; case folded."""
+    try:
+        name = _exe_basename(command)
+        for suffix in _LAUNCHER_SUFFIXES:
+            if name.endswith(suffix):
+                return name[: -len(suffix)].strip()
+        return name
+    except Exception:
+        return ""
+
+
+def _serve_binary_stems() -> set[str]:
+    """Launchable stems for the serve: the literal name plus what PATH resolves."""
+    return {_SERVE_BIN_NAME} | {
+        stem for stem in (_exe_stem(name)
+                          for name in _serve_binary_names()) if stem}
+
+
 def _argv_port(argv: list[str]) -> int:
     """``--port N`` / ``--port=N`` in argv; 0 when absent or unreadable."""
     try:
@@ -433,17 +493,24 @@ def _looks_like_managed_serve(cmdline: str, expected_base: str = "") -> bool:
     An identity check, not a resemblance check, because the pid this gates
     comes from an ordinary JSON file in the data dir:
 
-    * ``argv[0]``'s basename must be the opencode binary name, case-folded
-      and extension-insensitive (Windows: ``opencode.exe`` == ``opencode``).
-      ``shutil.which`` is consulted when it resolves, so an install whose
-      binary carries a different suffix still matches, and a bare ``opencode``
-      on PATH (argv[0] with no directory) is accepted on the name alone --
-      which is what the child is actually spawned as. Anything else is a
-      stranger: notepad, powershell, calc, a file named ``serve.exe``.
-    * ``serve`` must be a real argv element, not a word somewhere in the
-      line. The line is split into argv first (POSIX quoting on POSIX,
-      CommandLineToArgvW-style quoting on Windows) so a quoted path and a
-      path-less invocation both parse.
+    * The launcher must BE opencode, case-folded and suffix-insensitive
+      (Windows: ``opencode.exe``, ``opencode.CMD`` and a bare ``opencode`` are
+      the same stem). ``shutil.which`` is consulted when it resolves, so an
+      install whose binary carries a different name still matches. Anything
+      else is a stranger: notepad, powershell, calc, a file named
+      ``serve.exe``.
+    * OR the Windows shell wrapper that launches it: CPython hands a batch
+      file to the OS shell, so ``Popen([opencode.CMD, ...])`` records
+      ``cmd.exe /c <path>\\opencode.CMD serve ...`` and the pid in the port
+      file is the WRAPPER's, with the serve as its child. Only that exact
+      three-token prefix is accepted (``cmd`` ``/c`` ``<opencode>``), so
+      ``cmd.exe /c start opencode serve`` still fails on the ``start`` in
+      argv[2] -- a wrapper that merely mentions opencode later in the line is
+      not the launcher we spawned.
+    * ``serve`` must be a real argv element of the launcher, not a word
+      somewhere in the line. The line is split into argv first (POSIX quoting
+      on POSIX, CommandLineToArgvW-style quoting on Windows) so a quoted path
+      and a path-less invocation both parse.
     * ``--port N``, when present, must agree with the base URL recorded
       alongside the pid. A serve on another port is not the instance whose
       pid was recorded.
@@ -458,9 +525,16 @@ def _looks_like_managed_serve(cmdline: str, expected_base: str = "") -> bool:
         argv = _split_argv(cmdline)
         if len(argv) < 2:
             return False
-        if _exe_basename(argv[0]) not in _serve_binary_names():
+        stems = _serve_binary_stems()
+        if _exe_stem(argv[0]) in stems:
+            rest = argv[1:]
+        elif (_exe_stem(argv[0]) == _CMD_WRAPPER_NAME and len(argv) >= 4
+              and argv[1].strip().strip('"').lower() == "/c"
+              and _exe_stem(argv[2]) in stems):
+            rest = argv[3:]
+        else:
             return False
-        if not any(tok.lower() == _SERVE_SUBCOMMAND for tok in argv[1:]):
+        if not any(tok.lower() == _SERVE_SUBCOMMAND for tok in rest):
             return False
         port = _argv_port(argv)
         if port and expected_base:
@@ -519,6 +593,12 @@ def _kill_pid(pid: int) -> None:
             "if that persists.", pid, "unreadable" if not cmdline else "different",
             managed_base_dir() / "serve.json")
         return
+    if os.name == "nt":
+        # The recorded pid is the cmd.exe wrapper, and the serve is its child:
+        # signalling the wrapper alone would leave the real serve running on
+        # the port forever. /T reaches it (see :func:`_kill_tree`).
+        _kill_tree(pid)
+        return
     try:
         import signal
 
@@ -532,6 +612,39 @@ def _kill_pid(pid: int) -> None:
             time.sleep(0.2)
     except Exception:
         pass
+
+
+def _kill_tree(pid: int) -> bool:
+    """Windows: kill ``pid`` AND every process it started. True if it ran.
+
+    ``taskkill /T`` is the only way to reach the grandchildren from stdlib:
+    the managed child is spawned through the npm ``.cmd`` shim, so Windows
+    records a ``cmd.exe /c opencode.CMD serve ...`` wrapper whose child is the
+    actual serve. Terminating the wrapper (what ``Popen.terminate`` does)
+    leaves that child alive and still holding its port, which is how every
+    deepseaport restart leaked a serve before this existed.
+
+    ``/F`` because Windows has no graceful signal for a console child, and
+    ``proc.terminate()`` was already an immediate TerminateProcess there. Off
+    Windows this is a no-op: SIGTERM to the process group is what POSIX wants.
+    Never raises; a failure here only costs a stale serve on a port that
+    ``ensure()`` probes around anyway.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        creationflags = 0
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        except Exception:
+            creationflags = 0
+        subprocess.run(
+            ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=creationflags)
+        return True
+    except Exception:
+        return False
 
 
 # Grace between terminate() and the kill() escalation. shutdown() already
@@ -549,6 +662,11 @@ def _terminate_proc(proc, timeout: float = _TERMINATE_WAIT) -> None:
     holding its port. On ensure()'s not-ready path nothing else would ever
     wait on that child at all: ``_proc`` is not assigned before it returns.
 
+    On Windows the handle we hold is the ``cmd.exe`` wrapper, so terminate()
+    kills the wrapper and leaves the serve itself running on its port. The
+    tree kill goes first there instead (:func:`_kill_tree`); the ``wait()`` that
+    follows is still what reaps the handle.
+
     A child that ignores SIGTERM is killed rather than left running: an
     orphan ``opencode serve`` is a hole in the isolation the managed instance
     exists to provide. Never raises.
@@ -557,7 +675,9 @@ def _terminate_proc(proc, timeout: float = _TERMINATE_WAIT) -> None:
         alive = proc.poll() is None
     except Exception:
         alive = True
-    if alive:
+    if alive and os.name == "nt":
+        _kill_tree(int(getattr(proc, "pid", 0) or 0))
+    elif alive:
         try:
             proc.terminate()
         except Exception:
@@ -583,7 +703,7 @@ def _reap_previous_child(recorded_pid: int = 0) -> None:
     ``_proc`` is the only handle ``shutdown()`` and the ``atexit`` hook know,
     so the ``_proc = proc`` assignment at the end of :func:`ensure` makes the
     previous child unreachable the moment a new instance boots. The scenario
-    is not exotic: the reuse probe is a 2 s ``GET /global/health``, so an
+    is not exotic: the reuse probe is a 2 s ``GET /api/info``, so an
     *unresponsive* -- not dead -- serve (a loaded box, a wedged agent loop)
     misses it, and ensure() boots a fresh instance on a new free port. The
     orphan then keeps its port, its ``work/`` cwd and its per-boot basic-auth

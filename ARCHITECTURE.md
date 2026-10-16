@@ -664,7 +664,9 @@ no search). `/v1/models` serves the union of the active providers.
 ### The opencode provider (a local CLI, not a web upstream)
 
 The third registered provider and the odd one out: it is a **local process**,
-so none of the web-provider machinery applies. Full protocol detail lives in
+so none of the web-provider machinery applies. It speaks opencode v2's HttpApi
+(every route under `/api`, live-verified against 2.0.29), so the wire notes
+below are v2-specific. Full protocol detail lives in
 `src/deepseaport/providers/opencode/README.md`; this is the shape.
 
 - **`requires_accounts = False`** (`providers/opencode/provider.py:29`). No
@@ -677,8 +679,9 @@ so none of the web-provider machinery applies. Full protocol detail lives in
   accounts, and `cli.py:656` bypasses the pool in chat mode. The adapter still
   accepts `pool`/`item` in its signatures so the route contract is unchanged.
 - **No PoW, no WAF, no ban, no login.** `probe_ban` is `(False, None)`,
-  `login` raises, `warmup` is a log-only `GET /global/health`. The free Zen
-  models need no `opencode auth login` (that is only for key-gated providers).
+  `login` raises, `warmup` is a log-only `GET /api/info` probe that boots the
+  managed serve when nothing answers. The free Zen models need no
+  `opencode auth login` (that is only for key-gated providers).
 - **Managed isolated serve** (`providers/opencode/managed_serve.py`). The first
   request boots a dedicated `opencode serve` child on a free localhost port
   instead of talking to whatever the operator happens to be running. The child
@@ -693,58 +696,81 @@ so none of the web-provider machinery applies. Full protocol detail lives in
   `opencode` runs are untouched. Extra workers reuse the instance through the
   `serve.json` port file. Opt out with `DEEPSEAPORT_OPENCODE_BASE` (use your
   own serve as-is) or `DEEPSEAPORT_OPENCODE_MANAGED=0`.
+- **Since v2 the serve always requires HTTP basic auth.** It generates a
+  password at boot and prints it unless `OPENCODE_SERVER_PASSWORD` pins one, so
+  the managed child sets that env and hands the same value to the client
+  (`serve.json` stores it, owner-only; a probed base must be given the password
+  too). An operator's own serve is used with
+  `DEEPSEAPORT_OPENCODE_USERNAME/PASSWORD`; a 401 is terminal and names both.
+- **The turn is prompt-then-poll.** v2 has no blocking message endpoint:
+  `POST /api/session/:id/prompt {text}` returns at once with the created user
+  item while the agent loop runs in the background, so `send_message` polls
+  `GET /api/session/:id/message?limit=&order=desc` until the newest assistant
+  item AFTER this turn's user item carries `time.completed`. Model, reasoning
+  `variant` and agent are **session-scoped** in v2, so every turn POSTs
+  `/api/session/:id/model` and `/agent` before the prompt — without that a
+  session born from an empty create body answers from whatever model it happens
+  to carry. An unusable model/variant is not a 4xx: it is accepted and fails
+  the turn, which is why the serve's own words survive into the error text.
 - **Live streaming is real, not buffered** (this is the opencode-specific
   answer to the `stream_mode` discussion above, and the one place a provider
   does *not* use the engine's blocking producer). In `stream_mode: live`
-  (`completion_service.py:516`) `_stream_completion` runs
+  (`completion_service._stream_completion`) it runs
   `_run_completion_core(..., live=True)`, which calls
-  `client.stream_message` — that subscribes to `GET /event` **first** (so early
-  deltas are not missed), sends `prompt_async`, and forwards
-  `message.part.delta` text/reasoning through `core.engine.live_emit_pair` as
-  they arrive (`client.py:369-457`). `session.idle` ends the tail, then the
-  authoritative result is fetched from `GET /session/:id/message`; a partial
-  tail is never returned as the result. Two deliberate rules: thinking always
-  streams, but **content streams live only when the client sent no `tools`** —
-  otherwise a tool_calls reply would also leak as user-visible text. If the
-  SSE tail cannot start, it falls back to the blocking result fanned out as
-  chunks, so `stream_mode: buffered` and the fallback are the same code path.
-- **`reasoning_effort` → `variant`.** The one per-request parameter the serve
-  API honors. `_prepare` lifts `reasoning_effort` (string) or
-  `reasoning.effort` from the OpenAI body, validates it against the built-ins
-  `none/minimal/low/medium/high/xhigh` (`server_routes.py:877-893`), and the
-  completion path forwards it as the serve message `variant`
-  (`completion_service.py:402`). An unknown value is warned-and-dropped
-  (`_extract_passthrough`), then falls back to one variant-less resend instead
-  of failing the turn. `temperature` has no per-message field upstream, so it
-  stays warn-and-drop like the web providers.
-- **The native tool map: 14 keys declared, 1 granted.** Plain chat sends **no**
-  `tools` key at all. Tool turns must send one, because the free-tier
-  gatekeeper 403s an explicit all-false allowlist ("only be used from within
-  OpenCode") while an omitted key passes on the agent defaults. The map
-  (`protocol.NATIVE_TOOLS_MINIMAL`) therefore declares 14 native keys and
-  grants exactly one: `read`. **`bash` is declared with the value `False`**, and
-  that is load-bearing — the per-message `tools` map **overrides** the managed
-  agent's permission map, so `bash: True` here would silently re-grant a
-  native shell on every tool turn, exactly what the managed serve exists to
-  prevent. Both layers deny `bash` and neither is sufficient alone: the agent
-  map pins `bash: "deny"` / `read: "allow"`
-  (`managed_serve.managed_config_content`) and the message map must agree.
+  `client.stream_message` — that subscribes to `GET /api/event` **first** (so
+  early deltas are not missed), sends the prompt, and forwards
+  `session.text.delta` / `session.reasoning.delta` through
+  `core.engine.live_emit_pair` as they arrive. `session.execution.succeeded` /
+  `.failed` ends the tail, then the authoritative result is read from the same
+  session timeline; a partial tail is never returned as the result. Two
+  deliberate rules: thinking always streams, but **content streams live only
+  when the client sent no `tools`** — otherwise a tool_calls reply would also
+  leak as user-visible text. If the SSE tail cannot start, it falls back to the
+  blocking result fanned out as chunks, so `stream_mode: buffered` and the
+  fallback are the same code path.
+- **`reasoning_effort` → `variant`.** The one request-level knob the serve API
+  honors. `server_routes._parse_reasoning_effort` lifts `reasoning_effort`
+  (string) or `reasoning.effort` from the OpenAI body and validates it against
+  the built-ins `none/minimal/low/medium/high/xhigh`, and the completion path
+  forwards it as the `variant` on the session's model select. An unknown value
+  is warned-and-dropped (`_extract_passthrough`), then falls back to one
+  variant-less resend instead of failing the turn. `temperature` has no field
+  upstream on v2, so it stays warn-and-drop like the web providers.
+- **Tool access is the managed permission map, and nothing else.** v2 has no
+  message-level `tools` map — the prompt body is `{text}` and nothing else — so
+  the map in `managed_serve.managed_config_content` (`read: allow`;
+  `edit`/`bash`/`webfetch`/`external_directory`: `deny`, globally and on the
+  agent) is the single layer that bounds what the model may call. The free-tier
+  gatekeeper survives only as a terminal classification
+  (`protocol.is_free_tier_error` → `OPENCODE_FREE_TIER_DENIED`); the
+  declare-the-native-keys trick that used to ride the message body is history.
 - **Control plane and terminal errors.** Every serve request carries
   `User-Agent` (`opencode/<cli version>`), `x-opencode-client` (default `cli`),
   `x-opencode-project` (default `global`) and `X-Session-ID`. Sessions are
-  pinned to the caller's working directory via `?directory=`
-  (`DEEPSEAPORT_OPENCODE_WORKDIR`) so native tools run where the harness
-  expects. Free-tier refusals surface as terminal `OPENCODE_FREE_TIER_DENIED`
-  (no retry) with an upgrade hint; serve-down becomes 502 + an actionable hint.
-  Retry table is overload-only (there are no accounts to fail over to) plus one
-  inline stale-session recreate outside the budget.
-- **Model catalogue.** 8 static entries in `providers/opencode/models.py`: seven
-  named `*-free` plus `opencode/big-pickle`, which is *not* a `-free` id.
+  pinned to the caller's working directory via `location.directory` on session
+  create (`DEEPSEAPORT_OPENCODE_WORKDIR`) so native tools run where the harness
+  expects; v2 has no `?directory=` query. Client failures are `RuntimeError`s
+  with a code prefix the classifier reads (`OPENCODE_SERVE_DOWN`,
+  `OPENCODE_HTTP_<status>`, `OPENCODE_UPSTREAM`, `OPENCODE_EMPTY`,
+  `OPENCODE_INVALID_SESSION`, `OPENCODE_RATE_LIMITED`,
+  `OPENCODE_FREE_TIER_DENIED`); free-tier refusals are terminal with an
+  upgrade hint and serve-down becomes 502 + an actionable hint. Retry table is
+  overload-only (there are no accounts to fail over to) plus one inline
+  stale-session recreate outside the budget.
+- **Model catalogue.** Two layers in `providers/opencode/models.py`:
+  `live_specs()` reads `GET /api/model` (thinking when an entry declares
+  `compatibility.reasoningField`; disabled and non-`active` entries dropped)
+  and `MODELS_SPEC` is the 8-entry offline fallback used when
+  no serve answers — seven `*-free` plus `opencode/big-pickle`, which is *not* a
+  `-free` id. One process-wide cache under a lock holds a success for 5 minutes
+  and a failure for 30; when nothing answers at the configured base the read
+  boots the managed serve and retries, so the catalogue does not depend on which
+  process asks. `default_model()` is the explicit
+  `opencode/muse-spark-1.3-contributor-free`, never the first catalogue key.
   `protocol.split_model` splits `providerID/modelID` at the FIRST slash, and
   `model_spec` accepts any other id containing a slash as a passthrough
-  (user-configured proxy providers on the same serve) so those work in chat,
-  while `/v1/models` serves only the static verified set. Bare
-  catalogue-unknown ids stay unknown, preserving the unknown-model 404
+  (user-configured proxy providers on the same serve) so those work in chat.
+  Bare catalogue-unknown ids stay unknown, preserving the unknown-model 404
   contract.
 
 ## Tests: what the suite does and does not prove

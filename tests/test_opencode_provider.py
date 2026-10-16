@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -10,7 +12,9 @@ from deepseaport.core import registry
 from deepseaport.providers.opencode import client as OC
 from deepseaport.providers.opencode import completion_service as OCS
 from deepseaport.providers.opencode import protocol as OP
-from deepseaport.providers.opencode.models import DEFAULT_MODEL
+from deepseaport.providers.opencode import managed_serve as MS
+from deepseaport.providers.opencode import models
+from deepseaport.providers.opencode.models import DEFAULT_MODEL, MODELS_SPEC
 from support import settings
 from functools import partial
 from deepseaport.server import create_app
@@ -79,11 +83,201 @@ def test_split_model():
     assert OP.split_model("") == ("opencode", "muse-spark-1.3-contributor-free")
 
 
+# --- the catalogue: live from the serve, static as the fallback ------------
+
+
+@pytest.fixture(autouse=True)
+def _isolate_model_cache():
+    """The catalogue cache is MODULE state; a faked read must not leak.
+
+    ``live_specs`` caches success AND failure process-wide (``_CACHE_TTL`` for
+    a catalogue, ``_FAIL_TTL`` for a miss), so without this a faked catalogue
+    would answer every later test in the run (and vice versa: a serve-down
+    cached as {} would mask a fake).
+    """
+    saved = (models._cached, models._cached_at)
+    models._cached, models._cached_at = None, 0.0
+    yield
+    models._cached, models._cached_at = saved
+
+
+def _fake_catalogue(monkeypatch, result):
+    """Stub ``client._request`` (the one HTTP seam ``live_specs`` uses)."""
+    seen: list[str] = []
+
+    def _request(method, path, body=None, timeout=20, session_id=None):
+        seen.append(f"{method} {path}")
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(OC, "_request", _request)
+    return seen
+
+
+def test_spec_from_entry_drops_what_the_operator_cannot_pick():
+    assert models._spec_from_entry("nonsense") is None
+    assert models._spec_from_entry({}) is None
+    assert models._spec_from_entry({"modelID": "m"}) is None
+    assert models._spec_from_entry({"providerID": "p"}) is None
+    # Disabled and non-active entries must not be advertised.
+    assert models._spec_from_entry(
+        {"providerID": "p", "modelID": "m", "enabled": False}) is None
+    assert models._spec_from_entry(
+        {"providerID": "p", "modelID": "m", "status": "beta"}) is None
+    assert models._spec_from_entry(
+        {"providerID": "p", "modelID": "m", "enabled": True,
+         "status": "active"}) is not None
+
+
+def test_spec_from_entry_thinking_follows_the_reasoning_field_not_variants():
+    """Only a declared reasoning field means the serve can deliver thinking.
+
+    ``variants`` alone must NOT flip it: the free zen models carry variants
+    (the reasoning-effort knobs) while ``muse-spark-1.3-contributor-free``
+    reports reasoning TOKENS and delivers no thinking text at all.
+    """
+    base = {"providerID": "zen", "modelID": "m", "status": "active"}
+    plain = models._spec_from_entry(dict(base))
+    assert plain.thinking is False and plain.owned_by == "zen"
+    assert models._spec_from_entry(
+        {**base, "compatibility": {"reasoningField": "reasoning"}}).thinking is True
+    assert models._spec_from_entry(
+        {**base, "compatibility": {}}).thinking is False
+    assert models._spec_from_entry(
+        {**base, "variants": ["low", "high"]}).thinking is False
+    assert models._spec_from_entry(
+        {**base, "variants": ["low"],
+         "compatibility": {"reasoningField": "reasoning"}}).thinking is True
+    spec = models._spec_from_entry({**base, "modelID": "sub/m"})
+    assert spec.id == "zen/sub/m"
+
+
+def test_live_specs_reads_the_serve_and_drops_unusable_entries(monkeypatch):
+    seen = _fake_catalogue(monkeypatch, (200, {"data": [
+        {"providerID": "zen", "modelID": "muse", "status": "active",
+         "compatibility": {"reasoningField": "reasoning"}},
+        {"providerID": "zen", "modelID": "off", "enabled": False},
+        {"providerID": "zen", "modelID": "beta", "status": "beta"},
+        "junk",
+    ]}))
+    specs = models.live_specs()
+    assert seen == ["GET /api/model"], seen
+    assert list(specs) == ["zen/muse"], specs
+    assert specs["zen/muse"].thinking is True
+    # The cached copy is handed out, not the caller's dict.
+    specs["zen/muse"] = None
+    assert models.live_specs()["zen/muse"] is not None
+    assert seen == ["GET /api/model"], "the second read must come from cache"
+
+
+def test_live_specs_failure_is_cached_and_never_raises(monkeypatch):
+    down = _fake_catalogue(monkeypatch, RuntimeError(
+        "OPENCODE_SERVE_DOWN: refused"))
+    assert models.live_specs() == {}
+    assert models.live_specs() == {}
+    assert down == ["GET /api/model"], "a failure must be cached for the TTL too"
+
+    # Junk and empty bodies are the same signal, not a partial catalogue.
+    for junk in ((200, {}), (200, {"data": []}), (200, {"data": "nope"}),
+                 (404, {"data": [{"providerID": "p", "modelID": "m"}]}), (200, [])):
+        models._cached, models._cached_at = None, 0.0
+        _fake_catalogue(monkeypatch, junk)
+        assert models.live_specs() == {}, junk
+
+
+def test_live_specs_failure_expires_before_a_catalogue_does(monkeypatch):
+    """A booting serve must be re-read soon; a healthy one may be trusted.
+
+    ``/api/model`` is slow on the first read of a booting serve, so caching a
+    FAILED read for the full catalogue TTL would leave /v1/models on the
+    static set for minutes right after the managed instance came up.
+    """
+    good = [{"providerID": "zen", "modelID": "m", "status": "active"}]
+    down = _fake_catalogue(monkeypatch, RuntimeError("OPENCODE_SERVE_DOWN"))
+    assert models.live_specs() == {}
+    models._cached_at = time.monotonic() - models._FAIL_TTL - 1
+    _fake_catalogue(monkeypatch, (200, {"data": good}))
+    assert list(models.live_specs()) == ["zen/m"]
+    # A real catalogue, by contrast, is reused for the long TTL.
+    up = _fake_catalogue(monkeypatch, (200, {"data": good}))
+    models._cached_at = time.monotonic() - models._FAIL_TTL - 1
+    assert list(models.live_specs()) == ["zen/m"]
+    assert up == [], "a cached catalogue must not be re-read inside _CACHE_TTL"
+
+
+def test_live_specs_boots_the_managed_serve_when_nothing_answers(monkeypatch):
+    """The list must not depend on which process asks for it.
+
+    Pre-change, any process that had not already booted a serve -- a fresh
+    ``deepseaport models``, the TUI before warmup -- read nothing and fell
+    back to the hand-written eight, so the same installation reported
+    different ids depending on who asked.
+    """
+    good = [{"providerID": "zen", "modelID": "m", "status": "active"}]
+    reads: list[float] = []
+
+    def _request(method, path, body=None, timeout=20, session_id=None):
+        reads.append(timeout)
+        if len(reads) == 1:
+            raise RuntimeError("OPENCODE_SERVE_DOWN: nothing is listening")
+        return 200, {"data": good}
+
+    monkeypatch.setattr(OC, "_request", _request, raising=False)
+    monkeypatch.setattr(MS, "ensure", lambda timeout=30.0: "http://127.0.0.1:49999")
+
+    assert list(models.live_specs()) == ["zen/m"]
+    assert len(reads) == 2, "the boot must be followed by a second read"
+    assert reads[1] >= models._BOOT_READ_TIMEOUT, (
+        "a serve that just booted needs the long budget: it builds its model "
+        "registry on the first /api/model read")
+
+    # Nothing to boot (operator's own serve is down, or the managed one is
+    # disabled): one read, then the static fallback. Never a second attempt.
+    models._cached, models._cached_at = None, 0.0
+    reads.clear()
+    monkeypatch.setattr(MS, "ensure", lambda timeout=30.0: None)
+    assert models.live_specs() == {}
+    assert len(reads) == 1, reads
+
+
+def test_provider_models_prefers_live_over_static(monkeypatch):
+    prov = registry.get("opencode")
+    _fake_catalogue(monkeypatch, (200, {"data": [
+        {"providerID": "openrouter", "modelID": "anthropic/claude-x",
+         "status": "active", "compatibility": {"reasoningField": "reasoning"}},
+    ]}))
+    ids = list(prov.models())
+    # The live set REPLACES the static eight (upstream order), it is not merged.
+    assert ids == ["openrouter/anthropic/claude-x"], ids
+    spec = prov.model_spec("openrouter/anthropic/claude-x")
+    assert spec is not None and spec.thinking is True and spec.owned_by == "openrouter"
+    # The default stays the explicit constant, not the first live key.
+    assert prov.default_model() == DEFAULT_MODEL
+    # The static set is a fallback, not a floor: with a live catalogue that
+    # omits the default, the id still resolves -- as a passthrough spec.
+    assert prov.model_spec(DEFAULT_MODEL).thinking is False
+
+
+def test_provider_models_falls_back_when_the_serve_is_down(monkeypatch):
+    prov = registry.get("opencode")
+    _fake_catalogue(monkeypatch, RuntimeError("OPENCODE_SERVE_DOWN: refused"))
+    assert dict(prov.models()) == MODELS_SPEC
+    assert prov.model_spec(DEFAULT_MODEL).thinking is True
+    # A provider/model the serve cannot advertise still passes through.
+    assert prov.model_spec("anthropic/claude-x").id == "anthropic/claude-x"
+
+
 def test_message_payload_shape():
-    body = OP.message_payload("opencode", "m", "build", "hello")
-    assert body["model"] == {"providerID": "opencode", "modelID": "m"}
-    assert body["agent"] == "build"
-    assert body["parts"] == [{"type": "text", "text": "hello"}]
+    """v2 prompt body: the text, and nothing else.
+
+    The model, its reasoning ``variant`` and the agent are SESSION-scoped
+    (``POST /api/session/:id/model`` and ``.../agent``) and native tools have
+    no per-message map at all, so the message body carries no system, no
+    model, no agent and no ``tools`` key to declare.
+    """
+    assert OP.message_payload("hello") == {"text": "hello"}
+    assert set(OP.message_payload("hello")) == {"text"}
 
 
 def test_classify_error():
@@ -168,13 +362,49 @@ def test_stream_needs_no_pool(monkeypatch):
     assert "[DONE]" in resp.text
 
 
+def test_turn_outcome_only_reads_items_after_the_prompt_id():
+    """A resend on the same session must not answer with the previous turn.
+
+    v2's variant-less resend (completion_service re-sends without the
+    ``variant``) reuses the session, so the timeline still carries the first
+    attempt's completed answer ahead of the new user item. Only what follows
+    the id the prompt returned is this turn.
+    """
+    done = {"id": "msg_a1", "type": "assistant",
+            "time": {"created": 1.0, "completed": 2.0},
+            "content": [{"type": "text", "text": "FIRST ATTEMPT"}],
+            "finish": "stop", "tokens": {"output": 3}}
+    user = {"id": "msg_u2", "type": "user", "time": {"created": 3.0}}
+
+    assert OC._turn_outcome([done, user], "msg_u2", "p", "m") == ("pending", "")
+    # With no id to anchor on, the newest completed answer is still resolved.
+    assert OC._turn_outcome([done], "", "p", "m") == ("done", {
+        "content": "FIRST ATTEMPT", "thinking": "", "usage_total": 3,
+        "finish": "stop"})
+
+
 def test_200_with_error_envelope_is_502_not_content(monkeypatch):
+    """A turn that fails on the timeline is a 502, never its content.
+
+    v2 answers the prompt 200 at once and runs the agent loop in the
+    background, so the upstream failure rides the assistant item rather than
+    a status code on the POST.
+    """
     monkeypatch.setattr(OC, "create_session", lambda timeout=20, **kw: "ses_1")
     monkeypatch.setattr(
         OC, "_request",
         lambda method, path, body=None, timeout=20, session_id=None, **kw:
-        (200, {"info": {"error": "Connection error.", "finish": "error"},
-               "parts": []}))
+        (200, {"data": {"id": "msg_u"}}) if path.endswith("/prompt") else (204, {}))
+    monkeypatch.setattr(
+        OC, "get_session_messages",
+        lambda sid, timeout=20, **kw: [
+            {"id": "msg_u", "type": "user",
+             "time": {"created": 1.0, "completed": 1.0}, "text": "hi"},
+            {"id": "msg_a", "type": "assistant",
+             "time": {"created": 1.0, "completed": 2.0}, "content": [],
+             "finish": "error", "tokens": {},
+             "error": {"type": "ProviderAuthError", "message": "Connection error."}},
+        ])
     monkeypatch.setattr(OC, "delete_session",
                         lambda sid, timeout=10, **kw: None)
     app = create_app(_settings())
