@@ -54,7 +54,11 @@ def try_parse_fence(text, valid_or_none, limit_args, forgiving_on,
             raw = None
             if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list):
                 raw = obj["tool_calls"]
-            elif isinstance(obj, dict) and obj.get("name"):
+            # Arguments/parameters key required: a fenced name-only object is
+            # an illustrative example (same guard as the bare parser), and
+            # executing it with "{}" would both fail and eat the example.
+            elif (isinstance(obj, dict) and obj.get("name")
+                  and ("arguments" in obj or "parameters" in obj)):
                 raw = [{"function": obj}]
             elif isinstance(obj, dict) and isinstance(obj.get("function"), dict):
                 raw = [obj]

@@ -85,11 +85,23 @@ def managed_enabled() -> bool:
 
 
 def _explicit_user_base() -> str:
-    """Non-empty BASE env that is not a base this module set itself."""
+    """Non-empty BASE env that is not a base this module set itself.
+
+    ``_managed_base`` alone is not enough to recognize our own base: after an
+    in-process module reload that module state is empty while the env sentinel
+    an earlier ``ensure()`` recorded (``DEEPSEAPORT_OPENCODE_MANAGED_BASE``)
+    survives. Our own dead serve then looks like an operator-pinned base,
+    ``ensure()`` no-ops, and every request 502s against a base nothing answers
+    on -- with ``serve_hint()`` telling the operator to set the variable that
+    is already set.
+    """
     raw = (os.environ.get(_BASE_ENV, "") or "").strip().rstrip("/")
-    if raw and raw != _managed_base:
-        return raw
-    return ""
+    if not raw:
+        return ""
+    sentinel = (os.environ.get(_MANAGED_BASE_SENTINEL, "") or "").strip().rstrip("/")
+    if raw == _managed_base or (sentinel and raw == sentinel):
+        return ""
+    return raw
 
 
 def managed_base_dir() -> Path:
@@ -138,15 +150,23 @@ def managed_config_content() -> str:
     ``agents``, ``prompt`` to ``system``, ``bash`` to ``shell``); the
     permission map below is the ONLY thing that bounds what the model may
     call on v2, since v2 has no per-message tool map left to override it.
-    bash is DENIED for the reason that map exists at all: a prompt-injection
-    chain must not be able to run commands in a process that holds the
-    operator's env (see _child_env) and cwd. The agent prompt forces
-    text-only output so the harness (e.g. pi) owns execution; sessions are
-    pinned to the caller's workdir via the create body's
-    ``location.directory`` (see protocol.session_directory).
+    read/glob/grep are DENIED for the same reason bash is: sessions are rooted
+    at the operator's cwd (``protocol.session_directory``), which can be the
+    repo root or dist/, so ``config.json`` -- account emails, plaintext
+    passwords and bearer tokens -- sits inside the session directory, and a
+    native read (or a grep over it) is a credential leak. editing,
+    webfetch and external_directory access are denied with them, and
+    ``subagent`` (opencode's ``task`` tool) is denied because a spawned agent
+    carries its OWN permission set -- the built-in explore agent allows
+    read/grep/glob -- so it would otherwise bypass this map. Keys are tool
+    names: write/patch normalize to edit and task to subagent, so this set
+    covers every read-like default tool. The agent prompt forces text-only
+    output so the harness (e.g. pi) owns execution; sessions are pinned to the
+    caller's workdir via the create body's ``location.directory``.
     """
-    perms = {"read": "allow", "edit": "deny", "bash": "deny",
-             "webfetch": "deny", "external_directory": "deny"}
+    perms = {"read": "deny", "glob": "deny", "grep": "deny",
+             "edit": "deny", "bash": "deny", "webfetch": "deny",
+             "external_directory": "deny", "subagent": "deny"}
     cfg = {
         "$schema": "https://opencode.ai/config.json",
         "instructions": [],
@@ -254,6 +274,32 @@ def _probe(base: str, password: str, timeout: float = 2.0) -> bool:
         return isinstance(json.loads(raw), dict)
     except Exception:
         return False
+
+
+# A single 2 s probe is not proof of death: a busy serve (loaded box, a wedged
+# agent loop) can miss it while answering another request. Both preserve
+# decisions in ensure() run under _lock, so retrying the probe adds at most a
+# few seconds once on the genuinely-dead path and never on the hot path.
+_PROBE_ATTEMPTS = 3
+_PROBE_PAUSE = 1.0
+
+
+def _probe_alive(base: str, password: str, attempts: int = _PROBE_ATTEMPTS,
+                 timeout: float = 2.0) -> bool:
+    """Retried :func:`_probe`: True as soon as one attempt succeeds.
+
+    ensure() may only reap or replace a previous serve after this confirms
+    death -- reaping on one missed 2 s probe killed every in-flight turn on a
+    live-but-busy serve. ``_PROBE_PAUSE`` is module state (not a default
+    argument) so tests can zero it. Never raises.
+    """
+    attempts = max(1, int(attempts))
+    for attempt in range(attempts):
+        if _probe(base, password, timeout=timeout):
+            return True
+        if attempt + 1 < attempts:
+            time.sleep(_PROBE_PAUSE)
+    return False
 
 
 def _read_port_file(port_file: Path) -> tuple[str, str, int, str]:
@@ -703,10 +749,11 @@ def _reap_previous_child(recorded_pid: int = 0) -> None:
     ``_proc`` is the only handle ``shutdown()`` and the ``atexit`` hook know,
     so the ``_proc = proc`` assignment at the end of :func:`ensure` makes the
     previous child unreachable the moment a new instance boots. The scenario
-    is not exotic: the reuse probe is a 2 s ``GET /api/info``, so an
-    *unresponsive* -- not dead -- serve (a loaded box, a wedged agent loop)
-    misses it, and ensure() boots a fresh instance on a new free port. The
-    orphan then keeps its port, its ``work/`` cwd and its per-boot basic-auth
+    is not exotic: the reuse probe is a retried 2 s ``GET /api/info``
+    (:func:`_probe_alive`), so an *unresponsive* -- not dead -- serve (a loaded
+    box, a wedged agent loop) can still miss every attempt and ensure() then
+    boots a fresh instance on a new free port. The orphan then keeps its port,
+    its ``work/`` cwd and its per-boot basic-auth
     password for the life of the bridge, serving an instance (with the
     managed agent's ``bash: "deny"`` map) that nothing can reach or shut down
     again -- and ``ensure()`` runs from every serve-down error path
@@ -808,7 +855,7 @@ def ensure(timeout: float = 30.0) -> str | None:
             paths = write_isolated_files(base_dir)
             wanted_hash = _config_hash()
             if (_managed_base and _managed_password
-                    and _probe(_managed_base, _managed_password)):
+                    and _probe_alive(_managed_base, _managed_password)):
                 return _managed_base
             old_base, old_password, old_pid, old_hash = _read_port_file(
                 paths["port_file"])
@@ -817,7 +864,7 @@ def ensure(timeout: float = 30.0) -> str | None:
             # would fail the identity gate on a now-dead process and log a
             # misleading "not signalling it" warning).
             old_pid_reaped = False
-            if old_base and old_password and _probe(old_base, old_password):
+            if old_base and old_password and _probe_alive(old_base, old_password):
                 if not wanted_hash or old_hash == wanted_hash:
                     _managed_base, _managed_password = old_base, old_password
                     os.environ[_BASE_ENV] = old_base

@@ -15,6 +15,9 @@ network, no credentials, no browser.
 * E5 the buffered stream watchdog was sized from ONE socket read, so a
   healthy-but-slow producer was killed with "upstream timed out" and its
   valid answer discarded.
+* E7 the consumer applied that same one-read budget to the LAST mode that
+  could not afford it -- live -- before the first payload, where no delta
+  exists yet to reset the clock.
 * E6 only the ``overload`` retry row was gated on "no live delta has left",
   so a pow/session/token/waf failure AFTER a partial emit re-POSTed the same
   payload (upstream appended a turn) and re-streamed from delta 0 into a
@@ -582,6 +585,81 @@ def test_live_mode_watchdog_is_unchanged(monkeypatch, tmp_path):
     assert body.rstrip().endswith("data: [DONE]")
 
 
+# --- E7: the first-payload wait covers producer setup in live mode -----------
+
+
+class _DelayedQueue:
+    """``asyncio.Queue`` stand-in with a per-call (delay, item) script.
+
+    The last script entry repeats, so a long delay on the tail models a queue
+    that never speaks again; ``wait_for`` cancels the sleep at the budget,
+    which is exactly what the watchdog is for. Delays only have to sit on the
+    right side of the budget -- no wall-clock equality is asserted anywhere.
+    """
+
+    def __init__(self, script: list[tuple[float, tuple]]) -> None:
+        self.calls = 0
+        self._script = list(script)
+
+    async def get(self):
+        delay, item = self._script[min(self.calls, len(self._script) - 1)]
+        self.calls += 1
+        await asyncio.sleep(delay)
+        return item
+
+
+async def _drain_q(q, timeout: float) -> list[bytes]:
+    """Run the real shared consumer (live) over a queue stand-in."""
+    return [f async for f in _engine.drain_stream_queue(
+        q, {}, True, "cid", 0, "m", timeout)]
+
+
+def test_live_first_payload_wait_covers_producer_setup():
+    """E7a. Pre-change: every live get waited ONE read. Nothing resets the
+    clock before the first delta, yet the producer is doing the same setup +
+    recovery work buffered mode is credited 3x for (``new_stream_context``'s
+    own note: a ~180s browser login refresh plus a 90s login can exceed the
+    single-read budget), so a healthy-but-slow live stream was killed with
+    "upstream timed out" and its answer discarded.
+
+    timeout 0.25s -> old budget 0.25s, new first-payload budget 0.75s; the
+    first item lands at 1.5x (0.375s), strictly between them with a wide
+    margin on both sides. The second (done) item is immediate, so the fix must
+    not slow the happy path.
+    """
+    timeout = 0.25
+    q = _DelayedQueue([(0.375, ("content", "late")), (0.0, ("done", {}))])
+    body = sse_text(asyncio.run(_drain_q(q, timeout)))
+
+    assert "late" in body, \
+        "watchdog killed a live stream before its first delta: " + body
+    assert "upstream timed out" not in body, body
+    assert body.count("data: [DONE]") == 1, body
+    assert q.calls == 2, q.calls
+
+
+def test_live_watchdog_still_fires_after_the_first_payload():
+    """E7b. The bigger first wait must not leak into the rest of the stream:
+    once a payload has landed, only genuine silence is bounded and the timeout
+    path stays the old one (error frame + exactly one [DONE] + return).
+
+    First item immediate, second wait never resolves: the frame must arrive at
+    the PLAIN budget, and the 30s park must never elapse.
+    """
+    timeout = 0.2
+    q = _DelayedQueue([(0.0, ("content", "x")), (30.0, ("done", {}))])
+    started = time.monotonic()
+    body = sse_text(asyncio.run(_drain_q(q, timeout)))
+    elapsed = time.monotonic() - started
+
+    assert "x" in body, body
+    assert '"upstream timed out"' in body, body
+    assert body.count("data: [DONE]") == 1, body
+    assert body.rstrip().endswith("data: [DONE]")
+    # Hang guard for the parked second wait, not a timing assertion.
+    assert elapsed < 5.0, elapsed
+
+
 # --- E6: no retry row fires once a live delta reached the client -------------
 
 
@@ -703,3 +781,74 @@ def test_no_qwen_retry_row_re_attempts_after_a_partial_live_emit(
     assert attempt.calls["n"] == 1, (
         f"{error_text!r} re-POSTed after output already reached the client: "
         f"{attempt.calls['n']} attempts, so the client reads a duplicate")
+
+
+# --- allow_failover=False: one attempt, one release, no acquire -------------
+
+
+class _RecordingPool:
+    """``len`` > 1 so an ignored single-account flag WOULD try to fail over."""
+
+    def __init__(self) -> None:
+        self.acquires: list[float] = []
+
+    def __len__(self) -> int:
+        return 2
+
+    def acquire(self, timeout):
+        self.acquires.append(timeout)
+        return object()
+
+
+def test_allow_failover_false_releases_once_and_reraises():
+    """Pre-change this branch had no engine-level test: the only tests of the
+    flag mock ``_complete_with_failover_sync`` away, so nothing pinned that a
+    retryable error on the pinned account still releases its slot and
+    propagates instead of failing over.
+
+    The acquire recorder is the discriminating assertion: if the flag were
+    ignored, a 2-account pool would acquire and re-run ``_run_once`` before
+    giving up, and both the calls and the released list would show the second
+    item.
+    """
+    item = object()
+    pool = _RecordingPool()
+    released: list[object] = []
+    calls: list[object] = []
+
+    def _run_once(account):
+        calls.append(account)
+        raise HTTPException(status_code=503, detail="overloaded")
+
+    with pytest.raises(HTTPException) as exc_info:
+        _engine.run_with_failover(
+            pool, item, _run_once,
+            is_retryable_exc=lambda _e: True,
+            acquire=pool.acquire,
+            allow_failover=False,
+            release=released.append,
+        )
+
+    assert exc_info.value.status_code == 503
+    assert calls == [item], "allow_failover=False runs the pinned item once"
+    assert released == [item], "release must fire exactly once with the item"
+    assert pool.acquires == [], "allow_failover=False must never acquire"
+
+
+def test_allow_failover_false_releases_once_on_success():
+    """The success path of the same branch: one release, no acquire."""
+    item = object()
+    pool = _RecordingPool()
+    released: list[object] = []
+
+    result = _engine.run_with_failover(
+        pool, item, lambda _account: "ok",
+        is_retryable_exc=lambda _e: True,
+        acquire=pool.acquire,
+        allow_failover=False,
+        release=released.append,
+    )
+
+    assert result == "ok"
+    assert released == [item], "release must fire exactly once with the item"
+    assert pool.acquires == [], "allow_failover=False must never acquire"

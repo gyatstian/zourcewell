@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -407,8 +408,19 @@ class ObscuraBridge:
             except Exception:
                 return ""
 
-    def cookie_header(self) -> str:
-        return "; ".join(f"{k}={v}" for k, v in self.state.cookies.items())
+    def cookie_header(self, names: "Iterable[str] | None" = None) -> str:
+        """Join the jar as a Cookie header, optionally filtered to ``names``.
+
+        ``None`` ships every cookie (the historical behavior). A name
+        allowlist exists because the jar is ONE upstream's WAF session: a
+        caller talking to a different host must not hand it cookies it never
+        issued. Jar order is preserved.
+        """
+        if names is None:
+            return "; ".join(f"{k}={v}" for k, v in self.state.cookies.items())
+        wanted = set(names)
+        return "; ".join(f"{k}={v}" for k, v in self.state.cookies.items()
+                         if k in wanted)
 
     def has_waf_token(self) -> bool:
         return "aws-waf-token" in self.state.cookies

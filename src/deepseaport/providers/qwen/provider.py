@@ -27,6 +27,10 @@ class QwenProvider(Provider):
     id = "qwen"
     display_name = "Qwen"
 
+    # Consumes its own acw_tc cache (prime/fetch on the qwen host), never the
+    # bridge's jar: the shared bridge jar is warmed against the DeepSeek host.
+    needs_waf_jar = False
+
     def models(self) -> dict[str, ModelSpec]:
         """Return a copy of the Qwen model catalogue."""
         return dict(MODELS_SPEC)
@@ -76,26 +80,17 @@ class QwenProvider(Provider):
                 QC.prime_qwen_bridge(bridge)
             except Exception:
                 pass
+            # UA only: the bridge's jar is the DeepSeek-host WAF jar, so it
+            # must not ride a request to chat.qwen.ai. Qwen cookies are the
+            # local cache harvested from the qwen host by the prime above.
             try:
                 ua = bridge.state.user_agent
-                cookies = bridge.cookie_header()
-            except OSError as exc:
-                if QC._is_winerror5(exc):
-                    try:
-                        desc = P.describe_cookies({})
-                        logger.warning(
-                            "qwen warmup WinError5 cookie_names=%s "
-                            "has_token=%s has_acw_tc=%s",
-                            desc["names"], desc["has_token"],
-                            desc["has_acw_tc"])
-                    except Exception:
-                        pass
-                ua, cookies = "", ""
             except Exception:
-                ua, cookies = "", ""
+                ua = ""
+            cookies = ""
             try:
                 try:
-                    cookies = QC._merged_waf_cookies(cookies or "")
+                    cookies = QC._merged_waf_cookies("")
                 except Exception:
                     pass
                 QC.fetch_models(

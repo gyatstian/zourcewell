@@ -80,10 +80,12 @@ Five rules keep that table from lying to the client:
   already worked that way, so both **web** upstreams now agree. An
    account is marked banned only on real ban evidence — ban/mute wording or an
    explicit mute flag, confirmed by the `users/current` / `GET /api/v2/auths/` /
-   `GET /api/v1/auths/` probe (`_probe_ban`). An invalid token can never prove a
-   ban; only the upstream (or its page) can. Before this, one transient 401
-   wrote `banned: true` into config.json permanently and answered 403 with ban
-   wording.
+   `GET /api/v1/auths/` probe (`_probe_ban`). On the login page a single frame
+   with ban wording is only a hint appended to the detail: both browser drivers
+   require two consecutive ban frames before reporting `banned=True`. An
+   invalid token can never prove a ban; only the upstream (or its page) can.
+   Before this, one transient 401 wrote `banned: true` into config.json
+   permanently and answered 403 with ban wording.
 - **A failed recovery step never converts a retryable error into a 500.**
   Every `recover()` runs through `core.engine._run_recovery`, which contains
   the exception, logs the **scrubbed** reason at warning, stops escalating *that*
@@ -118,7 +120,13 @@ Five rules keep that table from lying to the client:
   alone is ~180 s). `new_stream_context(..., buffered=True)` multiplies the
   consumer budget by `_BUFFERED_PRODUCER_READS` (3: the attempt plus
   setup and one full recovery pass of headroom); live passes `False` and
-  keeps the single-read budget exactly. Sizing buffered off one read killed
+  keeps the single-read budget once a payload has arrived, since every delta
+  resets the clock. The FIRST `get` is widened in both modes:
+  `drain_stream_queue` waits `consumer_timeout × _BUFFERED_PRODUCER_READS`
+  until the first event (no mode has a payload yet, and the producer runs
+  the same session + PoW + recovery work either way), so buffered waits up
+  to 9 reads for the first event and live up to 3; after that the 3-read and
+  1-read budgets above apply. Sizing buffered off one read killed
   healthy-but-slow upstreams with a client-visible timeout and discarded a
   valid answer.
 
@@ -238,7 +246,10 @@ never had one (OpenAI types it as optional).
 - Missing-token accounts are not browser-logged-in on the first API request;
   they surface a fast 401 and `_complete_with_failover_sync` can move to the
   next account that already has a token. Expired tokens still get one Obscura
-  refresh attempt, with login backoff after captcha/credential failure.
+  refresh attempt, with login backoff after captcha/credential failure. A
+  real-browser captcha or no-token exit is not a verdict: `browser_login` falls
+  back to the Obscura driver on it — only a produced token or a confirmed ban
+  ends the login attempt.
 - Old/stale tokens fail with `40003 Authorization Failed` at session create.
 - `POST /v1/accounts/unblock` (and `deepseaport accounts unblock [identifier]`)
   clears the in-memory cooldown and the persisted ban marker.
@@ -250,9 +261,10 @@ are exactly what `AccountConfig.identifier` produces and what
 `GET /v1/accounts` returns: the account's `email`, its `mobile`, or the
 `token[:10] + "..."` short form (e.g. `abcdef0123...`).
 
-Anything that looks like a bearer token — 32+ characters of `[A-Za-z0-9_-]`
-(`server_routes.py:70`, `_TOKEN_SHAPED_RE`) — is refused with **400** by
-`_reject_token_shaped_identifier` (`server_routes.py:580-597`) on every route
+Anything that looks like a bearer token — 32+ characters over the bearer/JWT
+alphabet `[A-Za-z0-9_.=-]`
+(`server_routes.py:73`, `_TOKEN_SHAPED_RE`) — is refused with **400** by
+`_reject_token_shaped_identifier` (`server_routes.py:670-686`) on every route
 that takes an identifier: `DELETE /v1/accounts/{identifier}`,
 `PUT /v1/accounts/{identifier}/token`, `POST /v1/accounts/unblock` (body) and
 `POST /v1/accounts/select` (body). The check runs *ahead of* `_check_auth` on
@@ -436,19 +448,27 @@ no search). `/v1/models` serves the union of the active providers.
   `Ctrl+C` arrives via SIGINT. Multi-worker falls back to `uvicorn.run`
   (no Esc listener — it can't reach subprocesses).
 - Port auto-fix (`server_runner._ensure_free_port`, thin-wrapped by
-  `cli._ensure_free_port`): socket pre-check; busy port scans
-  `port+1..port+50`, asks `Y/n` on a tty (auto-picks headless), writes the
-  winner to `settings.port` + `config.json`.
+  `cli._ensure_free_port`): `cli._port_number` rejects `--port` outside
+  1-65535 at parse time; `_ensure_free_port` warns and falls back to scanning
+  from 5001 for an out-of-range or non-numeric value and is the only coercion
+  point (`_run_server`, chat_ui and dry_run pass the raw value). It then runs
+  the socket pre-check, scans `port+1..port+50` when busy, asks `Y/n` on
+  a tty (auto-picks headless), and writes the winner to `settings.port` +
+  `config.json`. Out-of-range never reaches bind: `socket.bind` raises
+  OverflowError (not an OSError), which escaped as a traceback and killed the
+  TUI menu.
 - Server-with-chat (`chat_ui.py`, stdlib only): same API server in a
   background thread (`log_level=error`, `access_log=False`) + blocking
   `input()` REPL in front posting non-stream completions to
   `127.0.0.1:port` (Bearer = first `settings.keys` entry when set).
   Commands: `/model [name]`, `/clear`, `/quit|/exit`, `/help`.
 - Chat log silence: `_silence_chat_logs()` raises `deepseaport.*`,
-  `uvicorn*` and root to `ERROR` before the server thread starts, and
-  `settings.log_level` is overridden to `ERROR` in-memory (never saved) so
-  the lifespan's `apply_log_level()` stays quiet too (this is what used to
-  spray `deepseaport.obscura` warmup INFO across the `You:` line). Levels
+  `uvicorn*` and root to `ERROR` before the server thread starts, and chat mode
+  pins the runtime-only `settings._runtime_log_level = "ERROR"` — the lifespan
+  reads `_effective_log_level()` as `_runtime_log_level` > `log_level` > INFO —
+  so it stays quiet too (this is what used to spray `deepseaport.obscura`
+  warmup INFO across the `You:` line). The saved `log_level` field is never
+  touched, so an in-session save (`/model`) cannot persist the override. Levels
   are restored on every exit path, including failed start.
 - Chat model memory: `/model` persists to `settings.chat_model`
   (`config.json` + `DEEPSEAPORT_CHAT_MODEL` env); unknown/empty values fall
@@ -471,22 +491,26 @@ no search). `/v1/models` serves the union of the active providers.
   `{"value":null}`) through `tokens.py`, so broken shapes become an empty token
   instead of a mysterious 40003 later. Bans found by the server/login page are
   persisted as `banned`/`banned_until`, so CLI/TUI show `(BANNED: 16 September)`
-  even after a restart and even when the account token is missing/cleared.
+  — or a plain `(BANNED)` when `banned_until` is missing or unparsable — even
+  after a restart and even when the account token is missing/cleared.
   `use_multiple_accounts` (default true): busy/cooldown CURRENT fails over to
   another healthy account (parallel subagents); false pins requests to CURRENT.
   `listen: true` binds `0.0.0.0` (LAN); default false binds `127.0.0.1`; `--host` overrides.
 - **An unparsable `config.json` is not an empty one.** `_read_config_json`
-  (`config.py:756`) strips a leading UTF-8 BOM (what Windows editors add, and
+  (`config.py:788`) strips a leading UTF-8 BOM (what Windows editors add, and
   what `json.loads` rejects) and repairs it, but genuinely broken input —
   truncated, hand-mangled, or valid JSON of the wrong shape — is latched in
-  `_UNPARSABLE_CONFIG` and `save()` **raises** rather than writing
-  (`config.py:356`). Loading it as `{}` was how a BOM became "no accounts" and
+  `_UNPARSABLE_CONFIG` (`config.py:763`) and `save()` **raises** rather than
+  writing (`config.py:382`). Loading it as `{}` was how a BOM became "no accounts" and
   the next `save()` — any account action, any TUI toggle, any ban persist —
   rewrote the file with `"accounts": []`, destroying every email, password and
   64-char bearer token in it. The app still *starts* on a broken config (a
   loud `logger.error` says why and that nothing will be written back); it just
   refuses to persist over the file. A successful load clears the latch, so
-  fixing the file by hand restores saving. A missing or blank file is a
+  fixing the file by hand restores saving. So does a successful `save()`: the
+  refusal fires only while the broken file still exists, and without that
+  clear the delete-then-save way out would re-arm the refusal the next time a
+  save ran against the recreated file. A missing or blank file is a
   legitimate fresh install and is never latched.
 - **A present-but-empty env var is treated as absent** (`_env_str`,
   `config.py:740`). `os.environ.get("OBSCURA_BIN", raw.get("obscura_bin", ""))`
@@ -694,8 +718,10 @@ below are v2-specific. Full protocol detail lives in
   sourced `.env` would land verbatim in a process the model can be talked into
   reading via prompt injection. `~/.config/opencode`, project files and plain
   `opencode` runs are untouched. Extra workers reuse the instance through the
-  `serve.json` port file. Opt out with `DEEPSEAPORT_OPENCODE_BASE` (use your
-  own serve as-is) or `DEEPSEAPORT_OPENCODE_MANAGED=0`.
+  `serve.json` port file, and a recorded serve is reaped only after a retried
+  probe (`_probe_alive`, 3 attempts) fails — one missed probe no longer kills a
+  busy instance. Opt out with `DEEPSEAPORT_OPENCODE_BASE` (use your own serve
+  as-is) or `DEEPSEAPORT_OPENCODE_MANAGED=0`.
 - **Since v2 the serve always requires HTTP basic auth.** It generates a
   password at boot and prints it unless `OPENCODE_SERVER_PASSWORD` pins one, so
   the managed child sets that env and hands the same value to the client
@@ -712,6 +738,9 @@ below are v2-specific. Full protocol detail lives in
   session born from an empty create body answers from whatever model it happens
   to carry. An unusable model/variant is not a 4xx: it is accepted and fails
   the turn, which is why the serve's own words survive into the error text.
+  A disconnect cancels both paths the same way: `send_message` / `_await_turn`
+  take `cancel_event`, abort the session and raise the same `_StreamCancelled`
+  the live tail raises.
 - **Live streaming is real, not buffered** (this is the opencode-specific
   answer to the `stream_mode` discussion above, and the one place a provider
   does *not* use the engine's blocking producer). In `stream_mode: live`
@@ -722,12 +751,16 @@ below are v2-specific. Full protocol detail lives in
   `session.text.delta` / `session.reasoning.delta` through
   `core.engine.live_emit_pair` as they arrive. `session.execution.succeeded` /
   `.failed` ends the tail, then the authoritative result is read from the same
-  session timeline; a partial tail is never returned as the result. Two
-  deliberate rules: thinking always streams, but **content streams live only
-  when the client sent no `tools`** — otherwise a tool_calls reply would also
-  leak as user-visible text. If the SSE tail cannot start, it falls back to the
-  blocking result fanned out as chunks, so `stream_mode: buffered` and the
-  fallback are the same code path.
+  session timeline; a partial tail is never returned as the result. Only socket
+  timeouts are tolerated in the SSE read loop — any other read failure records
+  `SSE_READ`, stops the reader and surfaces terminally unless the timeline read
+  shows the turn completed, and the wait loop no longer stalls to its deadline.
+  The consumer watchdog is sized from `P.opencode_timeout`, the same env knob
+  the producer runs under. Two deliberate rules: thinking always streams, but
+  **content streams live only when the client sent no `tools`** — otherwise a
+  tool_calls reply would also leak as user-visible text. If the SSE tail cannot
+  start, it falls back to the blocking result fanned out as chunks, so
+  `stream_mode: buffered` and the fallback are the same code path.
 - **`reasoning_effort` → `variant`.** The one request-level knob the serve API
   honors. `server_routes._parse_reasoning_effort` lifts `reasoning_effort`
   (string) or `reasoning.effort` from the OpenAI body and validates it against
@@ -738,9 +771,12 @@ below are v2-specific. Full protocol detail lives in
   upstream on v2, so it stays warn-and-drop like the web providers.
 - **Tool access is the managed permission map, and nothing else.** v2 has no
   message-level `tools` map — the prompt body is `{text}` and nothing else — so
-  the map in `managed_serve.managed_config_content` (`read: allow`;
-  `edit`/`bash`/`webfetch`/`external_directory`: `deny`, globally and on the
-  agent) is the single layer that bounds what the model may call. The free-tier
+  the map in `managed_serve.managed_config_content` (`read`/`glob`/`grep`/
+  `subagent` and `edit`/`bash`/`webfetch`/`external_directory`, all `deny`,
+  globally and on the agent) is the single layer that bounds what the model
+  may call. `read`-like tools are denied because sessions are rooted at the
+  operator's cwd, where `config.json` can sit, and `subagent` because a
+  spawned agent carries its own permission set. The free-tier
   gatekeeper survives only as a terminal classification
   (`protocol.is_free_tier_error` → `OPENCODE_FREE_TIER_DENIED`); the
   declare-the-native-keys trick that used to ride the message body is history.

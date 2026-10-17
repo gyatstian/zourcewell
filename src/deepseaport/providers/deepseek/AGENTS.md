@@ -33,6 +33,10 @@ login, and a `{p,v}` SSE continuation protocol.
 - Direct username/password POSTs are fingerprint-gated (`RISK_DEVICE_DETECTED`). The login runs through a browser. Obscura's no-render engine cannot initialize the Shumei `fp.min.js` SDK, so the sign-in posts `device_id: null` and DeepSeek rejects it; `real_browser.py` drives a real Chromium-family browser over CDP, where the SDK initializes. Obscura stays the WAF and hot-path engine either way.
 - `login_policy.py` is the single source of page semantics for both drivers: selectors, phrase lists, visibility and snapshot JS, poll and timeout constants, text collapse, classify and verdict helpers. Transport stays driver-specific (MCP tools versus a CDP websocket).
 - `_invalid_token_401_detail` and `_refresh_token_via_obscura` scrub upstream text before slicing.
+- Ban helpers never raise. `_as_float` scales a millisecond `mute_until` (>1e10) to seconds and drops non-finite/out-of-range values to unknown expiry; `format_ban_day_month` / `format_ban_datetime` return "" (and `ban_message` says "(expiry unknown)") when the timestamp is unusable, while `format_ban_label` degrades to a plain "(BANNED)". `parse_ban_until` requires a day ("September 2026" → None), accepts the comma day-first Polish form, and adds +1 year only when the page gave no explicit year.
+- [PERM] A login-page ban takes two consecutive ban frames; one sighting is a detail-only hint (`_BAN_HINT_SUFFIX`), never a `banned` verdict. Captcha, credential and no-token exits are banned=False, so `browser_login` still falls back to the Obscura driver; only a produced token or a confirmed ban ends the login attempt.
+- `classify_error` checks rate-limit before overload: "429 ... try again" is the terminal 429, not retryable overload.
+- The token-refresh singleflight persists a completed login and wakes followers before any cancellation raise; a follower returns a token only when it actually changed from the one it held.
 
 ## Work Guidance
 

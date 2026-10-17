@@ -614,7 +614,9 @@ def stream_completion(headers: dict, payload: dict,
     Caller must close on break. Maps: 200+HTML challenge -> WAF_CHALLENGE
     error event; 200+JSON biz error -> envelope error (with ban_until from
     the shared detect_ban verdict when the envelope carries a ban signal);
-    non-200 -> build_http_error_event; else SSE parse via QwenStreamParser.
+    200+non-SSE empty body -> UPSTREAM_ERROR (a drained stream must never be
+    re-iterated); non-200 -> build_http_error_event; else SSE parse via
+    QwenStreamParser.
     """
     _ensure_token_cookie(headers)
     resp = _SESSION.post(_with_chat_id(P.CHAT_COMPLETIONS_URL, payload),
@@ -669,6 +671,15 @@ def stream_completion(headers: dict, payload: dict,
         except Exception:
             pass
         T.close_quietly(resp)
+        # The drain above consumed the only body this response has: falling
+        # through to the SSE pump iterated a drained, closed curl_cffi stream
+        # a SECOND time, which never yields EOF and never raises -- the worker
+        # parked forever and its account slot was never released (reproduced
+        # against curl_cffi 0.16.3).
+        yield StreamEvent(
+            kind="error", code="UPSTREAM_ERROR",
+            message="empty non-SSE 200 body")
+        return
     if resp.status_code != 200:
         event = T.build_http_error_event(resp, payload, _FORBIDDEN_CODES)
         T.close_quietly(resp)

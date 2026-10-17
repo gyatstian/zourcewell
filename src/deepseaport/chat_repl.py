@@ -18,7 +18,6 @@ DEFAULT_MODEL = "deepseek-flash"
 # Server's upstream stream timeout is 300s; chat needs headroom for
 # session+PoW (~1s) so the client doesn't time out just as the server finishes.
 COMPLETION_TIMEOUT = 330
-READY_TIMEOUT = 20
 
 # All loggers that can write to the console while chatting. Background
 # INFO/WARNING records interleave with the input() line and corrupt it,

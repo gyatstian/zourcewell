@@ -392,11 +392,36 @@ def prompt_async(session_id: str, provider_id: str, model_id: str,
     return str(inner.get("id") or "")
 
 
+def _raise_cancelled() -> None:
+    """Raise the stream-cancellation sentinel (client disconnect).
+
+    ``server_concurrency`` owns the class the routes catch; the lazy import
+    keeps this module importable without it, and the local fallback is the
+    pre-existing "cannot happen" guard. Every cancel path raises through here
+    so buffered and live turns surface the SAME exception type.
+    """
+    try:
+        from ...server_concurrency import _StreamCancelled as _Cancelled
+    except Exception:  # pragma: no cover
+        class _Cancelled(Exception):  # type: ignore[no-redef]
+            pass
+
+    raise _Cancelled()
+
+
 def _await_turn(session_id: str, user_id: str, provider_id: str,
-                model_id: str, timeout: float) -> dict:
-    """Poll the timeline until this turn finishes, fails or times out."""
+                model_id: str, timeout: float,
+                cancel_event=None) -> dict:
+    """Poll the timeline until this turn finishes, fails or times out.
+
+    Cancellation aborts the session and raises (like the live path); the
+    ``_POLL_INTERVAL`` poll bounds how late a cancel lands.
+    """
     deadline = time.monotonic() + max(5.0, float(timeout))
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            abort_session(session_id)
+            _raise_cancelled()
         items = get_session_messages(session_id, timeout=20)
         outcome, payload = _turn_outcome(items, user_id, provider_id, model_id)
         if outcome == "done":
@@ -419,7 +444,8 @@ def _await_turn(session_id: str, user_id: str, provider_id: str,
 def send_message(session_id: str, provider_id: str, model_id: str,
                  agent: str, prompt: str,
                  timeout: float = DEFAULT_TIMEOUT,
-                 variant: str | None = None) -> dict:
+                 variant: str | None = None,
+                 cancel_event=None) -> dict:
     """Run one turn; return {content, thinking, usage_total, finish}.
 
     Prompt, then poll: v2 returns from the prompt at once and runs the agent
@@ -427,13 +453,15 @@ def send_message(session_id: str, provider_id: str, model_id: str,
     assistant item carrying ``time.completed``. Raises RuntimeError on
     transport/upstream failure (the message carries a code prefix for the
     classifier) and ``OPENCODE_EMPTY`` on a contentless reply, so the engine
-    retries once on a fresh session.
+    retries once on a fresh session. ``cancel_event`` aborts the session and
+    raises the shared cancellation sentinel (see :func:`_raise_cancelled`).
     """
     user_id = prompt_async(
         session_id, provider_id, model_id, agent, prompt,
         timeout=min(30.0, max(5.0, float(timeout))),
         variant=variant)
-    return _await_turn(session_id, user_id, provider_id, model_id, timeout)
+    return _await_turn(session_id, user_id, provider_id, model_id, timeout,
+                       cancel_event=cancel_event)
 
 
 def stream_message(session_id: str, provider_id: str, model_id: str,
@@ -525,9 +553,19 @@ def stream_message(session_id: str, provider_id: str, model_id: str,
                         break
                     try:
                         chunk = resp.read(1)
-                    except Exception:
+                    except TimeoutError:
                         # Socket timeout: re-check stop conditions, keep going.
+                        # (Since 3.10 socket.timeout IS TimeoutError; anything
+                        # else is a real mid-stream failure, below.)
                         continue
+                    except Exception as exc:
+                        # A reset/EOF mid-stream is not a timeout: swallowing
+                        # it here spun this loop at 100% CPU and left the wait
+                        # below blind until its deadline. Surface it instead;
+                        # the final timeline read still wins if the turn
+                        # actually completed.
+                        _sse_error.append(f"SSE_READ: {exc}"[:300])
+                        break
                     if not chunk:
                         break
                     buf += chunk
@@ -581,13 +619,11 @@ def stream_message(session_id: str, provider_id: str, model_id: str,
             except Exception:
                 pass
             _stop_reader.set()
-            try:
-                from ...server_concurrency import _StreamCancelled as _Cancelled
-            except Exception:  # pragma: no cover
-                class _Cancelled(Exception):  # type: ignore[no-redef]
-                    pass
-
-            raise _Cancelled()
+            _raise_cancelled()
+        if _sse_error and not _idle.is_set():
+            # The reader died mid-stream with an error recorded (do NOT set
+            # _idle): stop waiting now instead of stalling to the deadline.
+            break
         if _idle.is_set():
             break
         time.sleep(0.05)
@@ -598,13 +634,7 @@ def stream_message(session_id: str, provider_id: str, model_id: str,
         pass
 
     if _cancelled():
-        try:
-            from ...server_concurrency import _StreamCancelled as _Cancelled2
-        except Exception:  # pragma: no cover
-            class _Cancelled2(Exception):  # type: ignore[no-redef]
-                pass
-
-        raise _Cancelled2()
+        _raise_cancelled()
     # Authoritative final: this turn's completed assistant item (covers
     # multi-step tool loops; deltas already streamed live via callbacks).
     items = get_session_messages(session_id, timeout=20)

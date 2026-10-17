@@ -166,10 +166,9 @@ def _is_upstream_invalid_error(error: str | None) -> bool:
 def classify_error(error: str | None) -> RetryKind | None:
     """Map an attempt error string to its retry/terminal kind.
 
-    Order matches the historical retry loops (pow -> session -> token ->
-    waf -> overload) then the terminal ladder (ban -> rate-limit ->
-    overload -> upstream-invalid -> upstream). Returns None only when there
-    is no error text to classify.
+    Order: pow -> session -> token -> waf -> rate-limit -> overload -> ban ->
+    401 -> upstream-invalid -> upstream. Returns None only when there is no
+    error text to classify.
 
     The retry table additionally guards EVERY kind with the "partial live emit"
     flag (a re-POST plus re-stream would duplicate text); that is a
@@ -187,6 +186,13 @@ def classify_error(error: str | None) -> RetryKind | None:
         return RetryKind.INVALID_TOKEN
     if _is_waf_error(error):
         return RetryKind.WAF
+    # Rate limit BEFORE transient overload: a throttled body commonly also
+    # says "try again"/"busy" ("429 ... please try again"), and classified
+    # OVERLOAD it would be retried with a fresh PoW into the same throttle
+    # (503) instead of the terminal 429 the RATE_LIMIT row gives. Qwen's
+    # classifier orders these the same way.
+    if _is_rate_limit_error(error):
+        return RetryKind.RATE_LIMIT
     if _is_transient_overload(error):
         # Partial live emit: do not retry (would duplicate), but the
         # terminal ladder still surfaces it as 503. Signal that by
@@ -207,8 +213,6 @@ def classify_error(error: str | None) -> RetryKind | None:
     # this way; the two providers now agree.
     if "401" in low or "unauthorized" in low:
         return RetryKind.INVALID_TOKEN
-    if _is_rate_limit_error(error):
-        return RetryKind.RATE_LIMIT
     if _is_upstream_invalid_error(error):
         return RetryKind.UPSTREAM_INVALID
     return RetryKind.UPSTREAM
@@ -259,7 +263,8 @@ def _refresh_token_via_obscura(app: FastAPI, item: PooledAccount,
     ground truth from the login page suspension banner — the caller must treat
     the account as banned even when the API only ever said 40003.
     Singleflight per account: concurrent 40003s share one browser run.
-    Never raises (except _StreamCancelled when the client vanished while waiting).
+    Never raises (except _StreamCancelled when the client vanished during
+    the browser run or the wait).
     """
     cfg = item.cfg
     if not (cfg.email or cfg.mobile) or not cfg.password:
@@ -279,6 +284,11 @@ def _refresh_token_via_obscura(app: FastAPI, item: PooledAccount,
         # Chunked wait so a disconnected follower stops holding the account
         # slot instead of parking the full 180s. Leader browser run itself
         # is not killed; follower just aborts its wait promptly.
+        # Token BEFORE the wait: only a value that differs afterwards is the
+        # leader's fresh token. Returning an unchanged one as "refreshed" made
+        # the caller retry once with the same invalid token and report a
+        # misleading outcome.
+        before = (item.cfg.token or "").strip()
         deadline = time.monotonic() + 180
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -299,7 +309,8 @@ def _refresh_token_via_obscura(app: FastAPI, item: PooledAccount,
                 banned, detail = _TOKEN_REFRESH_BAN_HINT.get(key, (False, ""))
         except Exception:
             banned, detail = False, ""
-        return (fresh or None), banned, detail
+        refreshed = fresh if (fresh and fresh != before) else None
+        return refreshed, banned, detail
     # Backoff: a recent no-token login (captcha/credential) means the login
     # page is challenging this profile right now. Spawning the browser on
     # every 40003 flags it further — skip fast with the previous evidence.
@@ -320,13 +331,20 @@ def _refresh_token_via_obscura(app: FastAPI, item: PooledAccount,
         # Another request may meanwhile run an attempt on this account with
         # the stale token; it 40003s and joins this run as a follower —
         # strictly better than parking behind the leader's slot.
-        with _slot_releaser(item, cancel_event):
-            if cancel_event is not None and cancel_event.is_set():
-                raise _StreamCancelled()
-            new_token, banned, detail = _run_obscura_login(
-                app, item, settings, key)
         if cancel_event is not None and cancel_event.is_set():
             raise _StreamCancelled()
+        try:
+            with _slot_releaser(item, cancel_event):
+                new_token, banned, detail = _run_obscura_login(
+                    app, item, settings, key)
+        except _StreamCancelled:
+            # slot_releaser's reacquire check raises when the client
+            # disconnected during the browser run. The login itself is real
+            # work (up to 180s profile lock + 90s login): fall through and
+            # persist it rather than throw the token away. The new_token
+            # path re-raises below; the banned/no-token paths re-raise in
+            # the caller's post-refresh check.
+            pass
         try:
             with _TOKEN_REFRESH_LOCK:
                 _TOKEN_REFRESH_BAN_HINT[key] = (bool(banned), str(detail or ""))
@@ -346,13 +364,23 @@ def _refresh_token_via_obscura(app: FastAPI, item: PooledAccount,
             from ...accounts import set_account_token
             item.cfg.token = new_token
             try:
-                set_account_token(settings, key, new_token)
+                # Scoped to the account's own provider: settings may hold the
+                # same identity under another provider, and the unscoped first
+                # match wrote this token onto that record.
+                set_account_token(settings, key, new_token,
+                                  provider=getattr(item.cfg, "provider", "")
+                                  or "deepseek")
                 settings.save()
             except Exception as exc:
                 logger.warning("token refresh save failed for %s: %s", key, exc)
             logger.info("token refreshed via Obscura for %s", key)
             item.clear_login_backoff()
             _leave_token_refresh(key, inflight)
+            # Cancellation check AFTER persistence + wake: a disconnect must
+            # not discard a token the browser just produced. Followers were
+            # already woken with the new value in place.
+            if cancel_event is not None and cancel_event.is_set():
+                raise _StreamCancelled()
             return new_token, False, ""
         # No token, no ban page: back off the browser so repeated 40003s
         # don't hammer the challenge endpoint. Manual set-token clears it.

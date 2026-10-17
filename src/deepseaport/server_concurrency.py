@@ -248,10 +248,16 @@ def apply_log_level(level: str) -> None:
         pass
 
 
+def _effective_log_level(settings) -> str:
+    """Runtime override first, then the saved field (chat mode pins the former)."""
+    return (getattr(settings, "_runtime_log_level", None)
+            or getattr(settings, "log_level", "INFO") or "INFO")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings: Settings = app.state.settings
-    apply_log_level(getattr(settings, "log_level", "INFO"))
+    apply_log_level(_effective_log_level(settings))
     bridge = ObscuraBridge(settings.obscura_bin, settings.obscura_profile)
     app.state.bridge = bridge
     register_default_bridge(bridge)
@@ -268,8 +274,10 @@ async def lifespan(app: FastAPI):
 
 def _startup_warm(bridge: ObscuraBridge, settings=None) -> None:
     # Local-only mode (opencode CLI) needs no WAF bridge: skip the obscura
-    # warmup (and the DeepSeek PoW fallback below) when none of the active
-    # providers wants the bridge. Provider warmups still run.
+    # warmup (and the DeepSeek PoW fallback below) when no active provider
+    # consumes the bridge's harvested jar -- a qwen-only setup would otherwise
+    # boot a browser against the DeepSeek host and plant cookies qwen must
+    # never send. Provider warmups still run.
     try:
         from .core import pools as _pools_w
         from .core import registry as _reg_w
@@ -278,17 +286,17 @@ def _startup_warm(bridge: ObscuraBridge, settings=None) -> None:
         else:
             _w_ids = [_reg_w.default().id]
         # Resolve the ids ONCE and drop the unknown ones. getattr(None,
-        # "needs_bridge", True) defaulted to True, so a provider the registry
-        # does not have counted as "wants the browser" and fetched the DeepSeek
+        # "needs_waf_jar", True) defaulted to True, so a provider the registry
+        # does not have counted as "consumes the jar" and fetched the DeepSeek
         # wasm for a provider that needs neither a browser nor an account.
         _w_provs = [p for p in (_reg_w.get(pid) for pid in _w_ids)
                     if p is not None]
-        _needs_bridge = any(bool(getattr(p, "needs_bridge", True))
-                            for p in _w_provs)
+        _needs_waf_jar = any(bool(getattr(p, "needs_waf_jar", True))
+                             for p in _w_provs)
     except Exception as exc:
         logger.debug("bridge-need check unavailable, warming by default: %s", exc)
-        _needs_bridge = True
-    if _needs_bridge:
+        _needs_waf_jar = True
+    if _needs_waf_jar:
         try:
             bridge.warmup()
         except Exception as exc:
@@ -316,7 +324,7 @@ def _startup_warm(bridge: ObscuraBridge, settings=None) -> None:
         return
     except Exception as exc:
         logger.debug("provider warmup unavailable, using inline PoW: %s", exc)
-    if not _needs_bridge:
+    if not _needs_waf_jar:
         # Local-only mode: no DeepSeek PoW fallback (nothing uses it).
         return
     # Inline PoW fallback is DeepSeek-specific and lazy-imported so this

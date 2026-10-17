@@ -444,6 +444,25 @@ def test_edit_append_text_clear_empties(monkeypatch):
     assert s.append_top == ""
 
 
+# #18: printed strings must stay ASCII, not double-encoded UTF-8 mojibake
+
+def test_tui_output_has_no_double_encoded_utf8():
+    """#18: the provider gate row and the settings editor rendered garbage --
+    a double-encoded U+2014/U+2026 (bytes C3 A2 E2 82 AC followed by E2 80 9D
+    or C2 A6) while the rest of the repo uses real glyphs. TUI output is ASCII
+    on purpose: ``_elide_ids`` already notes U+2026 can blow up on a legacy
+    console codepage mid-draw.
+    """
+    source = inspect.getsource(tui)
+    assert "\u00e2\u20ac" not in source, "double-encoded UTF-8 is back in tui.py"
+
+    preview = tui._preview_append("x" * 40)
+    assert preview == "x" * 27 + "..."
+    assert all(ord(c) < 128 for c in preview)
+    multi = tui._preview_append("a b\n" + "c" * 5)
+    assert all(ord(c) < 128 for c in multi)
+
+
 def test_read_interactive_non_tty_unescapes(monkeypatch):
     import sys
 
@@ -580,6 +599,22 @@ def test_accounts_menu_offer_auto_login_confirmed(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert s.accounts[0].token == "tok-confirmed"
+
+
+def test_accounts_menu_login_ban_wording_hint_is_surfaced(monkeypatch, capsys):
+    """A no-token login whose detail carries a ban-wording hint (banned=False)
+    must print the evidence and persist nothing."""
+    s = _fresh(accounts=[AccountConfig(email="a@x.com", password="pw", token="")])
+    monkeypatch.setattr(
+        "deepseaport.providers.deepseek.auth.obscura_login_token",
+        lambda email, pw, st: (None, False,
+                               "captcha [ban wording seen: suspended]"))
+    inputs = iter(["t", "a@x.com", "", "", "b"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+    accounts_menu(s)
+    assert s.accounts[0].token == ""
+    assert s.accounts[0].banned is False
+    assert "ban wording seen" in capsys.readouterr().out
 
 
 def test_accounts_menu_set_token_literal(monkeypatch):

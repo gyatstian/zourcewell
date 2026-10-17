@@ -256,8 +256,9 @@ def _run_login(monkeypatch, tmp_path, argv_extra, provider):
     monkeypatch.setattr(reg, "get", lambda pid: _Prov())
     monkeypatch.setattr(cli_mod, "_unpack_login_token_result",
                         lambda raw: raw if isinstance(raw, tuple) else (None, False, ""))
+    # 4th arg = the provider hint the explicit --provider flag now carries.
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
-                        lambda e, p, s: ("tok1", False, ""))
+                        lambda e, p, s, prov=None: ("tok1", False, ""))
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     args = argparse.Namespace(config=cfg, email=None, password=None,
                               provider=provider)
@@ -391,8 +392,9 @@ def test_cli_login_still_reaches_deepseek_and_qwen_browsers(
     monkeypatch.setattr("getpass.getpass", lambda p="": "pw")
     monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: True)
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
-                        lambda e, p, s: seen.update(provider="deepseek",
-                                                    driver="obscura")
+                        lambda e, p, s, hint=None: seen.update(provider="deepseek",
+                                                               driver="obscura",
+                                                               hint=hint)
                         or ("tok-ds", False, ""))
 
     real_get = reg.get
@@ -402,4 +404,166 @@ def test_cli_login_still_reaches_deepseek_and_qwen_browsers(
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     assert cli_mod.cmd_login(argparse.Namespace(
         config=cfg, email="a@x.com", password="pw", provider="deepseek")) == 0
-    assert seen == {"provider": "deepseek", "driver": "obscura"}
+    assert seen == {"provider": "deepseek", "driver": "obscura",
+                    "hint": "deepseek"}
+
+
+# Finding 2: --provider must pin BOTH the driver that runs and the provider
+# the token is stored under -------------------------------------------------------
+
+def test_login_provider_flag_deepseek_pins_the_driver_hint(monkeypatch, tmp_path):
+    """Pre-change: settings.provider=qwen + ``--provider deepseek`` fell into
+    the flag-less branch, ``_obscura_login_token`` resolved settings.provider
+    and drove the QWEN signin, then stored the Qwen JWT under deepseek."""
+    import deepseaport.cli as cli_mod
+
+    seen: list = []
+
+    def _driver(e, p, s, prov=None):
+        seen.append(prov)
+        return ("ds-tok", False, "")
+
+    monkeypatch.setattr(cli_mod, "_obscura_login_token", _driver)
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [], "provider": "qwen"})
+
+    assert cli_mod.main(["--config", cfg, "login", "--email", "a@x.com",
+                         "--password", "pw", "--provider", "deepseek"]) == 0
+
+    assert seen == ["deepseek"], "the explicit provider never reached the driver"
+    acc = load_settings(cfg).accounts[0]
+    assert (acc.token, acc.provider) == ("ds-tok", "deepseek")
+
+
+def test_login_provider_flag_deepseek_never_reaches_configured_qwen(
+        monkeypatch, tmp_path):
+    """The shipped wrapper half: the Qwen registry login must not run for
+    ``--provider deepseek`` even when the config selects qwen."""
+    import deepseaport.cli as cli_mod
+    from deepseaport.core import registry as reg
+
+    calls: list = []
+    monkeypatch.setattr(
+        "deepseaport.providers.deepseek.auth.obscura_login_token",
+        lambda e, p, s: calls.append(("deepseek", e, p)) or ("ds-tok", False, ""))
+    qwen_calls: list = []
+
+    class _FakeQwen:
+        def login(self, email, password, settings):
+            qwen_calls.append(email)
+            return ("qwen-jwt", False, "")
+
+    real_get = reg.get
+    monkeypatch.setattr(reg, "get",
+                        lambda pid: _FakeQwen() if pid == "qwen" else real_get(pid))
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [], "provider": "qwen"})
+
+    assert cli_mod.main(["--config", cfg, "login", "--email", "a@x.com",
+                         "--password", "pw", "--provider", "deepseek"]) == 0
+
+    assert qwen_calls == [], "the Qwen signin ran for --provider deepseek"
+    assert calls == [("deepseek", "a@x.com", "pw")]
+    assert load_settings(cfg).accounts[0].provider == "deepseek"
+
+
+def test_login_flagless_uses_and_stamps_the_configured_qwen(monkeypatch, tmp_path):
+    """Flag-less login resolves settings.provider (qwen) and must persist the
+    SAME provider the token came from, not the DeepSeek default."""
+    import deepseaport.cli as cli_mod
+    from deepseaport.core import registry as reg
+
+    class _FakeQwen:
+        def login(self, email, password, settings):
+            return ("qwen-jwt", False, "")
+
+    real_get = reg.get
+    monkeypatch.setattr(reg, "get",
+                        lambda pid: _FakeQwen() if pid == "qwen" else real_get(pid))
+
+    def _no_ds(*a, **k):
+        raise AssertionError("the DeepSeek driver ran for a qwen login")
+
+    monkeypatch.setattr(
+        "deepseaport.providers.deepseek.auth.obscura_login_token", _no_ds)
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [], "provider": "qwen"})
+
+    assert cli_mod.main(["--config", cfg, "login", "--email", "q@x.com",
+                         "--password", "pw"]) == 0
+
+    acc = load_settings(cfg).accounts[0]
+    assert (acc.token, acc.provider) == ("qwen-jwt", "qwen")
+
+
+# Finding 2: the upsert must not cross providers (same email, two records) ------
+
+
+def _two_provider_config(tmp_path) -> str:
+    """One email on both providers: account_identity includes the provider, so
+    both records are legitimate and distinct."""
+    return write_config(tmp_path, {"keys": [], "accounts": [
+        {"email": "same@x.com", "token": "ds-old", "provider": "deepseek"},
+        {"email": "same@x.com", "token": "qw-old", "provider": "qwen"},
+    ]})
+
+
+def _qwen_login(monkeypatch, token: str) -> None:
+    import deepseaport.core.registry as reg
+
+    class _FakeQwen:
+        def login(self, email, password, settings):
+            return (token, False, "")
+
+    real_get = reg.get
+    monkeypatch.setattr(reg, "get",
+                        lambda pid: _FakeQwen() if pid == "qwen" else real_get(pid))
+
+
+def test_login_provider_flag_qwen_updates_only_the_qwen_record(
+        tmp_path, monkeypatch):
+    """Pre-change the email-only match stamped the Qwen JWT onto the
+    provider:deepseek record -- a token the DeepSeek pool would then replay."""
+    import deepseaport.cli as cli_mod
+
+    _qwen_login(monkeypatch, "qwen-jwt")
+    cfg = _two_provider_config(tmp_path)
+
+    assert cli_mod.main(["--config", cfg, "login", "--email", "same@x.com",
+                         "--password", "pw", "--provider", "qwen"]) == 0
+
+    assert {a.provider: a.token for a in load_settings(cfg).accounts} == {
+        "deepseek": "ds-old", "qwen": "qwen-jwt"}
+
+
+def test_login_provider_flag_deepseek_updates_only_the_deepseek_record(
+        tmp_path, monkeypatch):
+    """Mirror case: --provider deepseek must not touch the qwen record."""
+    import deepseaport.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_obscura_login_token",
+                        lambda e, p, s, prov=None: ("ds-new", False, ""))
+    cfg = _two_provider_config(tmp_path)
+
+    assert cli_mod.main(["--config", cfg, "login", "--email", "same@x.com",
+                         "--password", "pw", "--provider", "deepseek"]) == 0
+
+    assert {a.provider: a.token for a in load_settings(cfg).accounts} == {
+        "deepseek": "ds-new", "qwen": "qw-old"}
+
+
+def test_login_flagless_updates_only_the_settings_provider_record(
+        tmp_path, monkeypatch):
+    """The flag-less form resolves the configured provider (qwen here), so the
+    qwen record is the one it updates -- pinned so the scoping did not simply
+    move the bug to the other side."""
+    import deepseaport.cli as cli_mod
+
+    _qwen_login(monkeypatch, "qwen-jwt")
+    cfg = write_config(tmp_path, {"keys": [], "accounts": [
+        {"email": "same@x.com", "token": "ds-old", "provider": "deepseek"},
+        {"email": "same@x.com", "token": "qw-old", "provider": "qwen"},
+    ], "provider": "qwen"})
+
+    assert cli_mod.main(["--config", cfg, "login", "--email", "same@x.com",
+                         "--password", "pw"]) == 0
+
+    assert {a.provider: a.token for a in load_settings(cfg).accounts} == {
+        "deepseek": "ds-old", "qwen": "qwen-jwt"}

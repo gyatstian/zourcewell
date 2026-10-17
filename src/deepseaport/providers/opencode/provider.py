@@ -33,6 +33,9 @@ class OpencodeProvider(Provider):
     # No WAF bridge either: localhost serve needs no Obscura warmup.
     needs_bridge = False
 
+    # And nothing to do with the bridge's WAF cookie jar.
+    needs_waf_jar = False
+
     def catalogue(self) -> dict[str, ModelSpec]:
         """The live serve catalogue when there is one, else the static set.
 

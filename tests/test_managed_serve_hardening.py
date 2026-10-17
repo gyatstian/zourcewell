@@ -636,3 +636,36 @@ def test_invalid_token_401_detail_scrubs_both_branches(refreshed):
     assert "token invalid" in detail.lower()
     assert "BANNED" in detail
     assert ("after browser refresh" in detail) is refreshed
+
+
+# --------------------------------------------------------------------------
+# #19: our own recorded base must not masquerade as an operator-pinned BASE
+# --------------------------------------------------------------------------
+
+
+def test_explicit_user_base_ignores_the_modules_own_sentinel(monkeypatch):
+    """``DEEPSEAPORT_OPENCODE_MANAGED_BASE`` was written but never read.
+
+    After an in-process reload ``_managed_base``/``_managed_password`` are
+    empty while the env sentinel survives, so our own (dead) managed serve
+    looked like an operator-pinned ``DEEPSEAPORT_OPENCODE_BASE``: ``ensure()``
+    no-oped and every request 502'd with a hint telling the operator to set
+    the variable that was already set. The sentinel is normalized like BASE.
+    """
+    monkeypatch.setattr(MS, "_managed_base", "")
+    monkeypatch.setattr(MS, "_managed_password", "")
+    monkeypatch.setenv(MS._MANAGED_BASE_SENTINEL, "http://127.0.0.1:45999/")
+    monkeypatch.setenv(MS._BASE_ENV, "http://127.0.0.1:45999")
+    assert MS._explicit_user_base() == ""
+
+    # A genuinely different base is still the operator's, normalized.
+    monkeypatch.setenv(MS._BASE_ENV, " http://127.0.0.1:4999/ ")
+    assert MS._explicit_user_base() == "http://127.0.0.1:4999"
+
+    # Same-process state keeps working too (the pre-existing check).
+    monkeypatch.setattr(MS, "_managed_base", "http://127.0.0.1:45999")
+    monkeypatch.setenv(MS._BASE_ENV, "http://127.0.0.1:45999")
+    assert MS._explicit_user_base() == ""
+
+    monkeypatch.delenv(MS._BASE_ENV)
+    assert MS._explicit_user_base() == ""

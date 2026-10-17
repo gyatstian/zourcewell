@@ -55,10 +55,6 @@ LOGIN_BUTTON_SELECTOR = (
     'div[role="button"].ds-button--primary.ds-button--xl,'
     "button.ds-button--primary"
 )
-# Cookie banner: auth matched essential+all; real matched essential only.
-COOKIE_SELECTOR = (
-    ".cookie_banner-accept-essential-button, .cookie_banner-accept-all-button"
-)
 
 # --- timeouts / polling (values preserved per driver) --------------------
 LOGIN_TIMEOUT = 90.0  # Obscura/MCP driver (auth.BrowserLogin)
@@ -293,10 +289,11 @@ def parse_ban_until(text: str) -> float | None:
         low = (text or "").lower()
         day = month = year = None
         hour = minute = 0
-        # English / most locales: day month [year] [HH:MM]
+        # English / most locales: day month [year] [HH:MM]. The \D gap skips a
+        # filler before the time (Polish "o 12:49").
         m = re.search(
-            rf"(\d{{1,2}})\s+({_MONTH_RE})(?:\s+(\d{{4}}))?"
-            r"(?:\s+(\d{1,2}):(\d{2}))?",
+            rf"(?<!\d)(\d{{1,2}})(?!\d)\s+({_MONTH_RE})"
+            r"(?:\s*,?\s*(\d{4}))?(?:\D{0,6}(\d{1,2}):(\d{2}))?",
             low,
         )
         if m:
@@ -308,8 +305,8 @@ def parse_ban_until(text: str) -> float | None:
         if month is None:
             # Polish-ish: month day, year [HH:MM]
             m = re.search(
-                rf"({_MONTH_RE})\s+(\d{{1,2}})(?:,)?(?:\s+(\d{{4}}))?"
-                r"(?:\s+(\d{1,2}):(\d{2}))?",
+                rf"({_MONTH_RE})\s+(?<!\d)(\d{{1,2}})(?!\d)(?:,)?(?:\s+(\d{{4}}))?"
+                r"(?:\D{0,6}(\d{1,2}):(\d{2}))?",
                 low,
             )
             if m:
@@ -320,12 +317,12 @@ def parse_ban_until(text: str) -> float | None:
                 minute = int(m.group(5) or 0)
         if not day or not month:
             return None
+        explicit_year = year is not None
         now = _dt.datetime.now()
-        year = year or now.year
-        dt = _dt.datetime(year, month, day, hour, minute)
+        dt = _dt.datetime(year or now.year, month, day, hour, minute)
         # No explicit year and the date has already passed: assume next year.
-        if not m.group(3) and dt <= now:
-            dt = dt.replace(year=year + 1)
+        if not explicit_year and dt <= now:
+            dt = dt.replace(year=dt.year + 1)
         return dt.timestamp()
     except Exception:
         return None

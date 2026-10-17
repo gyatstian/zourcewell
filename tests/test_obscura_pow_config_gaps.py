@@ -166,6 +166,17 @@ def test_cookie_header_join(tmp_path):
     assert b.cookie_header() == ""
 
 
+def test_cookie_header_names_filter(tmp_path):
+    """``names`` selects a subset so one upstream never gets another's jar."""
+    b = _bridge(tmp_path, "hdr-filter")
+    b.state.cookies = {"a": "1", "b": "2", "aws-waf-token": "t"}
+    # Jar order preserved, allowlist order irrelevant.
+    assert b.cookie_header(names=["aws-waf-token", "b"]) == "b=2; aws-waf-token=t"
+    assert b.cookie_header(names=["b"]) == "b=2"
+    assert b.cookie_header(names=["nope"]) == ""
+    assert b.cookie_header(names=[]) == ""
+
+
 def test_has_waf_token_true_false(tmp_path):
     b = _bridge(tmp_path, "waf")
     b.state.cookies = {"a": "1"}

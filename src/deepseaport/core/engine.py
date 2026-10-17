@@ -151,7 +151,8 @@ def run_with_failover(
     acquire_timeout: float = 10,
     is_cancelled: Callable[[], bool] | None = None,
     allow_failover: bool = True,
-    release: Callable[[object], None] | None = None,
+    *,
+    release: Callable[[object], None],
 ) -> object:
     """Run ``run_once(item)`` on ``first_item``, failing over on retryable errors.
 
@@ -161,27 +162,10 @@ def run_with_failover(
     performs one attempt (including any per-kind retries); the engine only
     handles cross-account failover, cancellation, and slot lifecycle.
 
-    ``acquire`` is required: every caller already binds the pool's own
-    ``acquire``, so a default could only ever duplicate it. ``release`` still
-    defaults, because a caller that could not import ``AccountPool`` passes
-    ``None`` and needs the bare ``item.lock`` fallback.
+    ``acquire`` and ``release`` are both required: the only caller binds the
+    pool's own ``acquire`` and ``AccountPool.release``, so a default could only
+    duplicate the former or shadow the latter.
     """
-    if release is None:
-        def _default_release(item) -> None:
-            try:
-                from ..accounts import AccountPool as _Pool
-
-                _Pool.release(item)
-            except Exception:
-                try:
-                    rel = getattr(item, "lock", None)
-                    if rel is not None:
-                        rel.release()
-                except Exception:
-                    pass
-
-        release = _default_release
-
     if not allow_failover:
         try:
             return run_once(first_item)
@@ -778,7 +762,8 @@ def complete_with_failover_sync(app, pool, prep: dict, first_item,
         from ..accounts import AccountPool as _Pool
         _release = _Pool.release
     except Exception:
-        _release = None
+        # unreachable in a working install; release must still be callable.
+        _release = lambda _item: None  # noqa: E731
 
     result = run_with_failover(
         pool,
@@ -966,7 +951,8 @@ def dispatch_terminal(classify_fn: Callable[[str | None], object],
 
 # --- Stream bridge (producer/consumer shared by every provider) -------------
 
-# Read-budgets covered by the buffered consumer watchdog (see
+# Read-budgets covered by the consumer watchdog's first-payload wait (see
+# ``drain_stream_queue``) and by the buffered watchdog sizing (see
 # ``new_stream_context``): one for the attempt itself, the rest covering
 # session create + PoW solve + one recovery pass (browser login refresh /
 # Obscura warmup). Deliberately a fixed multiple, not a derived budget: the
@@ -1151,16 +1137,27 @@ async def drain_stream_queue(out: asyncio.Queue, prep: dict, live: bool,
     Buffered emits thinking + content once the whole reply lands; live
     already forwarded the deltas and only needs the close/tool tail.
     Error/timeout handling is identical. Yields SSE ``bytes`` frames.
+
+    The FIRST get is waited on with the producer-sized budget
+    (``consumer_timeout * _BUFFERED_PRODUCER_READS``): no mode has a payload
+    yet, and the producer is doing the same session + PoW + recovery work in
+    both, which can outlast a single read. From the first payload on the plain
+    ``consumer_timeout`` applies -- an event resets the clock, so it measures
+    genuine silence only.
     """
     chunk = lambda delta, finish=None: stream_chunk(cid, created, model, delta, finish)  # noqa: E731
     yield chunk({"role": "assistant"})
+    got_first = False
     while True:
+        budget = consumer_timeout if got_first else (
+            consumer_timeout * _BUFFERED_PRODUCER_READS)
         try:
-            kind, payload = await asyncio.wait_for(out.get(), timeout=consumer_timeout)
+            kind, payload = await asyncio.wait_for(out.get(), timeout=budget)
         except asyncio.TimeoutError:
             yield sse_error_frame("upstream timed out")
             yield b"data: [DONE]\n\n"
             return
+        got_first = True
         if kind == "thinking":
             yield chunk({"reasoning_content": payload})
             continue
@@ -1236,7 +1233,9 @@ def new_stream_context(stream_timeout: float,
     ``{"error": {"message": "upstream timed out"}}`` and threw away a valid
     answer. ``buffered=True`` therefore multiplies the budget by
     ``_BUFFERED_PRODUCER_READS`` (setup + one full recovery pass of headroom);
-    live mode passes ``False`` and keeps the single-read budget exactly.
+    live mode passes ``False`` and keeps the single-read budget for every get
+    AFTER the first payload. Before any payload the consumer widens the wait
+    in every mode (see ``drain_stream_queue``): live has no delta yet either.
     """
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())

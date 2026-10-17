@@ -36,6 +36,10 @@ from .login_policy import (
 
 logger = logging.getLogger("deepseaport.real_browser")
 
+# A single ban phrase in one frame is a HINT, not a verdict (see the login
+# loop); the exits that cannot report a verdict surface it in the DETAIL.
+_BAN_HINT_SUFFIX = " [ban wording seen in an earlier frame]"
+
 # Page policy (selectors, phrase lists, visibility/snapshot JS, poll/timeout
 # constants, verdict helpers) lives in ``login_policy``; the names imported
 # above are the ones this driver actually uses. The login loop classifies each
@@ -307,9 +311,9 @@ class RealBrowser:
             if token == "null":
                 token = ""
             if kind == "captcha":
-                return None, ban_hint, (
+                return None, False, (
                     f"real browser login captcha (phrase={phrase!r}): "
-                    f"{body[:300]}")
+                    f"{body[:300]}" + (_BAN_HINT_SUFFIX if ban_hint else ""))
             if kind == "ban":
                 # One sighting is a HINT, not a verdict -- same rule as the MCP
                 # driver (auth.py:267-274, ban_streak >= 2). LOGIN_BAN_PHRASES
@@ -324,7 +328,8 @@ class RealBrowser:
                 # side, so confirmation is required.
                 ban_streak += 1
                 # Sticky hint for the exits below that cannot report a verdict
-                # of their own (captcha/credential/no token): the user still
+                # of their own (captcha/credential/no token): they append it to
+                # the DETAIL, never to the banned slot -- the user still
                 # deserves to hear that ban wording was seen.
                 ban_hint = True
                 if ban_streak >= 2:
@@ -344,10 +349,12 @@ class RealBrowser:
                 # an ambiguous earlier frame must not veto a working credential.
                 return token, False, body[:800]
             if kind == "credential":
-                return None, ban_hint, (
+                return None, False, (
                     f"real browser login rejected (phrase={phrase!r}): "
-                    f"{body[:400]}")
-        return None, ban_hint, f"real browser login no token: {detail[:600]}"
+                    f"{body[:400]}" + (_BAN_HINT_SUFFIX if ban_hint else ""))
+        return None, False, (
+            f"real browser login no token: {detail[:600]}"
+            + (_BAN_HINT_SUFFIX if ban_hint else ""))
 
 
 def login_with_real_browser(email: str, password: str,

@@ -174,9 +174,12 @@ Client detection: content-type `text/html` OR body lines containing
 `protocol.is_waf_body` for the drained-body half). Engine recovery
 mirrors DeepSeek's WAF retry minus PoW: release the account slot, qwen-host
 solved fetch + `prime_waf`, recreate the chat, retry
-(`completion_service._refresh_waf_without_account_lock`). DeepSeek-host
-`bridge.warmup()` is skipped for qwen (never plants qwen cookies, WinError5
-noise on Windows).
+(`completion_service._refresh_waf_without_account_lock`). The DeepSeek-host
+`bridge.warmup()` never runs for qwen — not at startup (`needs_waf_jar`
+is `False`) and not on recovery — so there is no obscura fetch against
+chat.deepseek.com and no DeepSeek cookies planted (WinError5 noise on
+Windows). The shared bridge contributes its User-Agent only; qwen cookies
+stay in the qwen-host cache.
 
 ## Models (verified live, unauth catalogue)
 

@@ -129,12 +129,11 @@ def _headers(app: FastAPI, token: str) -> dict:
     # getattr guard: embedded/test apps may have no lifespan bridge. Missing
     # bridge must not mask the real error with AttributeError (notably from
     # the delete-chat cleanup finally, which must never replace the exception).
-    # Prefer app.state.bridge cookies directly: P.bridge_headers() reads the
-    # process default bridge, which diverges when the app bridge differs
-    # (tests, embedded, re-created lifespan). Fall back to the default bridge
-    # for out-of-server callers, else plain base (which always merges token=).
-    # Qwen-host acw_tc harvested via prime/fetch (despite discard_cookies)
-    # is merged too so Cookie carries token= + acw_tc (Bearer kept as well).
+    # The app bridge contributes its User-Agent only: its cookie jar is the
+    # DeepSeek-host WAF jar (warmup() fetches CHAT_HOME), so it must never ride
+    # a qwen request. Qwen cookies are its own qwen-host acw_tc + x-ap/sca/cna/
+    # tfstk/isg/xlly_s harvest (prime/fetch), merged below so Cookie carries
+    # token= + the jar (Bearer kept as well).
     def _with_cached(waf_cookies: str, ua: str) -> dict:
         try:
             waf_cookies = QC._merged_waf_cookies(waf_cookies or "")
@@ -150,22 +149,7 @@ def _headers(app: FastAPI, token: str) -> dict:
             bridge = None
     if bridge is not None:
         try:
-            try:
-                ua = bridge.state.user_agent
-                cookies = bridge.cookie_header()
-            except OSError as exc:
-                # WinError5 on profile dir: graceful, names-only, keep token.
-                try:
-                    _log_cookies("headers_winerror5", {"Cookie": ""})
-                except Exception:
-                    pass
-                try:
-                    logger.warning("qwen headers WinError5 (%s), "
-                                   "continuing with token only", exc)
-                except Exception:
-                    pass
-                ua, cookies = "", ""
-            return _with_cached(cookies, ua)
+            return _with_cached("", bridge.state.user_agent)
         except Exception:
             pass
     try:

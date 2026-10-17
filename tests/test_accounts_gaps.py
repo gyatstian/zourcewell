@@ -230,6 +230,32 @@ def test_remove_account_clears_current_and_missing():
     assert remove_account(s, "missing@x.com") is False
 
 
+def test_set_account_token_scoped_to_provider():
+    """Same email, two providers: the scoped write updates only its own record.
+    Pre-change the settings-wide first match wrote the token onto the other
+    provider's record as well."""
+    s = _settings(_cfg(email="same@x.com", token="ds-tok", provider="deepseek"),
+                  _cfg(email="same@x.com", token="qw-tok", provider="qwen"))
+
+    got = set_account_token(s, "same@x.com", "fresh", provider=" qwen ")
+
+    assert got is s.accounts[1]
+    assert [a.token for a in s.accounts] == ["ds-tok", "fresh"]
+    # provider=None keeps the documented first-match behaviour.
+    assert set_account_token(s, "same@x.com", "first").token == "first"
+
+
+def test_remove_account_scoped_to_provider():
+    """Same shape for the delete: ?provider=qwen used to drop the deepseek
+    record (the first settings match) while the qwen one survived."""
+    s = _settings(_cfg(email="same@x.com", token="ds-tok", provider="deepseek"),
+                  _cfg(email="same@x.com", token="qw-tok", provider="qwen"))
+
+    assert remove_account(s, "same@x.com", provider="qwen") is True
+
+    assert [(a.provider, a.token) for a in s.accounts] == [("deepseek", "ds-tok")]
+
+
 def test_ban_label_for():
     assert ban_label_for({}, "a") == (False, None)
     assert ban_label_for({"a@x.com": None}, "missing") == (False, None)

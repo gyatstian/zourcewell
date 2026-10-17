@@ -14,7 +14,7 @@ from ..common import (
     _valid_names,
 )
 from .bare import try_parse_bare
-from .dsml import try_parse_dsml
+from .dsml import _scan_dsml_calls, try_parse_dsml
 from .fence import try_parse_fence
 from .json_array import try_parse_json_array
 from .tags import try_parse_tags
@@ -93,6 +93,27 @@ def parse_tool_calls(
     return res.calls, res.rest
 
 
+def _dsml_skip_spans(text: str, forgiving_on: bool,
+                     tools: list[dict] | None) -> list[tuple[int, int]] | None:
+    """Invoke spans of this reply, so array/tag formats never read inside one.
+
+    A DSML raw value carries JSON and markup examples verbatim (that is what
+    the format is for), so a quoted ``{"tool_calls": ...}`` or
+    ``<invoke>...</invoke>`` sample inside one must not hijack the parse ahead
+    of the intended DSML call. ``_scan_dsml_calls`` normalizes fullwidth
+    brackets 1 char -> 1 char, so its spans index the original text as-is.
+
+    Only computed when the reply could contain DSML at all (same gate as
+    ``try_parse_dsml``), so a plain reply pays one substring check.
+    """
+    low = text.lower()
+    if not ("dsml" in low or "<invoke" in low
+            or (forgiving_on and "&lt;invoke" in low)):
+        return None
+    _calls, spans = _scan_dsml_calls(text, forgiving=forgiving_on, tools=tools)
+    return spans or None
+
+
 def parse_tool_calls_ex(
     text: str,
     tools: list[dict] | None = None,
@@ -114,6 +135,7 @@ def parse_tool_calls_ex(
     limit_bare = max_bare_objects if max_bare_objects is not None else MAX_BARE_OBJECTS
 
     diagnostics: list[dict] = []
+    skip_spans = _dsml_skip_spans(text, forgiving_on, tools)
     for name, _parse in _CHAIN_FNS.items():
         if name == "dsml":
             calls, rest = _parse(text, valid_or_none, limit_args, forgiving_on,
@@ -121,6 +143,9 @@ def parse_tool_calls_ex(
         elif name == "bare":
             calls, rest = _parse(text, valid, valid_or_none, limit_args,
                                  limit_bare, forgiving_on, diagnostics)
+        elif name in ("json_array", "tags"):
+            calls, rest = _parse(text, valid_or_none, limit_args, forgiving_on,
+                                 diagnostics, skip_spans=skip_spans)
         else:
             calls, rest = _parse(text, valid_or_none, limit_args, forgiving_on,
                                  diagnostics)

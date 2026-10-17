@@ -2,10 +2,12 @@
 
 import json
 import logging
+import time
 
 import pytest
 
 from deepseaport.core import tools as T
+from deepseaport.core.tools.parser.tags import _tag_spans
 
 
 # --- _int_env ---
@@ -602,3 +604,116 @@ def test_parse_tool_calls_recovers_unescaped_openai_arguments():
     assert json.loads(calls[0]["function"]["arguments"]) == {
         "filePath": "x.html", "content": "hello"}
     assert rest == ""
+
+
+# --- audit fixes: fenced examples, DSML raw values, tag scan, loose recovery --
+
+def test_fenced_name_only_example_is_not_executed():
+    """A fenced illustrative object is an example, not a call.
+
+    It used to become a tool_call with "{}" arguments (and disappear from the
+    text); the bare parser requires the arguments key for the same reason.
+    """
+    tools = [{"type": "function", "function": {"name": "read"}}]
+    text = ('Example config:\n```json\n{"name": "read", "path": "notes.md"}\n'
+            '```\nUse it as shown.')
+    calls, rest = T.parse_tool_calls(text, tools)
+    assert calls is None
+    assert rest == text
+
+
+def test_fenced_name_with_arguments_still_parses():
+    tools = [{"type": "function", "function": {"name": "read"}}]
+    text = '```json\n{"name": "read", "arguments": {"path": "notes.md"}}\n```'
+    calls, rest = T.parse_tool_calls(text, tools)
+    assert calls is not None
+    assert calls[0]["function"]["name"] == "read"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"path": "notes.md"}
+    assert rest == ""
+
+
+def _write_read_tools():
+    return [{"type": "function", "function": {"name": "write"}},
+            {"type": "function", "function": {"name": "read"}}]
+
+
+def _dsml_write(content):
+    return ('<||DSML|| invoke name="write">'
+            '<||DSML|| parameter name="content" string="true">' + content +
+            '</||DSML|| parameter></||DSML|| invoke>')
+
+
+def test_dsml_raw_value_quoting_an_array_example_not_hijacked():
+    """A DSML value is verbatim: a quoted {"tool_calls": ...} sample inside
+    it must not be parsed as the call (it used to win, and the intended
+    write call was gone)."""
+    inner = ('{"tool_calls": [{"function": {"name": "read", '
+             '"arguments": {"path": "x.md"}}}]}')
+    calls, rest = T.parse_tool_calls(_dsml_write(inner), _write_read_tools())
+    assert calls is not None and len(calls) == 1
+    assert calls[0]["function"]["name"] == "write"
+    assert json.loads(calls[0]["function"]["arguments"])["content"] == inner
+    assert rest == ""
+
+
+def test_dsml_raw_value_quoting_invoke_markup_not_hijacked():
+    inner = '<invoke>{"name": "read", "arguments": {"path": "x.md"}}</invoke>'
+    calls, rest = T.parse_tool_calls(_dsml_write(inner), _write_read_tools())
+    assert calls is not None and len(calls) == 1
+    assert calls[0]["function"]["name"] == "write"
+    assert json.loads(calls[0]["function"]["arguments"])["content"] == inner
+    assert rest == ""
+
+
+def test_array_call_outside_a_dsml_span_still_parses():
+    """The DSML skip must not reach a real call after the DSML block."""
+    text = ('<||DSML|| invoke name="read">'
+            '<||DSML|| parameter name="path" string="true">{"json": "example"}'
+            '</||DSML|| parameter></||DSML|| invoke>\n'
+            '{"tool_calls": [{"function": {"name": "write", '
+            '"arguments": {"path": "b.md"}}}]}')
+    calls, _ = T.parse_tool_calls(text, _write_read_tools())
+    assert calls is not None and calls[0]["function"]["name"] == "write"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"path": "b.md"}
+
+
+def test_unclosed_open_tag_flood_returns_fast():
+    """The lazy-body tag regex was quadratic on opens with no closes:
+    ~200KB of bare <tool_call> took minutes. The single pass is linear."""
+    tools = [{"type": "function", "function": {"name": "read"}}]
+    text = "<tool_call>" * 18_182  # ~200KB, no close tag anywhere
+    started = time.monotonic()
+    calls, rest = T.parse_tool_calls(text, tools)
+    elapsed = time.monotonic() - started
+    assert calls is None
+    assert rest == text
+    # Generous bound: pre-fix this input never finished in minutes.
+    assert elapsed < 5.0
+
+
+def test_tag_pairing_reproduces_non_greedy_semantics():
+    tools = [{"type": "function", "function": {"name": "calc"}}]
+    # Case-insensitive, cross-name pair: any of the three closes ends any
+    # of the three opens.
+    text = '<tOOl_CaLL>{"name": "calc", "arguments": {"e": "1+1"}}</invoke>'
+    calls, rest = T.parse_tool_calls(text, tools)
+    assert calls is not None and calls[0]["function"]["name"] == "calc"
+    assert json.loads(calls[0]["function"]["arguments"])["e"] == "1+1"
+    assert rest == ""
+    # An open while a pair is pending is body text, exactly like the old
+    # lazy (.*?): the second open consumes the first close, and the
+    # trailing close then pairs with nothing.
+    spans = _tag_spans('<invoke><tool_call>{"e": 2}</tool_call></invoke>')
+    assert len(spans) == 1
+    assert spans[0][0] == 0
+    assert spans[0][2] == '<tool_call>{"e": 2}'
+
+
+def test_loose_recovery_does_not_recover_array_arguments():
+    """_balanced_json balances braces only, so an array-shaped arguments
+    value is not recoverable; the damaged envelope is dropped cleanly."""
+    tools = [{"type": "function", "function": {"name": "write"}}]
+    text = ('{"tool_calls": [{"function": {"name": "write", '
+            '"arguments": [{"path": "x.md"}]')
+    assert T._recover_loose_openai_call(text, {"write"}, 200_000) is None
+    assert T.parse_tool_calls(text, tools) == (None, text)

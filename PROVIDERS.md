@@ -104,8 +104,10 @@ App shell (`server.py`, `server_routes.py`, `server_concurrency.py`, `tui.py`,
    (`AccountConfig.provider`).
 3. Model routing: `registry.resolve_model(model)` / `provider.tuple_spec()`
    map a model id to its provider; `/v1/models` serves the union.
-4. Warmup: `provider.warmup(bridge)` runs once at startup (DeepSeek prefetches
-   PoW wasm).
+4. Warmup: the shared-host Obscura warmup (`CHAT_HOME`, the DeepSeek host) runs
+   only when an active provider has `needs_waf_jar` (qwen and opencode set it
+   `False`; qwen's jar is its own qwen-host cache), and every active provider's
+   `warmup(bridge)` still runs once at startup (DeepSeek prefetches PoW wasm).
 
 ## The 403 meaning is per-provider
 

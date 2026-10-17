@@ -352,7 +352,7 @@ def _ask_password(prompt: str = "Password (Enter=skip)") -> str:
     """Hidden password prompt (no echo). Preserves inner/edge spaces.
 
     Falls back to visible _ask_raw when getpass cannot control the terminal
-    (e.g. no tty in tests) â€” getpass itself falls back to input() there,
+    (e.g. no tty in tests) — getpass itself falls back to input() there,
     so mocked builtins.input still works. On that path the secret IS echoed
     (say so, instead of silently typing a password into a shared screen or
     log) and spaces are preserved; the old _ask fallback stripped them, so
@@ -787,7 +787,7 @@ def _select_provider(settings: Settings) -> None:
             except Exception:
                 accts = []
             ntok = sum(1 for a in accts if (getattr(a, "token", "") or "").strip())
-            print(f"  {i}. {name} ({pid}) â€” {nmodels} models, "
+            print(f"  {i}. {name} ({pid}) - {nmodels} models, "
                   f"{len(accts)} accounts ({ntok} with token)")
         print()
         print("  m. Multi (all providers, one server exposes every model)")
@@ -912,17 +912,23 @@ def _ask_account_provider(settings: Settings) -> str:
 
 
 def _preview_append(value: str, width: int = 30) -> str:
-    """One-line preview so multi-line text never breaks the menu layout."""
+    """One-line preview so multi-line text never breaks the menu layout.
+
+    Elides with ASCII "..." like ``_elide_ids``: this used to carry a
+    double-encoded U+2026 (three mojibake chars, C3 A2 E2 82 AC C2 A6) that
+    rendered as garbage on screen, and ASCII is also what keeps the result
+    inside a legacy console codepage mid-draw.
+    """
     text = str(value or "")
     if not text.strip():
         return "(empty)"
     lines = text.strip("\r\n").splitlines() or [text]
     first = lines[0].strip()
     if len(first) > width:
-        first = first[:width - 1] + "â€¦"
+        first = first[:width - 3] + "..."
     if len(lines) > 1:
         chars = len(text)
-        return f"{first or 'â€¦'} ({len(lines)} lines, {chars} chars)"
+        return f"{first or '...'} ({len(lines)} lines, {chars} chars)"
     return first or "(empty)"
 
 
@@ -941,7 +947,7 @@ def _edit_append_text(settings: Settings, attr: str, label: str) -> None:
     print()
     if is_tty:
         if current.strip():
-            _info(f"{label} ({len(current.splitlines())} lines, {len(current)} chars â€” loaded below, edit away).")
+            _info(f"{label} ({len(current.splitlines())} lines, {len(current)} chars - loaded below, edit away).")
         else:
             _info(f"{label} (current: empty).")
     elif current.strip():
@@ -1317,6 +1323,11 @@ def accounts_menu(settings: Settings) -> None:
                 print(f"Evidence: {ban_detail[:300]}")
             return "", False, 0.0
         if not token:
+            if ban_detail:
+                # A single ban-wording sighting does not set login_banned, but
+                # the driver reports it here; surface it rather than returning
+                # with nothing said.
+                print(f"Evidence: {ban_detail[:300]}")
             return "", False, 0.0
         _ok(f"Auto-login ok for {email}")
         return token, False, 0.0
@@ -1955,7 +1966,7 @@ def main_menu(settings: Settings, serve_fn: Callable[[Settings], int],
             continue
         if choice == dry_num or choice in ("dry", "dry-run", "dryrun"):
             # No preflight: dry run needs no accounts, launches no browser,
-            # and never calls DeepSeek â€” it echoes the formatted prompt.
+            # and never calls DeepSeek — it echoes the formatted prompt.
             print()
             _info("Dry run. Press Ctrl+C or Esc to stop and return to menu.")
             print()

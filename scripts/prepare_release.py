@@ -20,7 +20,8 @@ So this script is the packaging step, not a lint on it:
   other JSON carrying a non-empty ``email`` / ``mobile`` / ``token`` /
   ``password`` / ``keys`` / ``api_key`` / ``secret`` value, and names the file
   and the path inside it, because that is the whole failure this exists to
-  prevent.
+  prevent. A JSON file it cannot read or decode is blocked the same way:
+  "clean" is only ever the verdict for a file it actually read and walked.
 
 Content scanning is JSON-only: a secret in ``settings.ini``, ``credentials.txt``,
 a ``.har`` capture or a screenshot of the TUI is dropped only if its NAME matches
@@ -142,17 +143,35 @@ def _walk_json(node, trail: str = "") -> list[str]:
 
 
 def scan_json(path: Path) -> list[str]:
-    """Credential paths inside one JSON file; ``[]`` when clean or unreadable.
+    """Credential paths inside one JSON file; never clean by default.
 
-    Unparseable JSON is reported as a hit rather than waved through: a file in a
-    release artifact that claims to be config and does not parse is not something
-    this script can clear, and "could not parse" is exactly the condition under
-    which a human should look.
+    Every outcome that is not "parsed and walked" is a hit: unparseable JSON,
+    an unreadable file, and an undecodable byte stream all report rather than
+    wave a file through. Returning ``[]`` for undecodable input was a
+    fail-open hole: PowerShell 5.1's ``>`` writes UTF-16LE, so an operator's
+    redirected copy of the credential store decoded as nothing at all and
+    shipped. A file in a release artifact that claims to be JSON and cannot be
+    read is exactly the condition under which a human should look.
+
+    UTF-16 is the second attempt because it is what that redirect produces
+    (BOM included); anything that fails both decoders is reported, not retried
+    further.
     """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return []
+    text: str | None = None
+    last_exc: Exception | None = None
+    for encoding in ("utf-8", "utf-16"):
+        try:
+            text = path.read_text(encoding=encoding)
+            break
+        except OSError as exc:
+            # PermissionError, a vanished file, a locked handle: no decoder
+            # can help, so do not retry.
+            last_exc = exc
+            break
+        except UnicodeError as exc:  # includes UnicodeDecodeError
+            last_exc = exc
+    if text is None:
+        return [f"<unreadable: {path.name} ({type(last_exc).__name__})>"]
     try:
         data = json.loads(text)
     except ValueError as exc:

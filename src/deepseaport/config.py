@@ -368,18 +368,24 @@ class Settings:
             # Concurrent writers (event loop + worker threads) can't interleave
             # or observe a half-written config. If the rename is blocked (see
             # below) we degrade to an in-place rewrite.
-            # Never overwrite a file whose last load found it unparsable: the
-            # in-memory Settings would be the empty fallback, so this write
-            # would replace the operator's accounts (and the .bak would then
-            # hold the good copy, but only if it had ever been saved). Raise
-            # rather than destroy -- the caller can surface it, and the file
-            # on disk is still recoverable.
-            if str(target) in _UNPARSABLE_CONFIG:
+            # Never overwrite a file whose last load found it unparsable AND
+            # that is still on disk: the in-memory Settings would be the empty
+            # fallback, so this write would replace the operator's accounts
+            # (and the .bak would then hold the good copy, but only if it had
+            # ever been saved). Raise rather than destroy -- the caller can
+            # surface it, and the file on disk is still recoverable. The
+            # exists() half matters because a running process never reloads:
+            # after the operator DELETES the file (the documented way out)
+            # nothing would ever clear the latch, so every later save -- an
+            # account add that already mutated memory -- kept 500ing and the
+            # file was never recreated.
+            if str(target) in _UNPARSABLE_CONFIG and target.exists():
                 raise RuntimeError(
                     f"refusing to save over {target}: its last load found it "
                     f"unparsable, so the in-memory settings are an empty "
                     f"fallback and saving would destroy the accounts in it. "
-                    f"Fix or delete the file, then retry.")
+                    f"Delete the file and retry, or fix it and restart so the "
+                    f"fixed file is loaded before anything writes.")
             target.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_name = tempfile.mkstemp(
                 prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
@@ -429,6 +435,12 @@ class Settings:
                     except OSError:
                         pass
             _warn_inherited_acl_once(target)
+            # This save just wrote the settings to disk, so an earlier load's
+            # "the file is unparsable and memory is an empty fallback" is
+            # superseded by a file that matches memory. Keeping the latch would
+            # re-arm the refusal the moment the recreated file exists (the
+            # delete-then-save recovery would work exactly once).
+            _UNPARSABLE_CONFIG.discard(str(target))
 
 
 # Set after the first successful Windows save, never reset. The ACL situation
@@ -643,6 +655,18 @@ def _normalize_keys(raw) -> list[str]:
     return out
 
 
+def _account_field(value) -> str:
+    """One account string field, coerced at the boundary.
+
+    ``{"mobile": 13800138000}`` in a hand-edited config loaded as an int, and
+    ``accounts._matches``/``_norm`` call ``.strip()`` on it: GET /v1/accounts
+    answered 500 and the account could not be selected or deleted from any UI.
+    None (a present null) reads as absent, not as ``"None"``. Not stripped:
+    the sibling fields load verbatim elsewhere in this loader.
+    """
+    return "" if value is None else str(value)
+
+
 def _as_bool(value, default: bool = False) -> bool:
     """String-aware truthiness for a single config value (no env layer).
 
@@ -732,7 +756,10 @@ def _dedupe_accounts(accounts: list[AccountConfig]) -> list[AccountConfig]:
 
 # Config paths whose last load found the file unparsable. save() consults this
 # so a broken file is never overwritten with an empty one (see load_settings
-# and _read_config_json); the entry is cleared the moment a load succeeds.
+# and _read_config_json). It is cleared by a successful load, and by a
+# successful save over a file the operator deleted -- a running process never
+# reloads, so deleting is the other documented way out, and the latch must not
+# survive that save (the file on disk then matches memory again).
 _UNPARSABLE_CONFIG: set[str] = set()
 
 # A UTF-8 BOM is written by many Windows editors (and by anything that saves
@@ -855,12 +882,21 @@ def load_settings(path: str | None = None) -> Settings:
                 "AUTH DISABLED (no API key required on any endpoint).",
                 env_keys, len(keys), cfg_path)
 
+    raw_accounts = raw.get("accounts", [])
+    if not isinstance(raw_accounts, list):
+        # A present "accounts": null (or a junk dict) used to raise TypeError
+        # while iterating, so the app would not start at all; read it as no
+        # accounts, the same silent coercion _normalize_keys/_providers_list
+        # apply to their own fields.
+        raw_accounts = []
     accounts: list[AccountConfig] = []
-    for a in raw.get("accounts", []):
+    for a in raw_accounts:
         if isinstance(a, dict) and (a.get("email") or a.get("mobile") or a.get("token")):
             accounts.append(AccountConfig(
-                email=a.get("email", ""), mobile=a.get("mobile", ""),
-                password=a.get("password", ""), token=a.get("token", ""),
+                email=_account_field(a.get("email")),
+                mobile=_account_field(a.get("mobile")),
+                password=_account_field(a.get("password")),
+                token=_account_field(a.get("token")),
                 token_expires_at=a.get("token_expires_at", 0.0),
                 # NOT bool(): "banned": "false" is a banned account forever.
                 # AccountConfig.__post_init__ only clears a ban whose

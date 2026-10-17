@@ -65,11 +65,12 @@ _PROVIDER_ID_RE = re.compile(r"^[a-z0-9-]+$")
 # A path/body segment this long and this opaque cannot be an account
 # identifier: AccountConfig.identifier is an email, a mobile number, or
 # token[:10] + "..." (config.AccountConfig.identifier), all far shorter. 32+
-# chars of [A-Za-z0-9_-] is a full userToken (64 chars) or junk. Rejected at the
-# HTTP edge so a bearer token never reaches a URL (access logs, proxy logs,
+# chars of [A-Za-z0-9_.=-] is a full userToken (64 chars), a Qwen JWT (three
+# dot-separated base64url segments, '=' padding included), or junk. Rejected at
+# the HTTP edge so a bearer token never reaches a URL (access logs, proxy logs,
 # Referer chains) or a log line, while accounts._matches keeps full-token
 # matching for the CLI/local callers that need it.
-_TOKEN_SHAPED_RE = re.compile(r"^[A-Za-z0-9_-]{32,}$")
+_TOKEN_SHAPED_RE = re.compile(r"^[A-Za-z0-9_.=-]{32,}$")
 
 # Cap on what a rejected request may put in the log, on top of redaction.
 _MAX_LOGGED_PATH_CHARS = 200
@@ -319,8 +320,12 @@ def register_routes(app: FastAPI) -> None:
         return await asyncio.to_thread(bridge.status)
 
     @app.get("/v1/models")
-    async def list_models():
+    async def list_models(authorization: str = Header(default="")):
         settings: Settings = app.state.settings
+        # Same key gate as every other /v1/* route (only /health stays open):
+        # the listing without it was the one route a LAN client could read
+        # unauthenticated. Empty keys keep the documented local-dev default.
+        _check_auth(settings, authorization)
         # openapi_url is None, so before this the running server exposed no
         # version at all: a user genuinely could not ask what they were talking
         # to. Same single source as server.py/dry_run.py's FastAPI(version=...).
@@ -476,6 +481,10 @@ def register_routes(app: FastAPI) -> None:
             # persisted into config.json as an account no pool, login or ban
             # check can ever match.
             _reject_unknown_provider(pid)
+            # Registered is not enough: a non-active id (e.g. qwen on a
+            # deepseek-only deployment) would land in the SELECTED provider's
+            # pool, which then serves it as its own credential.
+            _reject_inactive_provider(settings, pid)
         cfg = AccountConfig(email=fields["email"], mobile=fields["mobile"],
                             password=fields["password"],
                             token=extract_token(fields["token"]))
@@ -531,12 +540,18 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=400,
                                 detail="token required (raw value or full JSON). " + TOKEN_HELP)
         pid = str((body.get("provider") if isinstance(body, dict) else "") or provider or "").strip()
+        _reject_inactive_provider(settings, pid)
         pool = _pool_for(app, pid)
         item = await asyncio.to_thread(pool.get, identifier)
         if item is None:
             raise HTTPException(status_code=404, detail=f"account not found: {identifier}")
         item.cfg.token = token
-        await asyncio.to_thread(set_account_token, settings, identifier, token)
+        # Scope the settings write to the pool's provider: the same identifier
+        # can exist once per provider, and the unscoped first match wrote the
+        # token onto the OTHER provider's record as well.
+        effective = pid or pool.provider_id
+        await asyncio.to_thread(set_account_token, settings, identifier, token,
+                                provider=effective)
         await asyncio.to_thread(settings.save)
         # clear_cooldown now resets the whole AccountHealth (cooldown + ban +
         # browser-login backoff) through the pool the account actually lives in.
@@ -550,12 +565,20 @@ def register_routes(app: FastAPI) -> None:
         _reject_token_shaped_identifier(identifier)
         _check_auth(settings, authorization)
         pid = (provider or "").strip()
+        _reject_inactive_provider(settings, pid)
         pool = _pool_for(app, pid)
+        # Resolved BEFORE pool.remove: provider_id falls back to a member's own
+        # provider, and removing the last member of that provider would change
+        # the answer.
+        effective = pid or pool.provider_id
         removed = await asyncio.to_thread(pool.remove, identifier)
         if not removed:
             # A non-secret identifier: safe (and useful) to echo back.
             raise HTTPException(status_code=404, detail=f"account not found: {identifier}")
-        await asyncio.to_thread(remove_account, settings, identifier)
+        # Scoped: the same identifier can exist once per provider, and a
+        # settings-wide first-match delete removed the other provider's record.
+        await asyncio.to_thread(remove_account, settings, identifier,
+                                provider=effective)
         await asyncio.to_thread(settings.save)
         return {"ok": True, "removed": identifier, "current": pool.current or None}
 
@@ -570,6 +593,7 @@ def register_routes(app: FastAPI) -> None:
         _reject_token_shaped_identifier(identifier)
         _check_auth(settings, authorization)
         pid = str((body.get("provider") if isinstance(body, dict) else "") or provider or "").strip()
+        _reject_inactive_provider(settings, pid)
         pool = _pool_for(app, pid)
         cleared = await asyncio.to_thread(pool.clear_cooldown, identifier)
         # Persist the ban-flag clear so labels survive the next restart too.
@@ -615,6 +639,32 @@ def _reject_unknown_provider(pid: str) -> None:
         known = "unavailable"
     raise HTTPException(status_code=400,
                         detail=f"unknown provider '{pid}' (known: {known})")
+
+
+def _reject_inactive_provider(settings, pid) -> None:
+    """400 when ``pid`` is a provider this deployment does not serve.
+
+    A registered id is not necessarily an ACTIVE one, and ``_pool_for`` keeps
+    its fallback-to-selected behavior for an id outside the active set (pinned
+    by tests/test_multi_provider.py). So an account route that accepted one
+    applied it to the selected provider's pool: a Qwen JWT stored into -- and
+    made CURRENT in -- the DeepSeek pool, which then replayed it to
+    chat.deepseek.com. Refusing the explicit id at the edge is the fix, not a
+    second-guessing _pool_for. Empty/blank pid is a no-op: the caller asked
+    for the selected provider.
+    """
+    candidate = str(pid or "").strip().lower()
+    if not candidate:
+        return
+    try:
+        active = pools.active_provider_ids(settings)
+    except Exception:
+        active = []
+    if candidate in active:
+        return
+    raise HTTPException(status_code=400, detail=(
+        f"provider '{pid}' is not active for this deployment "
+        f"(active: {', '.join(active) or 'none'})"))
 
 
 def _reject_token_shaped_identifier(identifier) -> None:

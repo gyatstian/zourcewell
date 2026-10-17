@@ -453,6 +453,48 @@ def test_31_char_identifier_is_still_accepted_as_a_shape(monkeypatch):
     assert resp.status_code == 404, resp.text
 
 
+def test_jwt_shaped_identifier_is_rejected_on_every_identifier_route(
+        monkeypatch, caplog):
+    """A Qwen JWT is three dot-separated base64url segments; the old
+    ``[A-Za-z0-9_-]`` class did not cover '.', so DELETE /v1/accounts/<jwt>
+    deleted the account and echoed the JWT in "removed" (and a PUT/unblock
+    reached the same matcher)."""
+    jwt = "aaa." + "b" * 40 + ".ccc"
+    settings = _settings(keys=["sk-test"],
+                         accounts=[AccountConfig(token=jwt, email="")])
+    _pin_pool(monkeypatch, settings)
+
+    with caplog.at_level(logging.DEBUG, logger="deepseaport.server"):
+        with _client(settings) as client:
+            # Ahead of auth: no key presented, and still the 400.
+            unauth = client.delete(f"/v1/accounts/{jwt}")
+            delete = client.delete(f"/v1/accounts/{jwt}", headers=AUTH)
+            put = client.put(f"/v1/accounts/{jwt}/token",
+                             json={"token": "fresh"}, headers=AUTH)
+            unblock = client.post("/v1/accounts/unblock",
+                                  json={"identifier": jwt}, headers=AUTH)
+            select = client.post("/v1/accounts/select",
+                                 json={"identifier": jwt}, headers=AUTH)
+
+    for resp in (unauth, delete, put, unblock, select):
+        assert resp.status_code == 400, resp.text
+        assert jwt not in resp.text, "the 400 echoed the token back"
+    assert jwt not in caplog.text
+    assert len(settings.accounts) == 1, "the account was removed anyway"
+
+
+def test_short_dotted_identifier_is_still_a_404(monkeypatch):
+    """Control for the widened class: '.' alone must not make every dotted id
+    token-shaped -- the 32-char floor still decides."""
+    settings = _token_pool_settings()
+    _pin_pool(monkeypatch, settings)
+
+    with _client(settings) as client:
+        resp = client.delete("/v1/accounts/aaa.bbb.ccc", headers=AUTH)
+
+    assert resp.status_code == 404, resp.text
+
+
 # --- P1-5: the dry-run app has no body cap of its own ------------------------
 
 

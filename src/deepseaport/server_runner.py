@@ -244,7 +244,8 @@ def _ensure_free_port(settings, host: str, port: int,
 
     Interactive (tty stdin): asks Y/n. Non-interactive (headless): auto-picks
     the next free port when available. Returns the port to use (original when
-    user declines or no free port found).
+    user declines or no free port found; 5001-or-next when `port` itself is
+    out of range or not a number).
 
     `is_free` / `next_free` are injection seams used by deepseaport.cli so
     tests can monkeypatch the historical cli-level names; default to the
@@ -255,7 +256,18 @@ def _ensure_free_port(settings, host: str, port: int,
     free = is_free if is_free is not None else _is_port_free
     nxt_fn = next_free if next_free is not None else _next_free_port
 
-    port = int(port)
+    raw_port = port
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = 0
+    if not 1 <= port <= 65535:
+        # Out of range must never reach uvicorn: bind() raises OverflowError,
+        # which is not an OSError and escapes _run_server's KeyboardInterrupt
+        # handler as a traceback (in the TUI it killed the menu).
+        logger.warning("port=%r is not a usable listen port: scanning from "
+                       "5001 instead", raw_port)
+        port = 5001
     if free(host, port):
         return port
     nxt = nxt_fn(host, port)
@@ -395,7 +407,10 @@ def _run_server(settings, args, ensure_free=None) -> int:
     app = create_app(settings)
     # --host flag overrides config; else listen=true -> 0.0.0.0, false -> 127.0.0.1.
     host = _resolve_bind_host(settings, args)
-    port = int(getattr(settings, "port", 5001))
+    # Deliberately not int() here: ensure_free below owns the coercion, and a
+    # hand-built Settings with a non-numeric port must not raise ValueError
+    # out of the pre-flight line as a traceback.
+    port = getattr(settings, "port", 5001)
     log_level = str(getattr(settings, "log_level", "info")).lower()
     workers = int(getattr(args, "workers", 1) or 1)
     # Before the port fix-up: no config save, no prompt, no bind for a mode

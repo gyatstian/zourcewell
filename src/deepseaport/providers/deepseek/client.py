@@ -303,7 +303,14 @@ def stream_completion(headers: dict, payload: dict,
         except Exception:
             pass
         T.close_quietly(resp)
-        # Fall through to SSE loop (empty body closes without events).
+        # The drain above consumed the only body this response has: the SSE
+        # loop would iterate a drained, closed curl_cffi stream a SECOND time,
+        # which never yields EOF and never raises -- the worker parked forever
+        # and its account slot was never released (reproduced against
+        # curl_cffi 0.16.3).
+        yield P.StreamEvent(kind="error", code="UPSTREAM_ERROR",
+                            message="empty non-SSE 200 body")
+        return
     if resp.status_code != 200:
         event = T.build_http_error_event(resp, payload)
         T.close_quietly(resp)

@@ -38,9 +38,16 @@ class Provider(ABC):
     # when only such providers are active.
     requires_accounts: bool = True
 
-    # False for providers needing no WAF bridge (no Obscura warmup at
-    # startup, no bridge in one-shot chat). Local CLI providers set this.
+    # False for providers needing no WAF bridge (no bridge in one-shot chat;
+    # the startup warmup is gated on needs_waf_jar below). Local CLI
+    # providers set this.
     needs_bridge: bool = True
+
+    # True when this provider consumes the Obscura bridge's harvested WAF
+    # cookie jar. The startup warmup targets one host (CHAT_HOME, DeepSeek by
+    # default), so a provider whose WAF cookies come from elsewhere (qwen's
+    # own acw_tc cache) must not trigger it.
+    needs_waf_jar: bool = True
 
     @abstractmethod
     def models(self) -> dict[str, ModelSpec]:

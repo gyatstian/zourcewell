@@ -264,17 +264,20 @@ def test_login_ban_streak_resets_on_a_healthy_frame(monkeypatch):
 
 
 def test_login_captcha_mid_streak_still_surfaces_the_hint(monkeypatch):
-    """Keeps tests/test_auth_browser_gaps.py:729 semantics: a ban hint seen on
+    """Mirror of tests/test_auth_browser_gaps.py:758-783: a ban hint seen on
     an earlier frame is reported on a captcha exit, which cannot state a
-    verdict of its own."""
+    verdict of its own -- the hint goes to the DETAIL, never the banned slot
+    (auth.py only stops on a token or a confirmed ban, so the Obscura fallback
+    still runs). Re-pinned to the deepseek login-policy change."""
     browser, _ = _login_browser(monkeypatch, [
         _snap("account muted"),
         _snap("just a moment"),
     ])
     token, banned, detail = browser.login("a@x.com", "pw")
     assert token is None
-    assert banned is True
+    assert banned is False
     assert "captcha" in detail
+    assert "[ban wording seen in an earlier frame]" in detail
 
 
 # --- Task 3: ensure_wasm's temp file is per-call ---------------------------
@@ -562,3 +565,57 @@ def test_startup_warm_skips_deepseek_for_an_unknown_provider(monkeypatch):
 
     assert calls == {"bridge": 0, "wasm": 0}, (
         "an unknown provider still drove the DeepSeek bridge/wasm path")
+
+
+def test_startup_warm_skips_bridge_warmup_for_qwen_only(monkeypatch):
+    """qwen consumes its own acw_tc jar, not the bridge's: no DeepSeek warmup.
+
+    The startup obscura warmup targets CHAT_HOME (chat.deepseek.com), so a
+    qwen-only setup must not boot it and plant cookies qwen then refuses to
+    send. qwen's OWN warmup must still run -- it is what solves the qwen-host
+    jar. ``needs_bridge`` stays True (one-shot chat still builds a bridge), so
+    the startup gate is the separate ``needs_waf_jar``.
+    """
+    from deepseaport import server_concurrency as SC
+    from deepseaport.providers.qwen.provider import QwenProvider
+    from support import settings as _mk_settings
+
+    calls = {"bridge": 0, "provider": []}
+
+    class _Bridge:
+        def warmup(self, timeout: int = 45):
+            calls["bridge"] += 1
+            return {}
+
+    monkeypatch.setattr(QwenProvider, "warmup",
+                        lambda self, bridge: calls["provider"].append(bridge))
+    s = _mk_settings(provider="qwen")
+    SC._startup_warm(_Bridge(), s)
+
+    assert calls["bridge"] == 0, (
+        "a qwen-only startup booted obscura against the DeepSeek host")
+    assert calls["provider"], "qwen's own warmup was skipped"
+    assert isinstance(calls["provider"][0], _Bridge)
+
+
+def test_effective_log_level_prefers_runtime_override():
+    """chat mode pins ``_runtime_log_level``; the lifespan used to ignore it.
+
+    The override is restored to its pre-run value (None when unset) on exit,
+    so a missing/None attribute MUST fall back to ``log_level``. No attribute
+    at all (odd stand-in settings) falls back to INFO.
+    """
+    from deepseaport import server_concurrency as SC
+    from support import settings as _mk_settings
+
+    s = _mk_settings(log_level="INFO")
+    assert SC._effective_log_level(s) == "INFO"
+    s._runtime_log_level = "ERROR"
+    assert SC._effective_log_level(s) == "ERROR"
+    s._runtime_log_level = None
+    assert SC._effective_log_level(s) == "INFO"
+
+    class _NoLevels:
+        pass
+
+    assert SC._effective_log_level(_NoLevels()) == "INFO"

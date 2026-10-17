@@ -70,6 +70,21 @@ def _announce_exposure(settings, host: str, port: int, what: str = "") -> str:
     return notice
 
 
+def _client_host(bind_host: str) -> str:
+    """Host the chat client dials for a server bound to ``bind_host``.
+
+    A wildcard/empty bind has no address of its own to dial, so it maps to
+    loopback; a specific bind address is reached AT that address (binding
+    ``127.0.0.2`` or a LAN address leaves 127.0.0.1 with nothing listening,
+    which made every message "connection refused"). IPv6 literals come back
+    bracketed so they can ride an ``http://host:port`` URL.
+    """
+    host = str(bind_host or "").strip().strip("[]")
+    if not host or host in ("0.0.0.0", "::", "::0"):
+        return "127.0.0.1"
+    return f"[{host}]" if ":" in host else host
+
+
 def _active_providers_need_accounts(settings) -> bool:
     """True when an active provider actually requires accounts/tokens.
 
@@ -159,7 +174,7 @@ def run_multi_chat_servers(settings, args=None, count: int | None = None) -> int
         """Stop every server and restore log levels, exactly once.
 
         Widened to BaseException callers: Ctrl+C while _wait_for_server() is
-        polling (up to READY_TIMEOUT, the likeliest Ctrl+C window) raises
+        polling (up to 20s, the likeliest Ctrl+C window) raises
         KeyboardInterrupt, which `except Exception` never sees. That leaked
         every uvicorn thread and left the whole process at ERROR for the rest
         of the TUI session. The guard makes the REPL's finally idempotent.
@@ -195,7 +210,7 @@ def run_multi_chat_servers(settings, args=None, count: int | None = None) -> int
             servers.append(srv)
             threads.append(th)
 
-        bases = [f"http://127.0.0.1:{p}" for p in ports]
+        bases = [f"http://{_client_host(bind_host)}:{p}" for p in ports]
         for i, base_url in enumerate(bases):
             if not _wait_for_server(base_url):
                 alive = threads[i].is_alive() if i < len(threads) else False
@@ -216,7 +231,7 @@ def run_multi_chat_servers(settings, args=None, count: int | None = None) -> int
 
         print()
         for i, (port, acc) in enumerate(zip(ports, picked), 1):
-            print(f"  [{i}/{n}] API http://127.0.0.1:{port} "
+            print(f"  [{i}/{n}] API http://{_client_host(bind_host)}:{port} "
                   f"(bind {bind_host}:{port}) account {acc.identifier}")
         print(f"  Chat round-robin across {n} server(s). Model: {model}")
         _print_multi_help()
@@ -293,18 +308,22 @@ def run_chat_server(settings, args=None) -> int:
 
     _warn_chat_workers(args)
     bind_host = _resolve_bind_host(settings, args)
-    port = _ensure_free_port(settings, bind_host, int(getattr(settings, "port", 5001)))
-    client_base = f"http://127.0.0.1:{port}"
+    # No int() here: _ensure_free_port owns the coercion (garbage -> warn +
+    # scan from 5001), and a cast first is the traceback it exists to prevent.
+    port = _ensure_free_port(settings, bind_host, getattr(settings, "port", 5001))
+    client_base = f"http://{_client_host(bind_host)}:{port}"
     # Before the silencing below: printed, not logged, because
     # _silence_chat_logs() pins deepseaport.* to ERROR and would discard it.
     _announce_exposure(settings, bind_host, port, "chat + API:")
 
     # Silence BEFORE the server starts: lifespan warmup (obscura cookies,
     # PoW wasm) logs INFO straight onto the chat input line otherwise.
-    # settings.log_level is overridden in-memory only (never saved) so the
-    # lifespan's apply_log_level() also stays quiet; restored on exit.
-    orig_log_level = getattr(settings, "log_level", "INFO")
-    settings.log_level = "ERROR"
+    # The override lives in the runtime-only _runtime_log_level attribute
+    # (the server lifespan reads it before settings.log_level), so the saved
+    # log_level field is never touched and a /model pick's settings.save()
+    # cannot write ERROR into config.json. Restored on exit.
+    orig_runtime = getattr(settings, "_runtime_log_level", None)
+    settings._runtime_log_level = "ERROR"
     saved_logs = _silence_chat_logs()
     servers: list = []
     threads: list = []
@@ -314,7 +333,7 @@ def run_chat_server(settings, args=None) -> int:
         """Signal every server to exit, join, restore log levels -- once.
 
         Ctrl+C here is the common case, not the exotic one: _wait_for_server()
-        polls for up to READY_TIMEOUT, so that window is where a user hits
+        polls for up to 20s, so that window is where a user hits
         Ctrl+C, and KeyboardInterrupt is a BaseException that the previous
         `except Exception` handlers skipped. The result was a live uvicorn
         thread plus every logger left pinned at ERROR for the rest of the TUI
@@ -335,7 +354,7 @@ def run_chat_server(settings, args=None) -> int:
             except Exception:
                 pass
         try:
-            settings.log_level = orig_log_level
+            settings._runtime_log_level = orig_runtime
         except Exception:
             pass
         _restore_chat_logs(saved_logs)

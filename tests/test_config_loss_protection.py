@@ -115,6 +115,54 @@ def test_fixing_the_file_re_enables_saving(tmp_path):
     assert len(load_settings(p).accounts) == 1
 
 
+def test_deleting_the_broken_file_re_enables_saving(tmp_path):
+    """Deleting was the documented recovery, but only a successful LOAD cleared
+    the latch, and a running process never reloads: after the operator deleted
+    the file, every later save still raised, so an account add (which already
+    mutated memory) 500ed and the file was never recreated."""
+    p = tmp_path / "config.json"
+    p.write_text("{broken", encoding="utf-8")
+    s = load_settings(p)
+    assert str(p) in cfg._UNPARSABLE_CONFIG
+
+    p.unlink()
+    s.accounts.append(AccountConfig(email="new@x.com", token="T" * 64))
+    s.save()  # must not raise
+
+    assert p.is_file(), "the deleted file was never recreated"
+    assert load_settings(p).accounts[0].email == "new@x.com"
+
+
+def test_the_recreated_file_does_not_re_arm_the_refusal(tmp_path):
+    """The save that recreated the file is also what proves memory and disk
+    agree, so the NEXT save must go through: keeping the latch would make the
+    recovery work exactly once and then block on the file it just wrote."""
+    p = tmp_path / "config.json"
+    p.write_text("{broken", encoding="utf-8")
+    s = load_settings(p)
+    p.unlink()
+
+    s.accounts.append(AccountConfig(email="one@x.com", token="T" * 64))
+    s.save()
+    s.accounts.append(AccountConfig(email="two@x.com", token="U" * 64))
+    s.save()  # must not raise
+
+    assert [a.email for a in load_settings(p).accounts] == ["one@x.com",
+                                                           "two@x.com"]
+
+
+def test_the_refusal_still_holds_while_the_broken_file_exists(tmp_path):
+    """The other half of the exists() check: as long as the bad file is there,
+    reading it as empty and writing over it would destroy the accounts."""
+    p = tmp_path / "config.json"
+    p.write_text("{broken", encoding="utf-8")
+    s = load_settings(p)
+
+    with pytest.raises(RuntimeError, match="Delete the file and retry"):
+        s.save()
+    assert p.read_text(encoding="utf-8") == "{broken"
+
+
 def test_missing_and_blank_config_are_still_fresh_installs(tmp_path):
     """A missing or empty file is legitimate, not an error."""
     missing = tmp_path / "nope.json"

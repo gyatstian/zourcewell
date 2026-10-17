@@ -299,6 +299,60 @@ def test_check_flags_email_and_mobile_and_writes_nothing(tmp_path):
     assert [rel.as_posix() for rel, _r, _d in secrets] == ["state.json"]
 
 
+# --- unreadable JSON is a hit, not a pass -----------------------------------
+#
+# ``scan_json`` used to return [] for anything it could not read, i.e. "clean".
+# PowerShell 5.1's ``>`` writes UTF-16LE, so an operator's redirected copy of
+# the credential store decoded as nothing at all and shipped inside the zip.
+
+
+def test_utf16_credential_store_blocks_the_release(tmp_path):
+    src = _clean(_tree(tmp_path, **{
+        "state.json": json.dumps(_LIVE).encode("utf-16")}))
+    out = tmp_path / "release"
+    assert prepare_release.main(["--dist", str(src), "--out", str(out)]) == 1
+    assert not out.exists()
+
+
+def test_utf16_credential_store_blocks_check_mode_too(tmp_path):
+    """The release workflow gates the upload on `--check` alone."""
+    src = _clean(_tree(tmp_path, **{
+        "state.json": json.dumps(_LIVE).encode("utf-16")}))
+    assert prepare_release.main(["--check", "--dist", str(src),
+                                 "--out", str(tmp_path / "release")]) == 1
+
+
+def test_utf16_blank_json_still_passes(tmp_path):
+    """Fail closed must not become "UTF-16 always blocks": the file decodes,
+    so it is walked like any other JSON and an empty one stays clean."""
+    src = _clean(_tree(tmp_path, **{
+        "state.json": json.dumps({"keys": [], "accounts": []}).encode("utf-16")}))
+    assert prepare_release.main(["--dist", str(src),
+                                 "--out", str(tmp_path / "release")]) == 0
+
+
+def test_scan_json_reports_an_unreadable_file_as_a_hit(tmp_path):
+    """An OSError used to return [] = clean. A credential store the scanner
+    cannot open must never be waved through."""
+    locked = tmp_path / "locked.json"
+    locked.mkdir()  # opening a directory raises OSError on every OS
+
+    hits = prepare_release.scan_json(locked)
+
+    assert len(hits) == 1
+    assert hits[0].startswith("<unreadable:")
+
+
+def test_scan_json_reports_undecodable_bytes_as_a_hit(tmp_path):
+    bad = tmp_path / "state.json"
+    bad.write_bytes(b"\x80\x81\x82")  # invalid UTF-8, odd length: invalid UTF-16
+
+    hits = prepare_release.scan_json(bad)
+
+    assert len(hits) == 1
+    assert hits[0].startswith("<unreadable:")
+
+
 # --- one version, three consumers ------------------------------------------
 
 def _pyproject_version() -> str:
@@ -335,3 +389,81 @@ def test_package_version_is_the_pyproject_version():
     import deepseaport
 
     assert deepseaport.__version__ == _pyproject_version()
+
+
+def _spec_build_helpers(**seed) -> dict:
+    """Exec the spec's version-resource helpers out of the spec source.
+
+    Both defs are stdlib-only until called (``versioninfo`` is looked up at
+    call time), so the parsing/validation tier runs in CI, which has no
+    PyInstaller; the PyInstaller-backed test below injects the real module.
+    """
+    src = (_ROOT / "deepseaport.spec").read_text(encoding="utf-8")
+    ns: dict = dict(seed)
+    exec(src[src.index("def _file_version("):src.index("exe = EXE(")], ns)
+    return ns
+
+
+def test_spec_pads_the_version_to_a_four_int_file_version():
+    """WIN32 file versions are 4 integers; [project] versions are not
+    necessarily ("0.28")."""
+    ns = _spec_build_helpers()
+
+    assert ns["_file_version"]("0.28") == (0, 28, 0, 0)
+    assert ns["_file_version"]("1.2.3") == (1, 2, 3, 0)
+    assert ns["_file_version"]("1.2.3.4") == (1, 2, 3, 4)
+    assert len(ns["_file_version"](_pyproject_version())) == 4
+
+
+@pytest.mark.parametrize("bad", ["0.28-beta", "one.two", "", "0.28.1.2.3",
+                                 "70000.0", "-1.0", "0..28"])
+def test_spec_refuses_a_version_it_cannot_stamp(bad):
+    """Same rule as the moved-pyproject.toml comment at the top of the spec: a
+    build input that cannot be read is a build failure, not a silently wrong
+    version resource."""
+    ns = _spec_build_helpers()
+
+    with pytest.raises(SystemExit):
+        ns["_file_version"](bad)
+
+
+def test_spec_passes_the_version_resource_object_not_the_string():
+    """The bug: PyInstaller reads a str ``version=`` as a PATH to a
+    version-resource text file (building/api.py: "File path; either absolute,
+    or relative to the spec file"), so ``version=VERSION`` raised
+    FileNotFoundError: '0.28' at spec execution and the documented build could
+    never succeed."""
+    import re
+
+    src = (_ROOT / "deepseaport.spec").read_text(encoding="utf-8")
+
+    assert not re.search(r"^\s*version=VERSION\s*,", src, re.M), \
+        "EXE(version=VERSION) passes a string, which PyInstaller reads as a path"
+    assert "version=_version_resource(VERSION)," in src
+
+
+def test_spec_version_resource_carries_the_version_and_product_strings():
+    """Fuller tier, only where PyInstaller is importable (the exe build
+    environment); CI has no PyInstaller, so this skips there. It asserts
+    against the real VSVersionInfo class, which is the API nothing in CI can
+    watch."""
+    versioninfo = pytest.importorskip("PyInstaller.utils.win32.versioninfo")
+    ns = _spec_build_helpers(versioninfo=versioninfo)
+    version = _pyproject_version()
+
+    res = ns["_version_resource"](version)
+
+    assert isinstance(res, versioninfo.VSVersionInfo)
+    filevers = ns["_file_version"](version)
+    assert res.ffi.fileVersionMS == (filevers[0] << 16) | filevers[1]
+    assert res.ffi.fileVersionLS == (filevers[2] << 16) | filevers[3]
+    assert res.ffi.productVersionMS == res.ffi.fileVersionMS
+    assert res.ffi.productVersionLS == res.ffi.fileVersionLS
+    assert {s.name: s.val for s in res.kids[0].kids[0].kids} == {
+        "CompanyName": "deepseaport",
+        "FileVersion": version,
+        "OriginalFilename": "deepseaport.exe",
+        "ProductName": "deepseaport",
+        "ProductVersion": version,
+    }
+    assert res.kids[1].kids[0].kids == [1033, 1200]

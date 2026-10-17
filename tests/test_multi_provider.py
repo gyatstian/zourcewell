@@ -170,6 +170,92 @@ def test_add_account_defaults_to_selected_provider():
     assert s.accounts[0].provider == "deepseek"
 
 
+# 5b. an explicit provider must be ACTIVE, not merely registered ----------------
+
+
+def test_add_account_rejects_an_inactive_registered_provider():
+    """qwen is registered but not active here, and _pool_for falls back to the
+    selected pool for an id outside the active set (pinned above). Accepting the
+    id therefore stored a Qwen token into -- and made CURRENT in -- the DeepSeek
+    pool, which then replayed it to chat.deepseek.com."""
+    s = _settings(provider="deepseek",
+                  accounts=[AccountConfig(email="ds@x.com", token="ds-tok")])
+    app = create_app(s)
+    pool = _pool(app)
+    before = pool.status()
+
+    resp = TestClient(app).post("/v1/accounts",
+                                json={"provider": "qwen", "token": "qwen-jwt-abc"})
+
+    assert resp.status_code == 400, resp.text
+    assert "active" in resp.json()["detail"]
+    assert [a.provider for a in s.accounts] == ["deepseek"]
+    assert s.active_account == ""
+    assert pool.status() == before
+
+
+def test_account_mutations_reject_an_inactive_provider():
+    """The same guard on the other three identifier routes: PUT/DELETE/unblock
+    with a registered-but-inactive id fell through to the selected pool."""
+    s = _settings(provider="deepseek",
+                  accounts=[AccountConfig(email="ds@x.com", token="ds-tok")])
+    app = create_app(s)
+    client = TestClient(app)
+
+    unblock = client.post("/v1/accounts/unblock",
+                          json={"identifier": "ds@x.com", "provider": "qwen"})
+    put = client.put("/v1/accounts/ds@x.com/token?provider=qwen",
+                     json={"token": "fresh"})
+    delete = client.delete("/v1/accounts/ds@x.com?provider=qwen")
+
+    for resp in (unblock, put, delete):
+        assert resp.status_code == 400, resp.text
+        assert "active" in resp.json()["detail"]
+    assert s.accounts[0].token == "ds-tok"
+    assert len(s.accounts) == 1
+
+    # Control: the active provider keeps working.
+    ok = client.delete("/v1/accounts/ds@x.com?provider=deepseek")
+    assert ok.status_code == 200, ok.text
+    assert s.accounts == []
+
+
+# 5c. the same email on two providers: mutations stay inside one provider ------
+
+
+def _same_email_two_providers() -> Settings:
+    """Two records that share an email: account_identity includes the provider,
+    so load/save/dedupe all treat them as distinct accounts."""
+    return _settings(providers=["deepseek", "qwen"], accounts=[
+        AccountConfig(email="same@x.com", token="ds-tok", provider="deepseek"),
+        AccountConfig(email="same@x.com", token="qw-tok", provider="qwen"),
+    ])
+
+
+def test_delete_scopes_to_the_provider_param():
+    s = _same_email_two_providers()
+
+    resp = TestClient(create_app(s)).delete(
+        "/v1/accounts/same@x.com?provider=qwen")
+
+    assert resp.status_code == 200, resp.text
+    assert [(a.email, a.provider, a.token) for a in s.accounts] == [
+        ("same@x.com", "deepseek", "ds-tok")], (
+        "the settings-wide first match removed the deepseek record")
+
+
+def test_put_token_scopes_to_the_provider_param():
+    s = _same_email_two_providers()
+
+    resp = TestClient(create_app(s)).put(
+        "/v1/accounts/same@x.com/token?provider=qwen", json={"token": "fresh"})
+
+    assert resp.status_code == 200, resp.text
+    assert {a.provider: a.token for a in s.accounts} == {
+        "deepseek": "ds-tok", "qwen": "fresh"}, (
+        "the unscoped settings write touched the deepseek record too")
+
+
 # 6. single-provider seam delegation -------------------------------------------
 
 
@@ -245,3 +331,24 @@ def test_the_borrow_never_reaches_the_account_routes():
 
     assert resp.status_code == 400, resp.text
     assert s.accounts == [s.accounts[0]], "the rejected account was stored anyway"
+
+
+# 8. needs_waf_jar: who consumes the bridge's harvested jar ---------------------
+#
+# The startup obscura warmup targets ONE host (CHAT_HOME, DeepSeek by default)
+# and plants that host's WAF cookies in bridge.state. Only a provider that
+# actually sends those cookies may trigger it: qwen harvests its own acw_tc
+# cache through the bridge's engine, opencode has no WAF at all. `needs_bridge`
+# stays True for qwen -- one-shot chat still builds the bridge it may use.
+
+
+def test_needs_waf_jar_defaults_and_overrides():
+    from deepseaport.providers.deepseek.provider import DeepSeekProvider
+    from deepseaport.providers.opencode.provider import OpencodeProvider
+    from deepseaport.providers.qwen.provider import QwenProvider
+
+    assert Provider.needs_waf_jar is True
+    assert DeepSeekProvider.needs_waf_jar is True
+    assert QwenProvider.needs_waf_jar is False
+    assert OpencodeProvider.needs_waf_jar is False
+    assert QwenProvider.needs_bridge is True

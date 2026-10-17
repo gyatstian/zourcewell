@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 
+import pytest
 from fastapi.testclient import TestClient
 
 from deepseaport.config import Settings
@@ -71,8 +73,8 @@ def test_managed_config_content_is_minimal():
     assert cfg["instructions"] == []
     assert MANAGED_AGENT_PRESENT(cfg)
     perms = cfg["agent"][MS.MANAGED_AGENT]["permission"]
-    # read stays allowed, everything that can touch the host stays denied.
-    assert perms["edit"] == "deny" and perms["read"] == "allow"
+    # every native tool is denied; the map is the only tool boundary on v2.
+    assert perms["read"] == "deny" and perms["edit"] == "deny"
     assert perms["bash"] == "deny" and perms["webfetch"] == "deny"
     assert perms["external_directory"] == "deny"
     # The agent-level map mirrors the top-level one (both are sent).
@@ -90,7 +92,22 @@ def test_managed_config_denies_native_shell():
     cfg = json.loads(MS.managed_config_content())
     for scope in (cfg["permission"], cfg["agent"][MS.MANAGED_AGENT]["permission"]):
         assert scope["bash"] == "deny"
-        assert scope["read"] == "allow"
+        assert scope["read"] == "deny"
+
+
+def test_managed_config_denies_read_like_tools():
+    """#17: read sat at "allow" while the session directory is the operator's
+    cwd -- the repo root or dist/ -- where config.json holds plaintext
+    passwords and bearer tokens. ``subagent`` (alias ``task``) is denied
+    because a spawned opencode agent carries its own permission set (the
+    built-in explore agent allows read/grep/glob), which would bypass the map.
+    """
+    cfg = json.loads(MS.managed_config_content())
+    expected = ("read", "glob", "grep", "subagent", "edit", "bash",
+                "webfetch", "external_directory")
+    for scope in (cfg["permission"], cfg["agent"][MS.MANAGED_AGENT]["permission"]):
+        for key in expected:
+            assert scope[key] == "deny", f"{key} is not denied: {scope}"
 
 
 def test_client_headers_identity(monkeypatch):
@@ -478,6 +495,34 @@ def test_variant_rejection_falls_back_without(monkeypatch):
     assert calls == ["medium", None]
 
 
+def test_variant_resend_forwards_the_cancel_event(monkeypatch):
+    """Both send_message calls of a resend carry the cancellation token.
+
+    The variant-less resend must not be the hole a mid-turn cancel leaks
+    through: cancellation is honoured per poll, so both calls need the token.
+    """
+    seen: list = []
+    cancel = threading.Event()
+
+    def _send(sid, pid, mid, agent, prompt, timeout=180, variant=None,
+              cancel_event=None, **kw):
+        seen.append(cancel_event)
+        if variant == "medium":
+            raise RuntimeError("OPENCODE_HTTP_400: unknown variant medium")
+        return {"content": "ok", "thinking": "",
+                "usage_total": 1, "finish": "stop"}
+
+    monkeypatch.setattr(OC, "create_session", lambda timeout=20, **kw: "ses_vf")
+    monkeypatch.setattr(OC, "send_message", _send)
+    monkeypatch.setattr(OC, "delete_session",
+                        lambda sid, timeout=10, **kw: None)
+    content, _think, error, _usage = OCS._attempt(
+        "hi", DEFAULT_MODEL, 30, variant="medium", cancel_event=cancel)
+
+    assert error is None and content == "ok"
+    assert seen == [cancel, cancel], seen
+
+
 def test_ensure_without_binary_returns_none(monkeypatch, tmp_path):
     monkeypatch.delenv("DEEPSEAPORT_OPENCODE_BASE", raising=False)
     monkeypatch.delenv("DEEPSEAPORT_OPENCODE_MANAGED", raising=False)
@@ -485,6 +530,30 @@ def test_ensure_without_binary_returns_none(monkeypatch, tmp_path):
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
     assert MS.ensure() is None
     assert os.environ.get("DEEPSEAPORT_OPENCODE_BASE", "") == ""
+
+
+def test_send_message_cancel_event_aborts_the_session(monkeypatch):
+    """Buffered turns were un-cancellable: no abort, no early exit.
+
+    ``stream_message`` already aborted the session on cancel; the blocking
+    prompt-then-poll path ignored the token entirely, so a client disconnect
+    let the turn run to its deadline.
+    """
+    bodies = _fake_v2_serve(monkeypatch, [_assistant_item("hi")])
+    polls: list[str] = []
+    monkeypatch.setattr(
+        OC, "get_session_messages",
+        lambda sid, timeout=20, **kw: polls.append(sid) or [_assistant_item("hi")])
+    cancel = threading.Event()
+    cancel.set()
+    from deepseaport.server_concurrency import _StreamCancelled
+
+    with pytest.raises(_StreamCancelled):
+        OC.send_message("ses_1", "opencode", "m", OP.agent_name(), "hi",
+                        timeout=5, cancel_event=cancel)
+
+    assert any(p.endswith("/interrupt") for p, _b in bodies), bodies
+    assert polls == [], "cancel must be seen before the first poll"
 
 
 def test_managed_prompt_forbids_native_and_allows_dsml():

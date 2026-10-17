@@ -138,6 +138,16 @@ def _norm(identifier: str) -> str:
     return (identifier or "").strip().lower()
 
 
+def _provider_of(cfg: AccountConfig) -> str:
+    """Normalized provider id for an account (defaults to deepseek).
+
+    Same rule as ``core.pools._provider_of`` (which partitions the pools) and
+    ``config.account_identity`` (which dedupes): one normalization, so a
+    scoped match here cannot disagree with the pool an account lands in.
+    """
+    return (getattr(cfg, "provider", "deepseek") or "deepseek").strip().lower()
+
+
 def _matches(cfg: AccountConfig, identifier: str) -> bool:
     key = _norm(identifier)
     if not key:
@@ -391,24 +401,41 @@ def add_account(settings, pool: "AccountPool", cfg: AccountConfig) -> PooledAcco
     return item
 
 
-def set_account_token(settings, identifier: str, token: str) -> AccountConfig | None:
-    """Set normalized token on first matching settings account; return it or None."""
+def set_account_token(settings, identifier: str, token: str,
+                      provider: str | None = None) -> AccountConfig | None:
+    """Set normalized token on first matching settings account; return it or None.
+
+    ``provider`` (optional) scopes the match to that provider's accounts: the
+    same email is a distinct account per provider (config.account_identity),
+    and the previous settings-wide first match wrote the token onto a
+    DIFFERENT provider's record -- which that provider's pool then never
+    serves, while the other pool serves a token it was not given.
+    """
     token = extract_token(token)
+    want = (str(provider or "")).strip().lower()
     for a in (getattr(settings, "accounts", None) or []):
+        if want and _provider_of(a) != want:
+            continue
         if _matches(a, identifier):
             a.token = token
             return a
     return None
 
 
-def remove_account(settings, identifier: str) -> bool:
+def remove_account(settings, identifier: str,
+                   provider: str | None = None) -> bool:
     """Drop the first matching account from settings; clear stale CURRENT.
 
     Mirrors AccountPool.remove() ordering. Returns True when one was removed.
+    ``provider`` (optional) scopes the match like ``set_account_token``: the
+    same email on two providers is two accounts, and a settings-wide first
+    match deleted the other provider's record while the target's survived.
     """
+    want = (str(provider or "")).strip().lower()
     kept, dropped = [], False
     for a in (getattr(settings, "accounts", None) or []):
-        if not dropped and _matches(a, identifier):
+        if (not dropped and (not want or _provider_of(a) == want)
+                and _matches(a, identifier)):
             dropped = True
             continue
         kept.append(a)

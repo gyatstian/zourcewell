@@ -100,7 +100,7 @@ and educational use only.
 
 - `python -m pytest -m "not live" -q` is the gate. Hermetic: no account, no obscura binary, no browser, no secrets. CI runs exactly this on ubuntu-latest and windows-latest, Python 3.11 and 3.13.
 - `python -m pytest -m live -q` is opt-in and needs a real token plus `obscura` on PATH. Run it when a change touches an upstream wire format. It is the only check in the repo that notices upstream drift.
-- `python scripts/prepare_release.py --check` before packaging. Exit 1 means a credential was found in `dist/`. On a `v*` tag the `release` workflow runs it for you, ahead of the PyPI upload.
+- `python scripts/prepare_release.py --check` before packaging. Exit 1 means the check failed — a credential found in `dist/`, or a JSON file it could not read or parse. On a `v*` tag the `release` workflow runs it for you, ahead of the PyPI upload.
 
 ## Child DOX Index
 

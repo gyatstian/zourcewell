@@ -231,8 +231,8 @@ Clear that state with `POST /v1/accounts/unblock` or
   `DELETE /v1/accounts/{identifier}`, `POST /v1/accounts/unblock`
 - `{identifier}` is an **account identifier, never a token**: the account's
   `email`, its `mobile`, or the `token[:10] + "..."` short form that
-  `GET /v1/accounts` returns. A 32+ character `[A-Za-z0-9_-]` segment is
-  refused with **400** on every identifier route (`{identifier}` on
+  `GET /v1/accounts` returns. A 32+ character `[A-Za-z0-9_.=-]` segment (the bearer/JWT
+  alphabet) is refused with **400** on every identifier route (`{identifier}` on
   `PUT`/`DELETE`, the `identifier` body field on `select`/`unblock`), ahead of
   the API-key check, and the 400 never echoes the value back. Reason: a URL
   ends up in access logs, proxy logs and `Referer` headers, and the old 404
@@ -287,8 +287,8 @@ the web providers).
    and model `opencode/muse-spark-1.3-contributor-free`, then work
    normally: pi's tools arrive as DSML text, the model replies with DSML
    `tool_calls`, and the bridge returns OpenAI `tool_calls` for pi to
-   execute. The agent the bridge runs has `read` allowed and
-   `edit`/`bash`/`webfetch`/`external_directory` denied — pi's own tools
+   execute. The agent the bridge runs denies `read`/`glob`/`grep`/`subagent`
+   and `edit`/`bash`/`webfetch`/`external_directory` — pi's own tools
    ride the prompt text, not the model's native ones.
 4. opencode v2 requires a basic-auth password on every serve instance. The
    managed one pins a per-boot `OPENCODE_SERVER_PASSWORD` itself, so nothing
@@ -333,8 +333,10 @@ the file and the path inside it. Content scanning is JSON-only: a secret in
 `settings.ini`, `credentials.txt`, a `.har` or a screenshot ships unless its
 *name* matches an exclusion glob. It leaves your live `config.json` where it is;
 moving it out of `dist/` is your call (the exe reads it at startup, so
-`DEEPSEAPORT_CONFIG` or a moved copy both work). Exit 1 means a credential was
-found, exit 0 means the artifact is clean.
+`DEEPSEAPORT_CONFIG` or a moved copy both work). Exit 1 means the check
+failed: a credential was found, or a JSON file could not be read or parsed
+(reported as `<unreadable: ...>` — a file claiming to be JSON is never
+waved through unscanned). Exit 0 means the artifact is clean.
 
 **Version.** `pyproject.toml` `[project] version` is the only place a version
 is written. `deepseaport.spec` reads it at build time (so the exe's version

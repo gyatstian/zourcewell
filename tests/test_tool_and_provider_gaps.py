@@ -4,8 +4,8 @@ Groups:
 
 * ``MAX_PARAMS_PER_INVOKE`` must bound how many parameters are *scanned*,
   never the value range of the last accepted one (H1).
-* The opencode per-message tool map must not re-grant native bash on top of
-  the managed agent's ``bash: "deny"`` permission (H2).
+* The managed agent's permission map must keep native tools denied -- bash
+  (playbook H2) and read (the session dir holds config.json) (H2).
 * Dead provider surface stays deleted (H3): no dead `*_models` diagnostics
   helper, no dead stop helper; `snapshot_verdict` is live and must remain.
 * ``MAX_ARGS_CHARS`` is an import-time snapshot, not a live env read, and
@@ -143,7 +143,7 @@ def test_managed_permission_map_still_denies_bash():
 
     cfg = json.loads(MS.managed_config_content())
     assert cfg["permission"]["bash"] == "deny"
-    assert cfg["permission"]["read"] == "allow"
+    assert cfg["permission"]["read"] == "deny"
 
 
 # --- H3: the live provider helper stays live ------------------------------

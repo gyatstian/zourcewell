@@ -15,6 +15,8 @@ Covered:
   6. Duplicate accounts loading silently into the pool.
   7. A single-entry ``providers`` list being ignored without a word.
   8. A realistic save/load round trip still works.
+  9. A configured ``provider`` id nothing validated against the registry.
+  10. Hand-edited account shapes: ``"accounts": null`` and numeric fields.
 
 Idioms mirror the existing atomic-save tests in tests/test_reliability.py
 (`test_save_is_atomic_and_leaves_no_tmp`, `test_concurrent_saves_never_corrupt`):
@@ -644,3 +646,56 @@ def test_a_registry_that_cannot_be_asked_leaves_the_config_alone(monkeypatch,
 
     assert s.provider == "future-provider"
     assert s.providers == ["future-provider"]
+
+
+# 10. hand-edited account shapes ------------------------------------------------
+#
+# ``"accounts": null`` raised TypeError while loading (get() defaults only a
+# MISSING key), so the app did not start at all. A numeric email/mobile/
+# password/token loaded verbatim, and accounts.py calls .strip() on those
+# fields: ``AccountConfig.identifier`` and ``_matches`` crashed, so
+# GET /v1/accounts answered 500 and the account could not be selected or
+# deleted from any UI.
+
+
+@pytest.mark.parametrize("raw", [None, {}, "oops", 7, True])
+def test_non_list_accounts_load_as_zero_accounts(tmp_path, monkeypatch, raw):
+    _clean_env(monkeypatch)
+    s = load_settings(_write(tmp_path / "c.json", {"accounts": raw}))
+    assert s.accounts == []
+
+
+def test_numeric_account_fields_are_coerced_to_strings(tmp_path, monkeypatch):
+    """Coerced at the load boundary like _normalize_keys does for keys:
+    ``13800138000`` -> ``"13800138000"``, and a present null reads as absent,
+    not as ``"None"`` and not as a label the operator never typed."""
+    _clean_env(monkeypatch)
+    p = _write(tmp_path / "c.json", {"accounts": [
+        {"mobile": 13800138000, "password": 123456, "token": 9999},
+        {"email": 123, "token": "t2", "mobile": None, "password": None},
+    ]})
+    s = load_settings(p)
+
+    assert s.accounts[0].mobile == "13800138000"
+    assert s.accounts[0].password == "123456"
+    assert s.accounts[0].token == "9999"
+    assert s.accounts[1].email == "123"
+    assert (s.accounts[1].mobile, s.accounts[1].password) == ("", "")
+
+
+def test_numeric_mobile_serves_the_accounts_route(tmp_path, monkeypatch):
+    """End to end: the load coercion is the only thing standing between this
+    hand-edited config and GET /v1/accounts answering 500."""
+    _clean_env(monkeypatch)
+    from fastapi.testclient import TestClient
+
+    from deepseaport.server import create_app
+
+    p = _write(tmp_path / "c.json", {"accounts": [
+        {"mobile": 13800138000, "token": "t1"}]})
+    s = load_settings(p)
+
+    resp = TestClient(create_app(s), raise_server_exceptions=False).get(
+        "/v1/accounts")
+    assert resp.status_code == 200
+    assert resp.json()["data"][0]["identifier"] == "13800138000"

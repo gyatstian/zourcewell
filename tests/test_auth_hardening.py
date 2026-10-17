@@ -241,6 +241,28 @@ def test_waf_status_stays_open_without_configured_keys():
     assert _client(_settings(keys=[])).get("/v1/waf/status").status_code == 200
 
 
+# A4b -- /v1/models auth (the one unauthenticated /v1/* route) ------------------
+
+
+def test_models_requires_a_key():
+    """Pre-change /v1/models answered unauthenticated while the README said
+    every /v1/* route needs the key. /health stays open; this does not."""
+    client = _client(_settings(keys=["secret"]))
+    assert client.get("/v1/models").status_code == 401
+    ok = client.get("/v1/models", headers={"Authorization": "Bearer secret"})
+    assert ok.status_code == 200, ok.text
+    assert [m["id"] for m in ok.json()["data"]]
+
+
+def test_models_stays_open_without_configured_keys():
+    """No keys = documented local-dev default, gate included; the payload is
+    unchanged (version + object + data)."""
+    resp = _client(_settings(keys=[])).get("/v1/models")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["object"] == "list"
+    assert resp.json()["data"]
+
+
 # A6 -- POST /v1/accounts bounds ------------------------------------------------
 
 

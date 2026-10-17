@@ -1,6 +1,6 @@
 """opencode streaming + managed-serve hardening: watchdog budget, live tail, child reap.
 
-Three defects, each pinned by a test that fails on the pre-change code:
+Five defects, each pinned by a test that fails on the pre-change code:
 
 * **The consumer watchdog was one socket read in both stream modes.** In
   ``stream_mode: buffered`` (and in ``live`` *with* tools, where content
@@ -11,7 +11,15 @@ Three defects, each pinned by a test that fails on the pre-change code:
   assembled reply was answered ``{"error": {"message": "upstream timed out"}}``
   and thrown away. ``ARCHITECTURE.md`` makes the multiplier a cross-provider
   contract; DeepSeek honours it (providers/deepseek/completion_service.py:1156)
-  and opencode did not.
+  and opencode did not. The budget was also sized off the raw
+  ``OC.DEFAULT_TIMEOUT`` while the producer honoured
+  ``DEEPSEAPORT_OPENCODE_TIMEOUT``, so a raised knob reopened the same hole.
+* **The SSE reader busy-spun on a mid-stream socket error.** ``resp.read(1)``
+  was wrapped in ``except Exception: continue``, so a connection reset after
+  the tail started was retried instantly at 100% CPU and the wait loop below
+  stayed blind until its deadline (then reported a generic empty completion).
+  Only ``TimeoutError`` continues now; anything else is recorded and ends the
+  reader.
 * **The live path had no coverage at all.** ``client.stream_message`` (the
   hand-rolled one-byte SSE frame splitter and the event dispatch) and
   ``completion_service._attempt_live`` had never run under a test, so the two
@@ -28,6 +36,12 @@ Three defects, each pinned by a test that fails on the pre-change code:
   accumulated. The not-ready path compounded it: ``terminate()`` with no
   ``wait()``, and ``_proc`` never assigned, so nothing would ever reap that
   child either.
+* **One missed 2 s probe reaped a live managed serve.** A busy serve misses a
+  single ``GET /api/info`` while answering another request, and ``ensure()``
+  took that for death: it killed the recorded pid / replaced the tracked
+  child, ending every in-flight turn on a healthy serve and orphaning their
+  SSE readers. Both reuse decisions now retry (``managed_serve._probe_alive``)
+  before declaring death.
 
 No network, no opencode binary, no credentials: the serve is a fake
 ``urlopen()`` and every process is a fake ``Popen``.
@@ -108,6 +122,43 @@ class _FakeResp:
         return False
 
 
+class _BoomResp(_FakeResp):
+    """_FakeResp that raises ``exc`` once the payload is exhausted.
+
+    ``read_calls`` makes the no-spin rule observable: a reader that swallowed
+    the error would keep calling ``read`` on the dead response forever.
+    """
+
+    def __init__(self, payload: bytes, exc: Exception):
+        super().__init__(payload)
+        self._exc = exc
+        self.read_calls = 0
+
+    def read(self, n: int = -1) -> bytes:
+        self.read_calls += 1
+        if self._pos >= len(self._payload):
+            raise self._exc
+        return super().read(n)
+
+
+class _TimeoutOnceResp(_FakeResp):
+    """Raises ``TimeoutError`` on the first read past ``after`` bytes.
+
+    ``fired`` proves the timeout branch was actually exercised.
+    """
+
+    def __init__(self, payload: bytes, after: int):
+        super().__init__(payload)
+        self._after = after
+        self.fired = False
+
+    def read(self, n: int = -1) -> bytes:
+        if not self.fired and self._pos >= self._after:
+            self.fired = True
+            raise TimeoutError("simulated socket timeout")
+        return super().read(n)
+
+
 def _frame(event: dict) -> str:
     return "data: " + json.dumps(event) + "\n\n"
 
@@ -122,11 +173,12 @@ def _event(kind: str, **data) -> str:
 
 
 def _fake_serve(monkeypatch, *, messages: list, sse: str | None = None,
-                sse_up: bool = True) -> list[str]:
+                sse_up: bool = True, sse_resp=None) -> list[str]:
     """Route the v2 endpoints the opencode client uses; return the call log.
 
     ``sse`` is what ``GET /api/event`` replays byte for byte; without it the
-    bus answers 200 with an empty body. ``sse_up=False`` refuses that
+    bus answers 200 with an empty body. ``sse_resp`` overrides that response
+    object itself (read-failure tests). ``sse_up=False`` refuses that
     connection outright, which is the "the live tail never started" case the
     blocking fallback exists for. ``messages`` is the CHRONOLOGICAL timeline;
     the ``/message`` route reverses it like the real serve does for
@@ -148,6 +200,8 @@ def _fake_serve(monkeypatch, *, messages: list, sse: str | None = None,
         if path.endswith("/api/event"):
             if not sse_up:
                 raise OSError("connection refused (no live tail)")
+            if sse_resp is not None:
+                return sse_resp
             return _FakeResp((sse or "").encode("utf-8"), 200)
         if path.endswith("/api/info"):
             return _json_body({"version": "2.4.0"})
@@ -289,6 +343,49 @@ def test_live_mode_watchdog_stays_exactly_one_read(monkeypatch):
         OC.DEFAULT_TIMEOUT + _CONSUMER_GRACE_SECONDS))], seen
 
 
+def test_watchdog_budget_follows_the_timeout_env_knob(monkeypatch):
+    """DEEPSEAPORT_OPENCODE_TIMEOUT must size the producer AND the watchdog.
+
+    Pre-change the producer honoured the env knob while the consumer stayed at
+    the raw 180 s default, so a raised knob (600) answered a healthy slow
+    model with the watchdog's ``upstream timed out`` and threw the fully
+    assembled reply away.
+    """
+    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_TIMEOUT", "600")
+    env_seconds = 600.0
+
+    seen = _spy_stream_context(monkeypatch)
+    monkeypatch.setattr(OC, "create_session", lambda timeout=20, **kw: SESSION)
+    producer: list[float] = []
+
+    def _send(sid, pid, mid, agent, prompt, timeout=180, variant=None, **kw):
+        producer.append(timeout)
+        return {"content": "buffered reply", "thinking": "", "usage_total": 2,
+                "finish": "stop"}
+
+    monkeypatch.setattr(OC, "send_message", _send)
+    monkeypatch.setattr(OC, "delete_session", lambda sid, timeout=10, **kw: None)
+    buffered = _settings(stream_mode="buffered")
+    prep = _prepare({"model": DEFAULT_MODEL, "stream": True,
+                     "messages": [{"role": "user", "content": "hi"}]}, buffered)
+    assert "buffered reply" in _body(create_app(buffered), prep)
+    # Both sides read the same knob: the producer deadline and the watchdog.
+    assert producer == [env_seconds], producer
+    assert seen == [(True, pytest.approx(
+        (env_seconds + _CONSUMER_GRACE_SECONDS)
+        * _engine._BUFFERED_PRODUCER_READS))], seen
+
+    seen.clear()
+    _fake_serve(monkeypatch, messages=_final_messages(), sse=_live_sse())
+    live = _settings(stream_mode="live")
+    prep = _prepare({"model": DEFAULT_MODEL, "stream": True,
+                     "messages": [{"role": "user", "content": "hi"}]}, live)
+    body = _body(create_app(live), prep)
+    assert body.rstrip().endswith("data: [DONE]")
+    assert seen == [(False, pytest.approx(
+        env_seconds + _CONSUMER_GRACE_SECONDS))], seen
+
+
 # ---------------------------------------------------------------------------
 # 2. The live tail: delta dispatch, tool suppression, authoritative result
 # ---------------------------------------------------------------------------
@@ -425,6 +522,49 @@ def test_live_stream_without_tools_forwards_content_deltas(monkeypatch):
     assert _texts(deltas, "reasoning_content") == ["weigh", "ing"], deltas
 
 
+def test_mid_stream_read_failure_stops_the_reader_and_surfaces(monkeypatch):
+    """A reset mid-stream must not spin the reader or hide until the deadline.
+
+    Pre-change every non-timeout read error was swallowed by ``continue``: the
+    reader retried the dead socket instantly at 100% CPU and the request
+    stalled to its wait deadline, then reported a generic empty completion.
+    """
+    payload = _event("session.text.delta", messageID="msg_a", delta="Par").encode()
+    boom = _BoomResp(payload, ConnectionResetError("connection reset by peer"))
+    _fake_serve(monkeypatch, messages=[], sse_resp=boom)
+
+    with pytest.raises(RuntimeError) as err:
+        OC.stream_message(SESSION, "opencode", "muse", "agent", "hi",
+                          timeout=5, on_content=lambda _t: None)
+
+    text = str(err.value)
+    assert "OPENCODE_UPSTREAM" in text and "SSE_READ" in text, text
+    # Bounded: every byte once, then the raising call, then the break. A
+    # swallowed error would keep calling read() on the dead response.
+    assert boom.read_calls == len(payload) + 1, \
+        f"the reader kept reading after the reset: {boom.read_calls} calls"
+
+
+def test_socket_timeout_mid_stream_is_tolerated(monkeypatch):
+    """A socket timeout is the expected read outcome; only real errors stop."""
+    first = _event("session.text.delta", messageID="msg_a", delta="Par")
+    payload = (first
+               + _event("session.text.delta", messageID="msg_a", delta="tial tail")
+               + _event("session.execution.succeeded", messageID="msg_a")).encode()
+    resp = _TimeoutOnceResp(payload, after=len(first.encode()))
+    content: list[str] = []
+    _fake_serve(monkeypatch, messages=_final_messages(), sse_resp=resp)
+
+    result = OC.stream_message(SESSION, "opencode", "muse", "agent", "hi",
+                               timeout=5, on_content=content.append)
+
+    assert resp.fired, "the simulated timeout never fired"
+    # The timeout was survived: the delta after it still streamed, and the
+    # authoritative timeline read still answered.
+    assert content == ["Par", "tial tail"], content
+    assert result["content"] == FINAL_TEXT
+
+
 # ---------------------------------------------------------------------------
 # 3. Managed serve: reap the child we replace, and reap the not-ready one
 # ---------------------------------------------------------------------------
@@ -508,6 +648,9 @@ def _stub_managed_boot(monkeypatch, tmp_path, healthy_bases=(), proc=None) -> di
     monkeypatch.setattr(MS, "_find_free_port", lambda: NEW_PORT)
     monkeypatch.setattr(MS, "_probe",
                         lambda base, pw, timeout=2.0: base in healthy_bases)
+    # Keep the retried probe's inter-attempt pause out of the test runtime;
+    # the attempt COUNT is asserted where it matters, not the wall clock.
+    monkeypatch.setattr(MS, "_PROBE_PAUSE", 0.0, raising=False)
     monkeypatch.setattr(MS.shutil, "which", lambda name: "opencode")
     monkeypatch.setattr(
         MS.subprocess, "run",
@@ -588,6 +731,95 @@ def test_hash_change_does_not_signal_the_recorded_pid_twice(monkeypatch, tmp_pat
     with _managed_state():
         assert MS.ensure(timeout=1.0) == NEW_BASE
         assert killed == [4242], killed
+
+
+def test_one_missed_probe_is_not_proof_of_death(monkeypatch, tmp_path):
+    """Pre-change: a single 2 s probe miss reaped/killed a live serve.
+
+    A busy serve misses one ``GET /api/info`` while answering another request.
+    ensure() must retry before treating the recorded base as dead, or it ends
+    every in-flight turn on that serve (and orphans their SSE readers).
+    """
+    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_BASE", "")
+    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_MANAGED", "1")
+    monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
+    answers = [False, True]
+
+    def _probe(base, pw, timeout=2.0):
+        return answers.pop(0) if answers else False
+
+    monkeypatch.setattr(MS, "_probe", _probe)
+    monkeypatch.setattr(MS, "_PROBE_PAUSE", 0.0, raising=False)
+    killed: list[int] = []
+    reaped: list[int] = []
+    monkeypatch.setattr(MS, "_kill_pid", lambda pid: killed.append(pid))
+    monkeypatch.setattr(MS, "_reap_previous_child",
+                        lambda pid=0: reaped.append(pid))
+    # If the retry regressed, fail on the reuse assertion -- never boot a real
+    # opencode that happens to be installed.
+    monkeypatch.setattr(MS.shutil, "which", lambda name: None)
+    old = _FakeProc(pid=1111)
+    old_base = "http://127.0.0.1:41000"
+
+    with _managed_state(proc=old, base=old_base, password="old-pw"):
+        assert MS.ensure(timeout=1.0) == old_base
+        assert MS._proc is old
+
+    assert killed == [], "one missed probe killed a live serve"
+    assert reaped == [], "one missed probe replaced a live serve"
+
+
+def test_a_missed_probe_on_the_port_file_base_is_retried_too(monkeypatch, tmp_path):
+    """The second reuse decision (another worker's recorded base) retries too."""
+    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_BASE", "")
+    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_MANAGED", "1")
+    monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
+    (tmp_path / "m").mkdir(parents=True, exist_ok=True)
+    old_base = "http://127.0.0.1:41000"
+    MS._write_port_file(tmp_path / "m" / "serve.json", old_base, "old-pw",
+                        4242, MS._config_hash())
+    answers = [False, True]
+
+    def _probe(base, pw, timeout=2.0):
+        return answers.pop(0) if answers else False
+
+    monkeypatch.setattr(MS, "_probe", _probe)
+    monkeypatch.setattr(MS, "_PROBE_PAUSE", 0.0, raising=False)
+    killed: list[int] = []
+    monkeypatch.setattr(MS, "_kill_pid", lambda pid: killed.append(pid))
+    monkeypatch.setattr(MS, "_reap_previous_child",
+                        lambda pid=0: pytest.fail("a live serve was replaced"))
+    monkeypatch.setattr(MS.shutil, "which",
+                        lambda name: (_ for _ in ()).throw(
+                            AssertionError("a reused serve must not spawn")))
+
+    with _managed_state():
+        assert MS.ensure(timeout=1.0) == old_base
+
+    assert killed == []
+
+
+def test_confirmed_death_reaps_after_all_probe_attempts(monkeypatch, tmp_path):
+    """All attempts failing is the reap trigger; every attempt was made."""
+    attempts: list[str] = []
+    old = _FakeProc(pid=1111)
+    _posix_reap(monkeypatch)
+    captured = _stub_managed_boot(monkeypatch, tmp_path,
+                                  healthy_bases={NEW_BASE})
+
+    def _probe(base, pw, timeout=2.0):
+        attempts.append(base)
+        return base == NEW_BASE
+
+    monkeypatch.setattr(MS, "_probe", _probe)
+    old_base = "http://127.0.0.1:41000"
+
+    with _managed_state(proc=old, base=old_base, password="old-pw"):
+        assert MS.ensure(timeout=1.0) == NEW_BASE
+        assert old.calls == ["terminate", "wait(5.0)"], old.calls
+        assert MS._proc is captured["proc"]
+
+    assert attempts.count(old_base) == MS._PROBE_ATTEMPTS, attempts
 
 
 @pytest.mark.parametrize("stubborn", [False, True])

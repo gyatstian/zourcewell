@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 
 import pytest
@@ -60,6 +61,28 @@ class _FakeResp:
     def close(self) -> None:
         self.closed = True
         return None
+
+
+class _DrainedResp(_FakeResp):
+    """A 200 non-SSE double that RAISES if its body is iterated a second time.
+
+    curl_cffi never yields EOF for a second iteration of a drained, closed
+    response: against 0.16.3 a 200 + empty body parked in the second
+    ``iter_lines`` forever, no exception (a local-server repro sat there for
+    3s+). The second call raises here instead -- the point under test is that
+    the fixed code never reaches it.
+    """
+
+    def __init__(self, status_code=200, **kw):
+        super().__init__(status_code, **kw)
+        self.iter_lines_calls = 0
+
+    def iter_lines(self):
+        self.iter_lines_calls += 1
+        if self.iter_lines_calls > 1:
+            raise AssertionError(
+                "pump_sse re-iterated a drained+closed 200 response")
+        return super().iter_lines()
 
 
 def _sess(monkeypatch, *, get=None, get_exc=None, post=None, post_exc=None):
@@ -272,13 +295,22 @@ def test_stream_completion_200_json_ban(monkeypatch):
     assert resp.closed is True
 
 
-def test_stream_completion_200_empty_falls_through(monkeypatch):
+def test_stream_completion_200_empty_body_is_upstream_error(monkeypatch):
     from deepseaport.providers.deepseek import client as C
 
-    resp = _FakeResp(200, text="", content_type="application/json",
-                     lines=[], json_raises=True)
+    # Pre-change: the empty body fell through to the SSE loop ("empty body
+    # closes without events"), which iterated the drained stream a SECOND
+    # time -> parked forever, holding the worker and the account slot
+    # (reproduced against curl_cffi 0.16.3; _DrainedResp raises where curl_cffi
+    # blocks).
+    resp = _DrainedResp(200, text="", content_type="application/json",
+                        lines=[], json_raises=True)
     _sess(monkeypatch, post=resp)
-    assert list(C.stream_completion({"h": "1"}, {"prompt": "hi"})) == []
+    events = list(C.stream_completion({"h": "1"}, {"prompt": "hi"}))
+    assert len(events) == 1 and events[0].kind == "error"
+    assert events[0].code == "UPSTREAM_ERROR"
+    assert "empty" in events[0].message
+    assert resp.iter_lines_calls == 1, "the SSE pump re-entered the drained body"
     assert resp.closed is True
 
 
@@ -416,6 +448,27 @@ def test_extract_ban_timestamp_non_dict():
     assert P.extract_ban_timestamp("x") is None
     assert P.extract_ban_timestamp([]) is None
     assert P.extract_ban_timestamp({}) is None
+
+
+def test_ms_mute_until_normalized_and_ban_helpers_never_raise():
+    """A millisecond mute_until used to crash every formatter.
+
+    _as_float claimed to reject millisecond typos but only checked > 0, so
+    1789555791000 reached datetime.fromtimestamp (OSError) and the ban was
+    dropped silently -- transport.pump_sse swallows precheck exceptions.
+    """
+    payload = {"data": {"biz_data": {"is_muted": 1, "mute_until": 1789555791000}}}
+    ts = P.extract_ban_timestamp(payload)
+    assert ts == 1789555791.0
+    assert datetime.datetime.fromtimestamp(ts).year == 2026
+    msg = P.ban_message(ts)
+    assert "until" in msg and "2026" in msg
+    assert P.format_ban_day_month(1e30) == ""
+    assert P.format_ban_datetime(1e30) == ""
+    assert P.format_ban_label(1e30) == "(BANNED)"
+    assert "(expiry unknown)" in P.ban_message(1e30)
+    assert P.with_ban_expiry("muted", payload) == (
+        f"muted (suspended until {P.format_ban_datetime(ts)})")
 
 
 def test_parse_json_exception():

@@ -366,17 +366,21 @@ _BRIDGE_UNSET: object = object()
 
 
 def bridge_headers(bearer: str = "", bridge: object = _BRIDGE_UNSET) -> dict[str, str]:
-    """Base headers enriched with a warm bridge's WAF cookies + browser UA.
+    """Base headers enriched with a bridge's browser User-Agent.
 
-    Without the WAF ``acw_tc`` cookie + matching UA, chat.qwen.ai blocks
-    mutating endpoints at the edge (Aliyun WAF). Our programmatic client DOES
-    send ``Authorization: Bearer`` (FastAPI backend accepts it) even though
-    the web app deletes it for source=web — design decision, see README.
-    Falls back to plain base_headers when no bridge is registered.
+    Without the matching UA, chat.qwen.ai blocks mutating endpoints at the
+    edge (Aliyun WAF). Our programmatic client DOES send ``Authorization:
+    Bearer`` (FastAPI backend accepts it) even though the web app deletes it
+    for source=web — design decision, see README. Falls back to plain
+    base_headers when no bridge is registered.
+
+    The bridge's cookie jar is NEVER merged: it is the DeepSeek-host WAF jar
+    (the shared bridge warms ``CHAT_HOME``), and shipping it to chat.qwen.ai
+    hands that host a live credential it never issued. Qwen cookies come from
+    ``client._QWEN_WAF_CACHE``, merged by the caller.
 
     Pass an explicit ``bridge`` (e.g. ``app.state.bridge``) to avoid the
-    ``app.state.bridge`` vs ``get_default_bridge()`` divergence: callers
-    holding the request bridge must use its cookies, not a stale default.
+    ``app.state.bridge`` vs ``get_default_bridge()`` divergence for the UA.
     ``bridge=None`` forces the no-bridge fallback; omit to use the default.
     """
     if bridge is _BRIDGE_UNSET:
@@ -389,10 +393,9 @@ def bridge_headers(bearer: str = "", bridge: object = _BRIDGE_UNSET) -> dict[str
         return base_headers(bearer=bearer)
     try:
         ua = bridge.state.user_agent  # type: ignore[union-attr]
-        cookies = bridge.cookie_header()  # type: ignore[union-attr]
     except Exception:
-        ua, cookies = "", ""
-    return base_headers(user_agent=ua, waf_cookies=cookies, bearer=bearer)
+        ua = ""
+    return base_headers(user_agent=ua, bearer=bearer)
 
 
 def chat_new_payload(model: str, chat_id: str = "", chat_type: str = "t2t",

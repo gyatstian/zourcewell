@@ -49,6 +49,22 @@ def _valid_provider_id(raw) -> str:
     return ""
 
 
+def _port_number(raw: str) -> int:
+    """argparse ``type=`` for ``--port``: an int inside the bindable range.
+
+    A raw ``type=int`` accepted 70000 and only failed later inside
+    ``socket.bind`` as an uncaught OverflowError ("port must be 0-65535").
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"port must be an integer 1-65535, got {raw!r}")
+    if not 1 <= value <= 65535:
+        raise argparse.ArgumentTypeError(f"port must be 1-65535, got {value}")
+    return value
+
+
 def provider_is_registered(pid: str) -> bool:
     """True when ``pid`` names a provider the registry actually has.
 
@@ -218,6 +234,22 @@ def resolve_login_provider_id(settings, provider: str | None = None) -> str:
     return pid or "deepseek"
 
 
+def _save(settings) -> bool:
+    """``settings.save()`` with a one-line failure report instead of a traceback.
+
+    ``Settings.save()`` raises by design (an unparsable config.json, an
+    unwritable location). A traceback here is the whole UX of a one-shot CLI,
+    and in ``cmd_login`` it also discarded the token a ~30s browser
+    authorization had just produced. Returns True on success.
+    """
+    try:
+        settings.save()
+        return True
+    except Exception as exc:
+        print(f"could not write {getattr(settings, 'config_path', '')}: {exc}")
+        return False
+
+
 def _apply_serve_provider_flags(settings, args) -> int | None:
     """Apply --provider/--providers to settings. None = ok, int = exit code."""
     from .core import registry as _reg
@@ -230,7 +262,8 @@ def _apply_serve_provider_flags(settings, args) -> int | None:
             return _unknown_provider_exit(single)
         settings.provider = pid
         settings.providers = []
-        settings.save()
+        if not _save(settings):
+            return 1
         return None
     if multi:
         ids: list[str] = []
@@ -249,7 +282,8 @@ def _apply_serve_provider_flags(settings, args) -> int | None:
         else:
             settings.providers = ids
             settings.provider = ids[0]
-        settings.save()
+        if not _save(settings):
+            return 1
         return None
     return None
 
@@ -347,7 +381,8 @@ def cmd_accounts(args) -> int:
     _tmp = AccountPool(settings.accounts, current=settings.active_account)
     if sync_current_from_settings(_tmp, settings):
         settings.active_account = _tmp.current
-        settings.save()
+        if not _save(settings):
+            return 1
     action = getattr(args, "accounts_action", "list")
 
     if action == "list":
@@ -391,7 +426,8 @@ def cmd_accounts(args) -> int:
         ident = (getattr(args, "identifier", "") or "").strip()
         if getattr(args, "clear", False) or not ident or ident.lower() in ("none", "all", "auto"):
             settings.active_account = ""
-            settings.save()
+            if not _save(settings):
+                return 1
             print("Selection cleared -> ALL (auto-failover)")
             return 0
         pool = AccountPool(settings.accounts, current=settings.active_account)
@@ -399,7 +435,8 @@ def cmd_accounts(args) -> int:
             print(f"not found: {ident}")
             return 1
         settings.active_account = pool.current
-        settings.save()
+        if not _save(settings):
+            return 1
         print(f"CURRENT -> [{pool.current}] (saved)")
         return 0
 
@@ -440,7 +477,8 @@ def cmd_accounts(args) -> int:
         except ValueError as exc:
             print(f"add failed: {exc}")
             return 1
-        settings.save()
+        if not _save(settings):
+            return 1
         print(f"added {cfg.identifier} -> {settings.config_path}")
         if not cfg.token:
             print("WARNING: no token. Password-only fails (RISK_DEVICE_DETECTED).")
@@ -458,7 +496,8 @@ def cmd_accounts(args) -> int:
             return 2
         matched = _set(settings, args.identifier, token)
         if matched is not None:
-            settings.save()
+            if not _save(settings):
+                return 1
             print(f"token updated for {matched.identifier}")
             return 0
         print(f"not found: {args.identifier}")
@@ -476,7 +515,8 @@ def cmd_accounts(args) -> int:
         # Keep config file in sync with pool.
         from .accounts import remove_account as _remove
         _remove(settings, identifier)
-        settings.save()
+        if not _save(settings):
+            return 1
         print(f"removed {identifier}")
         return 0
 
@@ -505,7 +545,8 @@ def cmd_accounts(args) -> int:
             print("accounts unblock <email|mobile|identifier> -- or run it "
                   "with no identifier to clear every account.")
             return 1
-        settings.save()
+        if not _save(settings):
+            return 1
         print(f"persisted ban state cleared for {n} account(s)")
         print("If a server is running, also POST /v1/accounts/unblock "
               "(or restart it) to clear its in-memory cooldown.")
@@ -532,8 +573,25 @@ def _upsert_account(settings, email: str, password: str, token: str,
         token_expires_at = max(0.0, float(token_expires_at or 0.0))
     except (TypeError, ValueError):
         token_expires_at = 0.0
+    if provider:
+        # Explicit --provider: verbatim, same contract as `accounts add`
+        # (an id the registry does not know may still be the operator's).
+        effective = str(provider).strip().lower()
+    else:
+        # Inherited selection, coerced exactly as accounts.add_account does.
+        from .accounts import configured_provider_id as _configured
+        from .accounts import usable_provider as _usable
+
+        effective = _usable(_configured(settings))
+    if not effective:
+        effective = "deepseek"
     for a in settings.accounts:
-        if a.email and _m(a, email):
+        # Scoped to the effective provider: the same email is a distinct
+        # account per provider, and the unscoped match stamped a Qwen JWT onto
+        # the provider:deepseek record (or the reverse).
+        if (a.email and _m(a, email)
+                and ((getattr(a, "provider", "deepseek") or "deepseek"
+                      ).strip().lower() == effective)):
             a.token = token
             if password:
                 a.password = password
@@ -541,18 +599,7 @@ def _upsert_account(settings, email: str, password: str, token: str,
                 a.token_expires_at = token_expires_at
             return a
     cfg = AccountConfig(email=email, password=password, token=token)
-    if provider:
-        # Explicit --provider: verbatim, same contract as `accounts add`
-        # (an id the registry does not know may still be the operator's).
-        cfg.provider = str(provider).strip().lower()
-    else:
-        # Inherited selection, coerced exactly as accounts.add_account does.
-        from .accounts import configured_provider_id as _configured
-        from .accounts import usable_provider as _usable
-
-        cfg.provider = _usable(_configured(settings))
-    if not (cfg.provider or "").strip():
-        cfg.provider = "deepseek"
+    cfg.provider = effective
     settings.accounts.append(cfg)
     # New account becomes CURRENT (default) immediately.
     settings.active_account = cfg.identifier
@@ -699,6 +746,12 @@ def cmd_login(args) -> int:
         except Exception as exc:
             print(f"Auto-login failed: {exc}")
             return 3
+    elif _login_prov == "deepseek":
+        # --provider deepseek must PIN the driver: without the hint
+        # _obscura_login_token resolves settings.provider, so a config set to
+        # qwen sent the credentials to the QWEN signin and stored its JWT.
+        token, login_banned, ban_detail = _unpack_login_token_result(
+            _obscura_login_token(email, password, settings, "deepseek"))
     else:
         token, login_banned, ban_detail = _unpack_login_token_result(
             _obscura_login_token(email, password, settings))
@@ -707,6 +760,10 @@ def cmd_login(args) -> int:
             print(f"login refused for {email}: account BANNED per login page.")
             if ban_detail:
                 print(f"Evidence: {ban_detail[:300]}")
+        elif ban_detail:
+            # A single ban-wording sighting does not set login_banned, but the
+            # driver still reports it here; the user deserves to hear it.
+            print(f"Evidence: {ban_detail[:300]}")
         return 3
 
     _prov = _valid_provider_id(getattr(args, "provider", None)) or None
@@ -742,17 +799,30 @@ def cmd_login(args) -> int:
             pass
         acc.banned = True
         acc.banned_until = float(until or 0.0)
-        settings.save()
-        print(f"login ok, token saved for {email}, but account is BANNED.")
+        saved = _save(settings)
+        if saved:
+            print(f"login ok, token saved for {email}, but account is BANNED.")
+        else:
+            # The browser authorization is not repeatable on demand and a
+            # retry is another sign-in from this IP: show the token.
+            print(f"login ok for {email}, but account is BANNED; "
+                  f"token value: {token}")
         if acc.banned_until:
             from .providers.deepseek.protocol import format_ban_datetime
-            print("Expires:", format_ban_datetime(acc.banned_until))
+            _expires = format_ban_datetime(acc.banned_until)
+            if _expires:
+                print("Expires:", _expires)
         if ban_detail:
             print(f"Evidence: {ban_detail[:300]}")
-        print(f"Token -> {settings.config_path} (accounts list will show BANNED)")
+        if saved:
+            print(f"Token -> {settings.config_path} (accounts list will show BANNED)")
         return 3
 
-    settings.save()
+    if not _save(settings):
+        # Same reason as the banned branch: never throw away the token the
+        # ~30s browser run just produced.
+        print(f"login ok, token not saved for {email}; token value: {token}")
+        return 3
     print(f"login ok, token saved for {email} -> {settings.config_path}")
     return 0
 
@@ -821,7 +891,12 @@ def cmd_chat(args) -> int:
         # Publish for protocol.bridge_headers ban probes; without this the probe
         # falls back to bare headers (no WAF cookie/UA) and can false-negative.
         register_default_bridge(app.state.bridge)
-        app.state.bridge.warmup()
+        # Only a jar consumer needs the CHAT_HOME (DeepSeek-host) fetch. Qwen is
+        # not one: this bridge is its engine/UA source, while its cookies come
+        # from the qwen-host cache -- warming would boot obscura against
+        # chat.deepseek.com for a qwen-only request.
+        if getattr(_chat_provider, "needs_waf_jar", True):
+            app.state.bridge.warmup()
     else:
         # Local providers (opencode CLI) need no WAF bridge: skip obscura.
         app.state.bridge = None
@@ -874,7 +949,7 @@ def main(argv: list[str] | None = None) -> int:
                                 "(main menu; TUI when a console is available)")
     serve.add_argument("--host", default="",
                        help="bind address; overrides config listen=true/false")
-    serve.add_argument("--port", type=int, default=0)
+    serve.add_argument("--port", type=_port_number, default=0)
     serve.add_argument("--workers", type=int, default=1)
     serve.add_argument("--no-tui", action="store_true",
                        help="skip the main-page TUI and start the server directly")

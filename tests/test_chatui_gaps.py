@@ -3,7 +3,11 @@
 import json
 import logging
 import types
-from support import FakeUvicornConfig, FakeUvicornServer, AliveThread, DeadThread
+
+import pytest
+
+from support import (AliveThread, DeadThread, FakeUvicornConfig, FakeUvicornServer,
+                     on_disk, write_config)
 
 
 def _mk_acc(email, token="t1"):
@@ -420,3 +424,121 @@ def test_run_chat_repl_unknown_history_pop_quit_logs(monkeypatch, capsys):
     finally:
         lg.setLevel(old_lg)
         root.setLevel(old_root)
+
+
+# chat log override: runtime-only, never the saved log_level field
+
+def test_run_chat_model_pick_keeps_config_log_level(tmp_path, monkeypatch):
+    """#5: a /model pick's save() ran while settings.log_level held "ERROR",
+    so config.json came back with log_level "ERROR" and serve/dry-run were
+    silent until hand-edited. The override must stay in _runtime_log_level."""
+    from deepseaport import chat_ui
+    from deepseaport.config import load_settings
+
+    cfg = write_config(tmp_path, {"keys": [], "log_level": "INFO"})
+    s = load_settings(cfg)
+    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5097)
+    _install_single_fakes(monkeypatch, chat_ui, wait_ret=True, post_ret="hi")
+    monkeypatch.setattr(chat_ui, "resolve_chat_models", lambda st, instances=None: (
+        {"deepseek-flash": (False, False, "default"),
+         "deepseek-flash-search": (True, False, "default")},
+        ["deepseek-flash", "deepseek-flash-search"], "deepseek-flash"))
+    seen = {}
+
+    def _input(*a, **k):
+        seen.setdefault("runtime", getattr(s, "_runtime_log_level", None))
+        seen.setdefault("log_level", s.log_level)
+        return next(seq)
+
+    seq = iter(["/model deepseek-flash-search", "/quit"])
+    monkeypatch.setattr("builtins.input", _input)
+    assert chat_ui.run_chat_server(s) == 0
+    # During the session the runtime override was active while the field was not.
+    assert seen == {"runtime": "ERROR", "log_level": "INFO"}
+    # After: restored; the pick was saved and the on-disk level is untouched.
+    assert getattr(s, "_runtime_log_level", None) is None
+    assert s.log_level == "INFO"
+    disk = on_disk(cfg)
+    assert disk["log_level"] == "INFO"
+    assert disk["chat_model"] == "deepseek-flash-search"
+
+
+def test_run_chat_restores_prior_runtime_log_level(monkeypatch):
+    """The override is put back, not just cleared: a pre-set value survives."""
+    from deepseaport import chat_ui
+    from deepseaport.config import Settings
+
+    s = Settings(port=5001, config_path="", log_level="INFO")
+    s._runtime_log_level = "DEBUG"
+    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5098)
+    _install_single_fakes(monkeypatch, chat_ui, wait_ret=True, post_ret="hi")
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "/quit")
+    assert chat_ui.run_chat_server(s) == 0
+    assert s._runtime_log_level == "DEBUG"
+    assert s.log_level == "INFO"
+
+
+# #13: the client side dials the host the server actually bound
+
+def test_client_host_maps_wildcards_to_loopback_and_brackets_ipv6():
+    from deepseaport import chat_ui
+    assert chat_ui._client_host("127.0.0.2") == "127.0.0.2"
+    assert chat_ui._client_host("localhost") == "localhost"
+    assert chat_ui._client_host("0.0.0.0") == "127.0.0.1"
+    assert chat_ui._client_host("") == "127.0.0.1"
+    assert chat_ui._client_host("::") == "127.0.0.1"
+    assert chat_ui._client_host("::0") == "127.0.0.1"
+    assert chat_ui._client_host("::1") == "[::1]"
+    assert chat_ui._client_host("[::1]") == "[::1]"
+
+
+@pytest.mark.parametrize("host,url", [
+    ("127.0.0.2", "http://127.0.0.2:5099"),
+    ("0.0.0.0", "http://127.0.0.1:5099"),
+    ("::1", "http://[::1]:5099"),
+])
+def test_run_chat_server_dials_the_bind_host(monkeypatch, capsys, host, url):
+    """#13: `--host 127.0.0.2` bound the server there while the readiness probe
+    and every REPL message dialed 127.0.0.1 -> connection refused."""
+    from deepseaport import chat_ui
+    from deepseaport.config import Settings
+
+    s = Settings(port=5001, config_path="", log_level="INFO")
+    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5099)
+    _install_single_fakes(monkeypatch, chat_ui, wait_ret=True, post_ret="hi")
+    dialed: list[str] = []
+    monkeypatch.setattr(chat_ui, "_wait_for_server",
+                        lambda target, *a, **k: dialed.append(target) or True)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "/quit")
+    assert chat_ui.run_chat_server(s, types.SimpleNamespace(host=host)) == 0
+    assert dialed == [url]
+    assert url in capsys.readouterr().out
+
+
+def test_run_multi_chat_servers_dials_the_bind_host(monkeypatch, capsys):
+    """#13, multi: `bases` was built from 127.0.0.1 regardless of `--host`."""
+    from deepseaport import chat_ui
+    from deepseaport.config import Settings
+
+    a1 = _mk_acc("a1@x.com", "tok-a1")
+    s = Settings(accounts=[a1], keys=["k"], port=5011, config_path="")
+    monkeypatch.setattr(chat_ui, "_select_usable_accounts_live", lambda st: ([a1], 0, 0))
+    monkeypatch.setattr(chat_ui, "_allocate_sequential_ports",
+                        lambda h, b, n, is_free=None: [5011][:n])
+    monkeypatch.setattr("uvicorn.Config", FakeUvicornConfig)
+    monkeypatch.setattr("uvicorn.Server", FakeUvicornServer)
+    monkeypatch.setattr("threading.Thread", AliveThread)
+    monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
+    dialed: list[str] = []
+    monkeypatch.setattr(chat_ui, "_wait_for_server",
+                        lambda target, *a, **k: dialed.append(target) or True)
+    posted: list[str] = []
+    monkeypatch.setattr(chat_ui, "_post_completion",
+                        lambda base, key, model, hist: posted.append(base) or "ok")
+    seq = iter(["hi", "/quit"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(seq))
+    assert chat_ui.run_multi_chat_servers(
+        s, args=types.SimpleNamespace(host="127.0.0.2"), count=1) == 0
+    assert dialed == ["http://127.0.0.2:5011"]
+    assert posted == ["http://127.0.0.2:5011"]
+    assert "http://127.0.0.2:5011" in capsys.readouterr().out

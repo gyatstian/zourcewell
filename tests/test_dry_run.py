@@ -128,6 +128,17 @@ def test_dry_prepare_error_parity():
                   json={"model": "deepseek-flash", "messages": []}).status_code == 400
 
 
+def test_dry_models_requires_a_key():
+    """Same gate as the live route: /v1/models carried the key check nowhere,
+    so a dry run with keys configured still listed every model to anyone."""
+    c = TestClient(create_dry_app(_settings(keys=["sk-test"])),
+                   raise_server_exceptions=False)
+    assert c.get("/v1/models").status_code == 401
+    ok = c.get("/v1/models", headers={"Authorization": "Bearer sk-test"})
+    assert ok.status_code == 200, ok.text
+    assert "deepseek-flash" in [m["id"] for m in ok.json()["data"]]
+
+
 def test_dry_frontend_off_sends_note_but_prints_full(capsys):
     s = _settings(append_top="HDR", send_dry_run_to_frontend=False)
     c = TestClient(create_dry_app(s))

@@ -7,6 +7,7 @@ from fastapi import HTTPException
 
 from deepseaport.core import registry
 from deepseaport.core.provider import ModelSpec, Provider
+from deepseaport.providers.deepseek import completion_service as DSCS
 from deepseaport.providers.deepseek.models import DEFAULT_MODEL, MODELS_SPEC
 from deepseaport.providers.deepseek.provider import DeepSeekProvider
 from deepseaport.server import MODELS
@@ -98,3 +99,19 @@ def test_models_spec_defaults():
     assert spec.id == "deepseek-flash-reasoner"
     assert spec.thinking is True
     assert spec.capabilities == {}
+
+
+def test_classify_rate_limit_beats_retry_phrase():
+    """#8. A throttled body that also says "try again" must classify as the
+    terminal RATE_LIMIT (429), never as retryable OVERLOAD: the overload row
+    re-POSTs with a fresh PoW into the same throttle and surfaces 503.
+    Qwen's classifier checks the rate limit first for the same reason."""
+    msg = "429 rate limit exceeded, please try again"
+    assert DSCS.classify_error(msg) is DSCS.RetryKind.RATE_LIMIT
+    with pytest.raises(HTTPException) as exc:
+        DSCS._raise_for_terminal_error(None, None, {}, None, msg, "", None)
+    assert exc.value.status_code == 429, exc.value.detail
+    # A plain retry phrase with no throttle marker stays retryable overload.
+    assert DSCS.classify_error(
+        "generation_timeout: Server busy, please try again later."
+    ) is DSCS.RetryKind.OVERLOAD

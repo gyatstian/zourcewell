@@ -82,12 +82,16 @@ v2 has **no message-level tool map at all** — the prompt body carries
 `{"text": ...}` and nothing else, and the declare-14-native-keys / grant-one-
 `read` machinery that used to ride it is gone with the rest of the body. What
 bounds tool access is the managed agent's permission map in
-`managed_serve.managed_config_content`: `read` allow, `edit` / `bash` /
-`webfetch` / `external_directory` deny, at both the global and the agent
-level. That map is now the ONLY layer, so it is where any future grant must be
-made deliberately. v2 normalizes the keys we send (`agent` -> `agents`,
-`prompt` -> `system`, `bash` -> `shell`); the serve accepts the un-normalized
-spellings.
+`managed_serve.managed_config_content`: `read` / `glob` / `grep` / `subagent`
+/ `edit` / `bash` / `webfetch` / `external_directory` all deny, at both the
+global and the agent level. `read` (and `grep`, which prints matching file
+content) is denied because sessions are rooted at the caller's directory,
+where `config.json` — plaintext passwords and bearer tokens — can sit; on v2
+write/patch normalize to `edit` and `task` to `subagent`, so those aliases are
+covered by the same keys. That map is now the ONLY layer, so it is where any
+future grant must be made deliberately. v2 normalizes the keys we send
+(`agent` -> `agents`, `prompt` -> `system`, `bash` -> `shell`); the serve
+accepts the un-normalized spellings.
 
 DSML harness tools are unaffected: pi's tools arrive as DSML text in the
 prompt and the reply comes back as DSML `tool_calls`, parsed by

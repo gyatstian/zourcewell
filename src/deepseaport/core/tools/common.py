@@ -724,7 +724,9 @@ def _recover_loose_openai_call(text: str, valid: set[str] | None,
         if end <= value_start:
             return None
         raw = text[value_start + 1:end]
-    elif text[value_start] in "{[":
+    elif text[value_start] == "{":
+        # Object only: _balanced_json balances braces, so an array-shaped
+        # arguments value (starting "[") is not recoverable.
         raw = _balanced_json(text, value_start)
         if not raw:
             return None

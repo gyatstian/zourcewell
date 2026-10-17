@@ -172,6 +172,27 @@ def test_classify_captcha_visible_flag():
     assert classify_page_state("healthy page", True) == ("captcha", "visible challenge overlay")
 
 
+# --- parse_ban_until ---
+
+def test_parse_ban_until_month_year_only_is_none():
+    """'September 2026' has no day: the old pattern ate "20" out of the year."""
+    assert auth.parse_ban_until("September 2026") is None
+
+
+def test_parse_ban_until_comma_polish_and_good_strings():
+    import datetime as _dt
+
+    def _local(s):
+        v = auth.parse_ban_until(s)
+        return _dt.datetime.fromtimestamp(v) if v else None
+
+    # Day-first with a comma before the year and Polish "o" before the time.
+    assert _local("16 wrzesnia, 2026 o 12:49") == _dt.datetime(2026, 9, 16, 12, 49)
+    # The two forms that already worked stay unchanged.
+    assert _local("16 September 2026 12:49") == _dt.datetime(2026, 9, 16, 12, 49)
+    assert _local("wrzesien 16, 2026 21:18") == _dt.datetime(2026, 9, 16, 21, 18)
+
+
 # --- BrowserLogin.run ---
 
 def test_browser_login_run_missing_credentials(monkeypatch):
@@ -476,7 +497,9 @@ def test_browser_login_real_captcha_tuple_reaches_obscura(monkeypatch):
 
     monkeypatch.setattr(
         rb, "login_with_real_browser",
-        lambda *a, **k: (None, False, "real browser login captcha (phrase='x')"))
+        lambda *a, **k: (None, False,
+                         "real browser login captcha (phrase='x')"
+                         " [ban wording seen in an earlier frame]"))
     monkeypatch.setattr(BrowserLogin, "run",
                         lambda self, e, p: LoginResult(token="tok-after-captcha"))
     assert browser_login("a@x.com", "pw", _settings()).token == "tok-after-captcha"
@@ -752,9 +775,25 @@ def test_real_browser_login_captcha_phrase_wins_over_ban_flag(monkeypatch):
     monkeypatch.setattr(rb, "snapshot", _snap)
     tok, banned, detail = rb.login("a@x.com", "pw")
     assert tok is None
-    # The ban hint observed on an earlier snapshot is preserved on the way out.
-    assert banned is True
+    # One ban sighting is a hint, not a verdict: the captcha exit reports it
+    # in the detail, never in the banned slot (auth.py only stops on a token
+    # or a confirmed ban, so the Obscura fallback still runs).
+    assert banned is False
     assert "captcha" in detail
+    assert "[ban wording seen in an earlier frame]" in detail
+
+
+def test_real_browser_login_two_ban_frames_confirm(monkeypatch):
+    """Two consecutive ban frames are the verdict, matching auth's ban_streak."""
+    rb = _stub_login_rb(monkeypatch, [
+        {"url": "u", "token": None, "body": "account muted",
+         "captcha_visible": False},
+        {"url": "u", "token": None, "body": "account suspended",
+         "captcha_visible": False},
+    ])
+    tok, banned, detail = rb.login("a@x.com", "pw")
+    assert tok is None and banned is True
+    assert "suspension" in detail
 
 
 def test_real_browser_login_ban_hint_with_token(monkeypatch):

@@ -985,3 +985,51 @@ def test_recovery_failure_log_is_scrubbed_and_traceback_free(caplog):
     assert "'pow'" in caplog.text and "RuntimeError" in caplog.text, caplog.text
     assert "user is muted" in caplog.text, "scrubbing must not eat the diagnosis"
 
+
+# K9: qwen shipped the bridge's DeepSeek jar to chat.qwen.ai ------------------
+#
+# The app bridge holds ONE jar, warmed against CHAT_HOME (chat.deepseek.com).
+# qwen's `_headers` read `bridge.cookie_header()` and put the whole jar on
+# every qwen request, i.e. handed chat.qwen.ai a live aws-waf-token its
+# operator never gave it. Qwen's own cookies are its client-side acw_tc cache
+# (prime/fetch against the qwen host); the bridge now contributes only the UA.
+
+
+def test_qwen_headers_never_ship_the_bridge_jar(monkeypatch):
+    from deepseaport.providers.qwen import client as QC
+
+    QC._clear_waf_cache()
+    try:
+        class _State:
+            user_agent = "DS-UA"
+
+        class _Bridge:
+            state = _State()
+
+            def cookie_header(self, names=None):
+                return "aws-waf-token=SECRETWAF; intercom-device-id=ID"
+
+        class _St:
+            bridge = _Bridge()
+
+        class _App:
+            state = _St()
+
+        monkeypatch.setattr("deepseaport.core.obscura_bridge.get_default_bridge",
+                            lambda: _Bridge())
+
+        h = QCS._headers(_App(), "jwtLEAK")
+        assert "aws-waf-token" not in str(h)
+        assert "SECRETWAF" not in str(h)
+        assert h["Cookie"] == "token=jwtLEAK"
+        assert h["User-Agent"] == "DS-UA"
+
+        # The no-app-bridge fallback must not source the DeepSeek jar either.
+        h2 = QCS._headers(None, "jwtLEAK2")
+        assert "aws-waf-token" not in str(h2)
+        assert "SECRETWAF" not in str(h2)
+        assert h2["Cookie"] == "token=jwtLEAK2"
+        assert h2["User-Agent"] == "DS-UA"
+    finally:
+        QC._clear_waf_cache()
+

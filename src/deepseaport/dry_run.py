@@ -171,12 +171,15 @@ def create_dry_app(settings: Settings | None = None) -> FastAPI:
         return {"ok": True, "dry_run": True}
 
     @app.get("/v1/models")
-    async def list_models():
+    async def list_models(authorization: str = Header(default="")):
+        # Same key gate as /v1/chat/completions (only /health stays open), so
+        # the dry surface cannot be enumerated by an unauthenticated client.
+        settings_ = app.state.settings
+        _check_auth(settings_, authorization)
         # Central listing shared with the live route (F6): catalogue +
         # owned_by in server_routes.build_models_list. Outer fallback keeps
         # the dry surface up even if provider discovery fails.
         try:
-            settings_ = app.state.settings
             return {"object": "list", "data": build_models_list(settings_)}
         except Exception:
             import time as _time
@@ -241,7 +244,7 @@ def run_dry_run(settings: Settings, args=None) -> int:
 
     app = create_dry_app(settings)
     host = _resolve_bind_host(settings, args)
-    port = _ensure_free_port(settings, host, int(getattr(settings, "port", 5001)))
+    port = _ensure_free_port(settings, host, getattr(settings, "port", 5001))
     log_level = str(getattr(settings, "log_level", "info")).lower()
     print()
     print(f"  Dry run live at http://127.0.0.1:{port} (bind {host}:{port})")

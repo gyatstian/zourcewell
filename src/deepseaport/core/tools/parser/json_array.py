@@ -16,8 +16,13 @@ logger = logging.getLogger("deepseaport.tools")
 
 
 def try_parse_json_array(text, valid_or_none, limit_args, forgiving_on,
-                         diagnostics=None):
-    """First match wins: single left-to-right balanced scan (linear)."""
+                         diagnostics=None, skip_spans=None):
+    """First match wins: single left-to-right balanced scan (linear).
+
+    ``skip_spans`` (orchestrator-supplied DSML invoke spans) marks regions
+    whose content is raw text, not markup: a sample inside one must not be
+    read as a call ahead of the DSML parser. ``None`` = no skipping.
+    """
     # Fast C-level exit: no tool_calls marker means no work (plain answers
     # with many "{" skip Python-loop balanced scans entirely).
     if '"tool_calls"' not in text:
@@ -35,6 +40,9 @@ def try_parse_json_array(text, valid_or_none, limit_args, forgiving_on,
         if start < 0:
             break
         scanned += 1
+        if skip_spans and any(s <= start < e for s, e in skip_spans):
+            pos = start + 1
+            continue
         obj_text = _balanced_json(text, start)
         if not obj_text:
             pos = start + 1

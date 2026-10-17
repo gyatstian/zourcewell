@@ -51,6 +51,29 @@ class _FakeResp:
         return None
 
 
+class _DrainedResp(_FakeResp):
+    """A 200 non-SSE double that RAISES if its body is iterated a second time.
+
+    curl_cffi does not yield EOF for a second iteration of a drained, closed
+    response: against 0.16.3 a 200 + empty body parked in the second
+    ``iter_lines`` forever, with no exception to unwind on (a local server
+    repro sat there for 3s+). A test cannot model "blocks forever", so the
+    second call raises instead -- the point under test is that the fixed code
+    never reaches it.
+    """
+
+    def __init__(self, status_code=200, **kw):
+        super().__init__(status_code, **kw)
+        self.iter_lines_calls = 0
+
+    def iter_lines(self):
+        self.iter_lines_calls += 1
+        if self.iter_lines_calls > 1:
+            raise AssertionError(
+                "pump_sse re-iterated a drained+closed 200 response")
+        return super().iter_lines()
+
+
 def _sess(monkeypatch, *, get=None, get_exc=None, post=None, post_exc=None,
           delete=None, delete_exc=None):
     attrs = {}
@@ -526,6 +549,24 @@ def test_stream_completion_200_json_success_false(monkeypatch):
     assert resp.closed is True
 
 
+def test_stream_completion_empty_200_body_is_upstream_error(monkeypatch):
+    # Pre-change: with nothing to yield (no WAF body, no envelope, empty
+    # body) the code closed the response and fell through to
+    # T.pump_sse, which iterated the drained stream a SECOND time -> parked
+    # forever, holding the worker and the account slot (reproduced against
+    # curl_cffi 0.16.3; _DrainedResp raises where curl_cffi blocks).
+    resp = _DrainedResp(200, text="", content_type="application/json",
+                        lines=[])
+    _sess(monkeypatch, post=resp)
+    events = list(QC.stream_completion({"h": "1"}, {"prompt": "hi"}))
+    assert len(events) == 1
+    assert events[0].kind == "error"
+    assert events[0].code == "UPSTREAM_ERROR"
+    assert "empty" in events[0].message
+    assert resp.iter_lines_calls == 1, "the SSE pump re-entered the drained body"
+    assert resp.closed is True
+
+
 # 403 mapping / ban classification (Qwen's WAF is 200 + text/html, never 403) ---
 
 
@@ -803,6 +844,11 @@ def test_cookie_names_only_no_values():
 
 
 def test_bridge_headers_explicit_bridge_wins_over_default(monkeypatch):
+    """The explicit bridge supplies the UA; NO bridge supplies cookies.
+
+    This test used to pin the leak: the app bridge's jar (the DeepSeek-host
+    WAF jar) was merged into the Cookie header and shipped to chat.qwen.ai.
+    """
     class _State:
         def __init__(self, ua):
             self.user_agent = ua
@@ -817,44 +863,48 @@ def test_bridge_headers_explicit_bridge_wins_over_default(monkeypatch):
 
     monkeypatch.setattr("deepseaport.core.obscura_bridge.get_default_bridge",
                         lambda: _B("DEFAULT-UA", "acw_tc=default; token=OLDDEFAULT"))
-    app_bridge = _B("APP-UA", "acw_tc=appcookies")
+    app_bridge = _B("APP-UA", "aws-waf-token=DSJAR")
     h = QP.bridge_headers(bearer="jwt123", bridge=app_bridge)
     assert h["User-Agent"] == "APP-UA"
-    assert "DEFAULT" not in h["Cookie"]
-    assert "acw_tc=appcookies" in h["Cookie"]
-    assert "token=jwt123" in h["Cookie"]
-    assert "OLDDEFAULT" not in h["Cookie"]
-    # explicit None forces fallback (no bridge cookies, token still sent)
+    assert h["Cookie"] == "token=jwt123"
+    assert "aws-waf-token" not in h["Cookie"]
+    assert "DEFAULT" not in str(h)
+    # explicit None forces fallback (no bridge UA, token still sent)
     h2 = QP.bridge_headers(bearer="jwt123", bridge=None)
     assert h2["Cookie"] == "token=jwt123"
 
 
 def test_headers_prefers_app_bridge(monkeypatch):
-    class _State:
-        def __init__(self, ua):
-            self.user_agent = ua
+    """The app bridge's UA wins over the default; its jar never ships."""
+    QC._clear_waf_cache()
+    try:
+        class _State:
+            def __init__(self, ua):
+                self.user_agent = ua
 
-    class _B:
-        def __init__(self, ua, cookies):
-            self.state = _State(ua)
-            self._c = cookies
+        class _B:
+            def __init__(self, ua, cookies):
+                self.state = _State(ua)
+                self._c = cookies
 
-        def cookie_header(self):
-            return self._c
+            def cookie_header(self):
+                return self._c
 
-    class _St:
-        bridge = _B("APP-UA", "acw_tc=app")
+        class _St:
+            bridge = _B("APP-UA", "aws-waf-token=ds-jar")
 
-    class _App:
-        state = _St()
+        class _App:
+            state = _St()
 
-    monkeypatch.setattr("deepseaport.core.obscura_bridge.get_default_bridge",
-                        lambda: _B("DEFAULT-UA", "acw_tc=default"))
-    h = QCS._headers(_App(), "jwt999")
-    assert h["User-Agent"] == "APP-UA"
-    assert "acw_tc=app" in h["Cookie"]
-    assert "token=jwt999" in h["Cookie"]
-    assert "DEFAULT" not in str(h)
+        monkeypatch.setattr("deepseaport.core.obscura_bridge.get_default_bridge",
+                            lambda: _B("DEFAULT-UA", "aws-waf-token=default-jar"))
+        h = QCS._headers(_App(), "jwt999")
+        assert h["User-Agent"] == "APP-UA"
+        assert "aws-waf-token" not in str(h)
+        assert h["Cookie"] == "token=jwt999"
+        assert "DEFAULT" not in str(h)
+    finally:
+        QC._clear_waf_cache()
 
 
 def test_ensure_token_cookie_merges_and_wins():

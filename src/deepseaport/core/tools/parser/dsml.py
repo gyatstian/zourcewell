@@ -330,6 +330,18 @@ def _scan_dsml_calls(text: str, forgiving: bool = False,
                            if pidx + 1 < len(params) else param_limit)
             pclose = _find_close(norm, value_start, value_limit, param_close,
                                  generic_close)
+            if pclose is None and named_close is None:
+                # A raw value may quote invoke markup, which the opens scan
+                # took for a nested block and used as body_end. The value is
+                # still raw: accept its own close farther out, unless another
+                # <parameter> open comes first (that means the value was cut,
+                # not quoted).
+                far = _find_close(norm, value_start, len(norm), param_close,
+                                  generic_close)
+                if (far is not None
+                        and param_open.search(norm, value_start,
+                                              far.start()) is None):
+                    pclose = far
             value_stop = pclose.start() if pclose else value_limit
             pattrs = _parse_dsml_attrs(pm.group(1) or "", forgiving=forgiving)
             pname = pattrs.get("name")
@@ -373,7 +385,10 @@ def _scan_dsml_calls(text: str, forgiving: bool = False,
             generic = generic_close.search(norm, last_param_end, body_end)
             inv_close = generic
         out.append({"function": {"name": eff_name, "arguments": args}})
-        span_end = inv_close.end() if inv_close else body_end
+        # max(): a raw value whose own close lies past body_end (quoted invoke
+        # markup) owns that range, so the span must cover it.
+        span_end = inv_close.end() if inv_close else max(body_end,
+                                                         last_param_end)
         spans.append((inv.start(), span_end))
     return out, spans
 

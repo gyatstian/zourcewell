@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Iterator, Literal
@@ -79,8 +80,13 @@ def _as_float(value) -> float | None:
         if value is None or isinstance(value, bool):
             return None
         num = float(value)
-        # mute_until is seconds (float) — reject millisec typos, keep sane range.
-        if num <= 0:
+        if not math.isfinite(num) or num <= 0:
+            return None
+        # mute_until is unix seconds; a millisecond value scales down.
+        if num > 1e10:
+            num /= 1000.0
+        # Beyond this datetime cannot represent it: unknown expiry, not a crash.
+        if num > 253402300799:
             return None
         return num
     except (TypeError, ValueError):
@@ -191,37 +197,45 @@ def detect_ban(data: dict) -> tuple[bool, float | None]:
         return False, None
 
 
-def _ban_dt(mute_until: float):
+def _ban_dt(mute_until: float | None):
+    """Local datetime for a unix ts, or None when it cannot be represented."""
     import datetime as _dt
 
-    return _dt.datetime.fromtimestamp(float(mute_until))
+    try:
+        return _dt.datetime.fromtimestamp(float(mute_until))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
 
 
-def format_ban_day_month(mute_until: float) -> str:
-    """'16 September' from unix ts (local time, matches web UI wording)."""
+def format_ban_day_month(mute_until: float | None) -> str:
+    """'16 September' from unix ts (local time, matches web UI wording); '' when unusable."""
     dt = _ban_dt(mute_until)
+    if dt is None:
+        return ""
     return f"{dt.day} {dt.strftime('%B')}"
 
 
-def format_ban_datetime(mute_until: float) -> str:
-    """'16 September 2026 12:49' from unix ts (local time)."""
+def format_ban_datetime(mute_until: float | None) -> str:
+    """'16 September 2026 12:49' from unix ts (local time); '' when unusable."""
     dt = _ban_dt(mute_until)
+    if dt is None:
+        return ""
     return f"{dt.day} {dt.strftime('%B')} {dt.year} {dt.strftime('%H:%M')}"
 
 
 def format_ban_label(mute_until: float | None) -> str:
     """'(BANNED: 16 September)' — red wrapper applied by caller."""
-    if mute_until is None:
-        return "(BANNED)"
-    return f"(BANNED: {format_ban_day_month(mute_until)})"
+    day_month = format_ban_day_month(mute_until)
+    return f"(BANNED: {day_month})" if day_month else "(BANNED)"
 
 
 def ban_message(mute_until: float | None, *, prefix: str = "") -> str:
     """Full human error: ban reason + expiry, mirrors web UI wording."""
     base = prefix or "Due to violation of user policies, your account has been suspended"
-    if mute_until is None:
+    stamp = format_ban_datetime(mute_until)
+    if not stamp:
         return f"{base} (expiry unknown). If you have any questions, please contact us."
-    return (f"{base} until {format_ban_datetime(mute_until)}. "
+    return (f"{base} until {stamp}. "
             "If you have any questions, please contact us.")
 
 
@@ -229,9 +243,9 @@ def with_ban_expiry(msg: str, data: dict) -> str:
     """Append the ban expiry suffix when the envelope carries a ban."""
     try:
         if is_ban_payload(data):
-            ts = extract_ban_timestamp(data)
-            if ts is not None:
-                return f"{msg} (suspended until {format_ban_datetime(ts)})".strip()
+            stamp = format_ban_datetime(extract_ban_timestamp(data))
+            if stamp:
+                return f"{msg} (suspended until {stamp})".strip()
     except Exception:
         pass
     return msg

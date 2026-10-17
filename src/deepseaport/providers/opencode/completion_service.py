@@ -156,7 +156,8 @@ def _attempt(prompt: str, model: str, timeout: float,
         try:
             result = OC.send_message(session_id, provider_id, model_id,
                                      agent, prompt, timeout=timeout,
-                                     variant=variant)
+                                     variant=variant,
+                                     cancel_event=cancel_event)
         except _StreamCancelled:
             raise
         except Exception as exc:
@@ -167,7 +168,8 @@ def _attempt(prompt: str, model: str, timeout: float,
                 try:
                     result = OC.send_message(
                         session_id, provider_id, model_id,
-                        agent, prompt, timeout=timeout)
+                        agent, prompt, timeout=timeout,
+                        cancel_event=cancel_event)
                 except _StreamCancelled:
                     raise
                 except Exception as exc2:
@@ -462,15 +464,19 @@ async def _stream_completion(app: FastAPI, pool, item, prep: dict):
     # covers the whole producer budget, not one read"); DeepSeek passes the
     # same argument at providers/deepseek/completion_service.py:1156.
     #
-    # Without it the consumer waits 180 + 10 s while this producer's own
-    # deadline is create(30) + turn(180) + one overload retry(180) = 390 s, so
-    # a healthy-but-slow serve was answered with
-    # {"error": {"message": "upstream timed out"}} and a valid, fully
-    # assembled reply was thrown away. Live mode keeps the single-read budget
-    # exactly: every delta resets the per-get clock.
+    # The watchdog must be sized from the SAME timeout the producer runs with:
+    # `_run_completion_core` reads DEEPSEAPORT_OPENCODE_TIMEOUT
+    # (P.opencode_timeout), so passing the raw OC.DEFAULT_TIMEOUT here left a
+    # raised knob (600) with a 180 + 10 s consumer while the producer's
+    # deadline was create(30) + turn(600) + one overload retry(600) -- a
+    # healthy-but-slow serve was answered {"error": {"message": "upstream
+    # timed out"}} and a fully assembled reply was thrown away. Live mode
+    # keeps the single-read budget exactly: every delta resets the per-get
+    # clock.
+    timeout = P.opencode_timeout(OC.DEFAULT_TIMEOUT)
     (cid, created, out, cancel_event, consumer_timeout, model,
      _emit, _put) = _engine.new_producer_context(
-        prep, OC.DEFAULT_TIMEOUT, _CONSUMER_GRACE_SECONDS, buffered=not live)
+        prep, timeout, _CONSUMER_GRACE_SECONDS, buffered=not live)
 
     def _produce(*, live_produce: bool) -> None:
         try:
