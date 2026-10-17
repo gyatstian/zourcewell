@@ -28,7 +28,7 @@ def test_registry_default_and_get():
 def test_deepseek_models_match_compat_table():
     provider = DeepSeekProvider()
     assert set(provider.models()) == set(MODELS)
-    assert provider.default_model() == DEFAULT_MODEL
+    assert next(iter(provider.models())) == DEFAULT_MODEL
     assert isinstance(provider.models()["deepseek-flash"], ModelSpec)
 
 
@@ -36,8 +36,7 @@ def test_model_spec_case_insensitive():
     provider = DeepSeekProvider()
     assert provider.model_spec("DEEPSEEK-FLASH") is not None
     assert provider.model_spec("deepseek-flash").thinking is False
-    assert provider.accepts_model("deepseek-flash-reasoner")
-    assert not provider.accepts_model("gpt-99")
+    assert provider.model_spec("deepseek-flash-reasoner") is not None
     assert provider.model_spec("gpt-99") is None
 
 
@@ -98,7 +97,6 @@ def test_models_spec_defaults():
     spec = MODELS_SPEC["deepseek-flash-reasoner"]
     assert spec.id == "deepseek-flash-reasoner"
     assert spec.thinking is True
-    assert spec.capabilities == {}
 
 
 def test_classify_rate_limit_beats_retry_phrase():

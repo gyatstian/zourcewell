@@ -293,20 +293,6 @@ def test_g3_acquire_slot_or_499_503_and_429_use_the_pool_label():
     assert (e429.status_code, e429.detail) == (429, "all Qwen accounts busy, retry later")
 
 
-def test_g3_acquire_slot_or_499_accepts_an_explicit_label():
-    """G3: the OPTIONAL keyword lets a caller name the provider for a pool
-    that cannot (e.g. an empty pool built before the accounts were added)."""
-    empty = AccountPool([])  # no members -> would fall back to DeepSeek
-
-    async def scenario() -> HTTPException:
-        with pytest.raises(HTTPException) as ei:
-            await _acquire_slot_or_499(empty, _Req(), threading.Event(), 0.1, True,
-                                       provider_label="Qwen")
-        return ei.value
-
-    assert asyncio.run(scenario()).detail == "no Qwen accounts in pool"
-
-
 def test_g3_no_label_fallback_keeps_the_historical_deepseek_wording():
     """G3 (fallback): a pool with no members and no explicit label -- and a
     duck-typed pool exposing no label at all -- must still say exactly what
@@ -361,15 +347,13 @@ def test_g3_pool_provider_id_and_signature_are_backwards_compatible():
     assert AccountPool([]).provider_id == "deepseek"
 
 
-def test_g3_acquire_slot_or_499_signature_only_gained_an_optional_kwarg():
-    """G3: the exported signature keeps all five positional parameters, so the
-    two 5-arg call sites in server_routes need no change."""
+def test_g3_acquire_slot_or_499_keeps_five_positional_params():
+    """G3: the exported signature is exactly the five positional parameters
+    server_routes calls it with."""
     sig = inspect.signature(_acquire_slot_or_499)
     names = list(sig.parameters)
-    assert names == ["pool", "request", "cancel_event", "timeout", "allow_failover",
-                     "provider_label"]
-    assert sig.parameters["provider_label"].default is None
-    for name in ("pool", "request", "cancel_event", "timeout", "allow_failover"):
+    assert names == ["pool", "request", "cancel_event", "timeout", "allow_failover"]
+    for name in names:
         assert sig.parameters[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
 
 
@@ -640,10 +624,9 @@ def test_g7_server_reexports_keep_their_historical_signatures():
         _cs._complete_with_failover_sync).parameters) == [
         "app", "pool", "prep", "first_item", "cancel_event",
         "on_content", "on_thinking", "allow_failover"]
-    # 5 positional + the optional label keyword added by G3.
+    # 5 positional parameters, unchanged.
     assert list(inspect.signature(_sc._acquire_slot_or_499).parameters) == [
-        "pool", "request", "cancel_event", "timeout", "allow_failover",
-        "provider_label"]
+        "pool", "request", "cancel_event", "timeout", "allow_failover"]
     # The engine's `del` must not have leaked into any of them.
     for name in ("_ban_403_for_item", "_ensure_token", "_headers",
                  "_is_invalid_token_error", "_is_transient_overload"):

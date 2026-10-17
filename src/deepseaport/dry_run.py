@@ -176,26 +176,9 @@ def create_dry_app(settings: Settings | None = None) -> FastAPI:
         # the dry surface cannot be enumerated by an unauthenticated client.
         settings_ = app.state.settings
         _check_auth(settings_, authorization)
-        # Central listing shared with the live route (F6): catalogue +
-        # owned_by in server_routes.build_models_list. Outer fallback keeps
-        # the dry surface up even if provider discovery fails.
-        try:
-            return {"object": "list", "data": build_models_list(settings_)}
-        except Exception:
-            import time as _time
-
-            now = int(_time.time())
-            try:
-                from .server import MODELS as _MODELS
-            except Exception:
-                _MODELS = {"deepseek-flash": (False, False, "default")}
-            return {
-                "object": "list",
-                "data": [
-                    {"id": m, "object": "model", "created": now, "owned_by": "deepseek"}
-                    for m in _MODELS
-                ],
-            }
+        # Central listing shared with the live route: catalogue + owned_by in
+        # server_routes.build_models_list.
+        return {"object": "list", "data": build_models_list(settings_)}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: dict, request: Request,
@@ -209,8 +192,8 @@ def create_dry_app(settings: Settings | None = None) -> FastAPI:
         # of it is sent back to the requesting client. Off the event loop:
         # json.dumps(indent=2) plus a flushing print on an 8 MB body blocks
         # every other connection (including the SSE one) for the whole dump.
-        # _print_dry_run stays sync at module level: the TUI/CLI call it
-        # directly, and _PRINT_LOCK still serializes concurrent dumps.
+        # _print_dry_run stays a sync module function (tests pin that);
+        # _PRINT_LOCK serializes the concurrent dumps.
         await asyncio.to_thread(_print_dry_run, num, body, prep)
         send = bool(getattr(settings_, "send_dry_run_to_frontend", True))
         content = _dry_content(num, body, prep, send)
@@ -237,10 +220,8 @@ def run_dry_run(settings: Settings, args=None) -> int:
         lan_exposure_notice,
     )
 
-    try:
-        from .cli import _ensure_free_port
-    except Exception:
-        from .server_runner import _ensure_free_port as _ensure_free_port  # type: ignore
+    # Kept as the cli-level name: tests monkeypatch deepseaport.cli._ensure_free_port.
+    from .cli import _ensure_free_port
 
     app = create_dry_app(settings)
     host = _resolve_bind_host(settings, args)

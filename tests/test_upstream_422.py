@@ -116,30 +116,18 @@ def test_stream_completion_preserves_422_json_detail(monkeypatch):
 # 2. server maps upstream 422 -> 502, never RuntimeError/500 ---------------
 
 
-def test_run_core_maps_http_422_to_502(monkeypatch, tmp_path):
+@pytest.mark.parametrize("attempt_error", [
+    "HTTP_422: ",  # the crash shape: error text with no body at all
+    'HTTP_422: {"detail":[{"loc":["body"]}]}',  # a 422 that carries a body
+])
+def test_run_core_maps_http_422_to_502(monkeypatch, tmp_path, attempt_error):
     """The exact user crash: 'HTTP_422: ' must raise 502, not RuntimeError."""
     app = app_with_bridge(_settings())
     cached_wasm(monkeypatch, tmp_path)
     _stub_session_pow(monkeypatch)
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.completion_service._attempt", lambda *a, **k: ("", "", "HTTP_422: ", 0))
-    prep = _prepare({"model": "deepseek-flash",
-                     "messages": [{"role": "user", "content": "hi"}]})
-    item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
-
-    with pytest.raises(HTTPException) as exc_info:
-        _run_completion_core(app, item, prep)
-    assert exc_info.value.status_code == 502
-    assert "422" in str(exc_info.value.detail)
-
-
-def test_run_core_maps_422_with_body_to_502(monkeypatch, tmp_path):
-    app = app_with_bridge(_settings())
-    cached_wasm(monkeypatch, tmp_path)
-    _stub_session_pow(monkeypatch)
-    monkeypatch.setattr(
         "deepseaport.providers.deepseek.completion_service._attempt",
-        lambda *a, **k: ("", "", 'HTTP_422: {"detail":[{"loc":["body"]}]}', 0))
+        lambda *a, **k: ("", "", attempt_error, 0))
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
@@ -147,7 +135,9 @@ def test_run_core_maps_422_with_body_to_502(monkeypatch, tmp_path):
     with pytest.raises(HTTPException) as exc_info:
         _run_completion_core(app, item, prep)
     assert exc_info.value.status_code == 502
-    assert "rejected" in str(exc_info.value.detail).lower()
+    detail = str(exc_info.value.detail)
+    assert "422" in detail
+    assert "rejected" in detail.lower()
 
 
 def test_run_core_maps_generic_upstream_to_502_not_500(monkeypatch, tmp_path):
@@ -164,9 +154,10 @@ def test_run_core_maps_generic_upstream_to_502_not_500(monkeypatch, tmp_path):
 
     with pytest.raises(HTTPException) as exc_info:
         _run_completion_core(app, item, prep)
-    # 500 from upstream is in the transient-overload list -> 503; anything
-    # else must still be an HTTPException (502), never a bare RuntimeError.
-    assert exc_info.value.status_code in (502, 503)
+    # "HTTP_500: ..." matches no overload row ("timeout", "overload",
+    # "bad gateway" -- a bare 500 is not one of them), so it lands on the
+    # generic UPSTREAM row: a deterministic 502, never a bare RuntimeError.
+    assert exc_info.value.status_code == 502
 
 
 # 3. endpoint returns 502 JSON (no ASGI traceback / 500) ------------------

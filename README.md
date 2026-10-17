@@ -134,18 +134,13 @@ Request limits (server-enforced, no config knob for the first three):
 
 ### `max_retries` — a knob, but clamped
 
-`max_retries` **is** configurable (`DEEPSEAPORT_MAX_RETRIES`, `config.json`,
-TUI Settings 4 "Retries per failed request", default `1`) — it is not one of
-the fixed limits above. It is clamped to **0–5** at load time: a larger value
-logs a warning and becomes 5, because the counter multiplies upstream work
-(one request costs up to `max_retries` session + PoW + stream attempts, each
-holding an account slot). With `DEEPSEAPORT_MAX_RETRIES` **unset** the clamp is
-runtime-only and is never written back, so a hand-edited value survives a save
-(the loader remembers the pre-clamp number and `save()` writes that back). With
-the env var **set**, the clamp *is* persisted: the env value is the effective
-source and is not owned by `config.json`, so the first save rewrites the file to
-the clamped number — `"max_retries": 7` plus `DEEPSEAPORT_MAX_RETRIES=2` gives
-runtime `2` and on-disk `2`. Keep the two in sync or drop the env var.
+`max_retries` **is** configurable (`DEEPSEAPORT_MAX_RETRIES`, `config.json`, TUI
+Settings) — not one of the fixed limits above — and clamped to **0–5** at load
+(a larger value warns and becomes 5), because one request costs up to
+`max_retries` session + PoW + stream attempts. With the env var **unset** the
+clamp is runtime-only and a hand-edited value survives a save; with it **set**,
+the env value is the effective source and the first save persists the clamped
+number to `config.json` — keep the two in sync or drop the env var.
 
 `provider` (single mode) / `providers` (multi mode) select the upstream
 (`Settings.provider`/`providers`, env
@@ -162,30 +157,21 @@ never blocks).
 
 `active_account` is the `CURRENT` selection (`""` = auto-failover over the
 whole pool). `chat_model` remembers the last `/model` pick from server-with-chat
-mode (env: `DEEPSEAPORT_CHAT_MODEL`). All remaining behaviour flags
-(`enable_tools`, `warmup_on_startup`, `auto_delete_session`, `max_retries`,
-`parallel_challenge_fetch`, `use_multiple_accounts`, `log_level`,
-`stream_mode`, `forgiving_toolcalls`) live in `config.example.json`. Most are
-also editable from the TUI Settings screen — 1 `enable_tools`, 2
-`warmup_on_startup`, 3 `auto_delete_session`, 4 `max_retries`, 5
-`parallel_challenge_fetch`, 7 `log_level`, 8 `stream_mode`, 14
-`use_multiple_accounts`, 18 `forgiving_toolcalls`. Four persisted fields have no
-Settings entry and are `config.json` only: `obscura_profile`, `browser_bin`,
-`browser_headless` and `tool_args_max_chars` (cap at `DEEPSEAPORT_MAX_ARGS_CHARS`,
-default 200000). `enable_append` (default `true`, env:
-`DEEPSEAPORT_ENABLE_APPEND`, TUI Settings 15 "Enable append") gates both:
-when `false`, stored `append_top` / `append_bottom` texts are kept but
-nothing is wrapped into requests. `append_top` / `append_bottom` (env:
-`DEEPSEAPORT_APPEND_TOP` / `DEEPSEAPORT_APPEND_BOTTOM`, TUI Settings
-16/17 "Append at top/bottom") wrap every outgoing prompt — top text goes at
-the absolute top, bottom text at the absolute bottom. Both are multi-line
-(`"append_top": "line1\nline2"` in `config.json`); `""` disables.
+mode (env: `DEEPSEAPORT_CHAT_MODEL`). All remaining behaviour flags and their
+defaults live in `config.example.json`; the TUI Settings screen is authoritative
+for what is editable there, and any persisted field it does not cover is
+`config.json` only. `enable_append` (default `true`, env:
+`DEEPSEAPORT_ENABLE_APPEND`, TUI Settings) gates both: when `false`, stored
+`append_top` / `append_bottom` texts are kept but nothing is wrapped into
+requests. `append_top` / `append_bottom` (env: `DEEPSEAPORT_APPEND_TOP` /
+`DEEPSEAPORT_APPEND_BOTTOM`, TUI Settings) wrap every outgoing prompt — top
+text goes at the absolute top, bottom text at the absolute bottom. Both are
+multi-line (`"append_top": "line1\nline2"` in `config.json`); `""` disables.
 `send_dry_run_to_frontend` (default `true`, env:
-`DEEPSEAPORT_SEND_DRY_RUN_TO_FRONTEND`, TUI Settings 6 "Send dry run to
-frontend"): when `true`, the Dry run reply is a normal OpenAI-shaped
-response whose content is what dry run prints (raw body + formatted
-prompt); when `false`, the content is a short note while the terminal
-still prints everything.
+`DEEPSEAPORT_SEND_DRY_RUN_TO_FRONTEND`, TUI Settings): when `true`, the Dry run
+reply is a normal OpenAI-shaped response whose content is what dry run prints
+(raw body + formatted prompt); when `false`, the content is a short note while
+the terminal still prints everything.
 
 `use_multiple_accounts` (default `true`, env:
 `DEEPSEAPORT_USE_MULTIPLE_ACCOUNTS`): when `true` and `CURRENT` is busy
@@ -252,10 +238,8 @@ return `reasoning_content` alongside `content`); Qwen — `qwen3.7-plus`
 (default), `qwen3.8-max`, `qwen3.8-omni-flash`;
 opencode (local CLI, no accounts) — whatever the running `opencode serve`
 lists on `GET /api/model` (default `opencode/muse-spark-1.3-contributor-free`),
-with the eight hand-verified entries as the offline fallback; two of those
-eight are no longer served upstream and exist only in the fallback. Seven
-carry a `-free` suffix; `opencode/big-pickle` does not — it is still
-served and still listed, it just is not named `-free`. Any `provider/model`
+falling back to the hand-verified fallback list; exact ids and current
+availability live in `providers/opencode/models.py`. Any `provider/model`
 you configured on your own `opencode serve` passes through.
 
 Note: OpenAI params the web upstreams cannot honor (`temperature`, `top_p`,
@@ -316,27 +300,17 @@ python scripts/prepare_release.py             # release/ + release/dist.zip
 ```
 
 **Package the release with `scripts/prepare_release.py`, not
-`Compress-Archive dist\*`.** `dist/` is both the PyInstaller output directory
-*and* the frozen app's live credential store: `config._app_dir()` returns
-`Path(sys.executable).parent` when frozen, so `dist/config.json` holds the
-account emails, plaintext passwords, 64-char bearer tokens and API keys that
-`deepseaport.exe` reads and writes. Zipping `dist/` by hand ships all of it, and
-`config.json` being gitignored protects git, not the upload — `.gitignore:2` and
-`deepseaport.spec` have no `datas` exclusion. `.github/workflows/release.yml`
-runs `prepare_release.py --check` as a **hard gate before every upload step** on
-a `v*` tag, and builds the zip through the same script. The script reads `dist/`
-and never writes to it, drops `*.bak` / `*.tmp` / `*.log` / `__pycache__` and
-leftover `.env`/`*.pem`/profile directories, and **refuses to build** when the
-tree holds a `config.json` or any other JSON with a non-empty `email` /
-`mobile` / `token` / `password` / `keys` / `api_key` / `secret` value, naming
-the file and the path inside it. Content scanning is JSON-only: a secret in
-`settings.ini`, `credentials.txt`, a `.har` or a screenshot ships unless its
-*name* matches an exclusion glob. It leaves your live `config.json` where it is;
-moving it out of `dist/` is your call (the exe reads it at startup, so
-`DEEPSEAPORT_CONFIG` or a moved copy both work). Exit 1 means the check
-failed: a credential was found, or a JSON file could not be read or parsed
-(reported as `<unreadable: ...>` — a file claiming to be JSON is never
-waved through unscanned). Exit 0 means the artifact is clean.
+`Compress-Archive dist\*`.** `dist/` doubles as the frozen app's live
+credential store, so a hand-made zip ships `config.json`. The script drops
+build noise and secret-shaped leftovers, **refuses to build** when any JSON in
+the tree carries a non-empty `email` / `mobile` / `token` / `password` /
+`keys` / `api_key` / `secret` value (content scanning is JSON-only), and never
+writes to `dist/` — your live `config.json` stays where the exe expects it.
+`.github/workflows/release.yml` runs `prepare_release.py --check` as a **hard
+gate before every upload step** on a `v*` tag. Exit 1 means the check failed
+(a credential was found, or a JSON file it could not read or parse); exit 0
+means the artifact is clean. Full rationale:
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Version.** `pyproject.toml` `[project] version` is the only place a version
 is written. `deepseaport.spec` reads it at build time (so the exe's version
@@ -344,19 +318,13 @@ resource and a broken pyproject now fail the build loudly instead of silently
 stamping `0.0.0`), `deepseaport.__version__` derives from it, and both FastAPI
 apps pass that to `FastAPI(version=...)`. Bump it there and nowhere else.
 
-Interpreter: the project is developed and tested on CPython **3.13.6**
-(Windows 11), and `.[build]` asks for `pyinstaller>=6`. On this checkout
-PyInstaller **6.22.3** is installed and importable, so the command above works
-as written. One gotcha if you reach for the module instead of the script:
-the package is capitalized, so `python -m pyinstaller` fails with
-`No module named pyinstaller` while `python -m PyInstaller --version` prints
-`6.22.3`. The `pyinstaller` console script is the one the command above uses.
-
-There is no build log in this tree and none is tracked in git (`*.log` is
-gitignored, and no `build*.log` path has ever been committed), so no claim
-about a previous build's interpreter or PyInstaller version is made here. If
-you produce a build, record the versions in the release notes — a build on
-record is worth more than one asserted here.
+Interpreter: CPython >= 3.11 (CI: 3.11/3.13); `.[build]` asks for
+`pyinstaller>=6`, and the exact PyInstaller version is whatever the build used —
+record the interpreter and PyInstaller version in the release notes of any build
+you produce. One gotcha if you reach for the module instead of the script: the
+package is capitalized, so `python -m pyinstaller` fails with
+`No module named pyinstaller` while `python -m PyInstaller` works; the
+`pyinstaller` console script is the one the command above uses.
 
 The exe needs the **Visual C++ redistributable** on the target machine —
 `https://aka.ms/vs/17/release/vc_redist.x64.exe` — which the app needs
@@ -388,9 +356,7 @@ Two things a new contributor will hit immediately:
    ```
 
    That tier needs a real account token in `config.json` and the `obscura`
-   binary on PATH. Do not encode the default as `-m "not live"` in
-   `addopts`: a command-line `-m` does not override `addopts`, so
-   `pytest -m live` would silently deselect everything.
+   binary on PATH.
 
    **Run this periodically** — it is the only thing in the repo that can
    notice an upstream changed. `tests/test_live_smoke.py` is a small suite

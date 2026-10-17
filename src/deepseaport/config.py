@@ -36,43 +36,36 @@ MAX_RETRIES_LIMIT = 5
 
 # Upper bound for a TCP port, applied at load time for the same "last line of
 # defence" reason as MAX_RETRIES_LIMIT above: config.json and DEEPSEAPORT_PORT
-# are hand-edited and unvalidated (the TUI checks 1-65535, nothing else does),
-# and neither end of the legal range is survivable.
-#   * port 0 binds an OS-assigned ephemeral port while the UI keeps printing
-#     "http://127.0.0.1:0", so every request fails with [WinError 10061]
-#     connection-refused and nothing points at the config that caused it.
-#   * port > 65535 reaches socket.bind() and raises OverflowError, which is
-#     NOT an OSError, so it slips past the "except OSError" handlers around
-#     the bind path and kills the TUI with a traceback.
-# So: clamp above to 65535, and treat 0 as "no port chosen" -> DEFAULT_PORT.
-# 0 is a legitimate value for bind(0) ("give me any free port") but never in a
-# config file, where it silently desynchronizes the port actually bound from
-# the one displayed.
+# are hand-edited and unvalidated (only the TUI checks 1-65535), and neither
+# end of the legal range is survivable: 0 binds an OS-assigned ephemeral port
+# while the UI keeps printing "http://127.0.0.1:0" (every request fails with
+# [WinError 10061] and nothing points at the config that caused it), and
+# >65535 raises OverflowError out of socket.bind -- NOT an OSError, so it slips
+# past the bind path's "except OSError" handlers and kills the TUI with a
+# traceback. Clamp the top to 65535; 0 means "no port chosen" -> DEFAULT_PORT
+# (a legitimate bind(0) argument, never a config value: it silently
+# desynchronizes the port actually bound from the one displayed).
 PORT_LIMIT = 65535
 
-# Mirror of server_routes.MAX_ACCOUNTS (server_routes.py:55), which is the
+# Mirror of server_routes.MAX_ACCOUNTS (server_routes.py:57), which is the
 # enforced cap on POST /v1/accounts. config cannot import server_routes (that
 # module imports config), so the number is repeated here with a comment; keep
 # the two in sync if either moves. Load-time only enforces NOTHING -- see the
-# comment in load_settings for why dropping accounts at load would destroy
+# comment in save() for why dropping accounts at load would destroy
 # credentials on the next save().
 MAX_ACCOUNTS_LIMIT = 64
 
-# Serializes the config.json read-modify-write within the process. Callers span
-# the event loop (endpoint saves) and worker threads (_ensure_token / account
-# pool). It must cover the accounts SNAPSHOT as well as the write, not just the
-# bytes: a lock on the write alone lets two mutators each build a payload from a
-# stale list and the second one silently overwrites the other's account. The
-# atomic temp-file + os.replace below is the other half -- this lock keeps the
-# snapshot and the write together, the replace keeps readers off a half-written
-# file.
-# NOTE: process-local only. Separate OS processes (uvicorn --workers N) each
-# have their own lock; atomic os.replace keeps the file valid JSON but the
-# last writer wins (a ban/token saved in one worker can be overwritten by a
-# concurrent save from another). No file lock: it would add a Windows
-# dependency + stale-lock risk without fixing last-writer-wins.
-# Plain Lock, NOT an RLock: save() acquires it exactly once, so a second
-# `with _CONFIG_SAVE_LOCK` inside save() self-deadlocks rather than nesting.
+# Serializes the config.json read-modify-write within the process; callers
+# span the event loop (endpoint saves) and worker threads. Snapshot and write
+# stay in ONE critical section -- a write-only lock silently drops accounts
+# (see the save-lock contract in src/deepseaport/AGENTS.md). The atomic
+# temp-file + os.replace below is the other half: the lock keeps the snapshot
+# and the write together, the replace keeps readers off a half-written file.
+# Process-local only: separate OS processes (uvicorn --workers N) each have
+# their own lock, and atomic os.replace leaves last-writer-wins (a ban/token
+# saved in one worker can be overwritten by a concurrent save from another).
+# No file lock: it would add a Windows dependency + stale-lock risk without
+# fixing that.
 _CONFIG_SAVE_LOCK = threading.Lock()
 
 
@@ -202,24 +195,20 @@ _SETTINGS_SAVE_FIELDS = (
     "append_bottom",     "send_dry_run_to_frontend", "provider", "providers",
 )
 
-# Name of the plain instance attribute holding the clamp bookkeeping for the
-# fields load_settings had to bound: ``{"max_retries": (9, 5)}`` = the
-# operator's own value 9, the effective clamped value 5. save() writes 9 back
-# while the runtime value is still 5, and the new value once the operator
-# changes it deliberately (TUI "Retry count" -> 2 must persist 2, not 9).
+# Name of the plain instance attribute holding the clamp bookkeeping:
+# ``{"max_retries": (9, 5)}`` = the operator's own value 9, the effective
+# clamped value 5. save() writes 9 back while the runtime value is still 5,
+# and the new value once the operator changes it deliberately (TUI "Retry
+# count" -> 2 must persist 2, not 9).
 #
-# Deliberately NOT a dataclass field:
-#   * asdict()/replace()/eq/repr stay about the effective settings, and the
-#     bookkeeping can never be serialised by accident;
-#   * ``__dataclass_fields__`` remains exactly the set of *persistable
-#     candidate* fields, which is the contract the mirror guard in save()
-#     checks - adding a real field without a _SETTINGS_SAVE_FIELDS entry must
-#     still warn, so the guard is left untouched rather than widened.
-# A module-level WeakKeyDictionary keyed by Settings was the alternative and
-# was rejected: it adds an import plus a GC/lifetime dependency to a
-# dataclass that already has a __dict__, and it hides the value from any
-# future debug/repr tooling. The attribute is private and read in exactly one
-# place (save()).
+# Deliberately NOT a dataclass field: asdict()/replace()/eq/repr stay about
+# the effective settings, and ``__dataclass_fields__`` remains exactly the set
+# of *persistable candidate* fields the mirror guard in save() checks - a real
+# field without a _SETTINGS_SAVE_FIELDS entry must still warn, so the guard is
+# left untouched rather than widened. A module-level WeakKeyDictionary keyed
+# by Settings was rejected: it adds an import plus a GC/lifetime dependency to
+# a dataclass that already has a __dict__, and it hides the value from
+# debug/repr tooling. Private; read in exactly one place (save()).
 _RAW_PERSISTED_VALUES = "_raw_persisted_values"
 
 
@@ -364,21 +353,16 @@ class Settings:
                 payload[_key] = list(_val) if isinstance(_val, list) else _val
             data = json.dumps(payload, ensure_ascii=False, indent=2)
             target = Path(self.config_path)
-            # Atomic write: unique temp file in the same dir, then os.replace.
-            # Concurrent writers (event loop + worker threads) can't interleave
-            # or observe a half-written config. If the rename is blocked (see
-            # below) we degrade to an in-place rewrite.
-            # Never overwrite a file whose last load found it unparsable AND
-            # that is still on disk: the in-memory Settings would be the empty
-            # fallback, so this write would replace the operator's accounts
-            # (and the .bak would then hold the good copy, but only if it had
-            # ever been saved). Raise rather than destroy -- the caller can
-            # surface it, and the file on disk is still recoverable. The
-            # exists() half matters because a running process never reloads:
-            # after the operator DELETES the file (the documented way out)
-            # nothing would ever clear the latch, so every later save -- an
-            # account add that already mutated memory -- kept 500ing and the
-            # file was never recreated.
+            # Atomic write: unique temp file in the same dir, then os.replace,
+            # so concurrent writers can't interleave or observe a half-written
+            # config. A blocked rename degrades to an in-place rewrite (below).
+            # Refuse a file whose last load found it unparsable and that is
+            # still on disk (the exists() half is the delete-then-save recovery
+            # documented on _UNPARSABLE_CONFIG): in-memory Settings would be
+            # the empty fallback, so this write would destroy the operator's
+            # accounts (the .bak only covers a file that was ever saved
+            # before). Raise rather than destroy -- the file stays
+            # recoverable.
             if str(target) in _UNPARSABLE_CONFIG and target.exists():
                 raise RuntimeError(
                     f"refusing to save over {target}: its last load found it "
@@ -541,23 +525,15 @@ def _backup_previous(target: Path, previous: bytes) -> None:
 def _overwrite_in_place(target: Path, data: str) -> None:
     """Non-destructive in-place rewrite, used only when os.replace is blocked.
 
-    Guarantees, and why each holds:
-
-    * **A crash during the save never reduces config.json to zero bytes.**
-      The file is opened without O_TRUNC and truncated only after the new
-      content is written and fsynced, so the on-disk length is monotonically
-      the old length until the new content is durable.
-    * **A crash during the save never loses the previous good state.** Two
-      independent copies: the previous bytes are copied to config.json.bak
-      first, and the target itself still holds the previous content until the
-      overwrite is complete.
-    * An exception *inside* the write is not a crash: the previous bytes are
-      written back before it propagates.
-
-    The remaining exposure is a crash in the gap between the overwrite and
-    the next save, with the file holding ``new_prefix + old_tail`` - invalid
-    JSON, which load_settings treats as an empty config. That is strictly
-    better than an empty file and recoverable from the .bak.
+    The write is ``_write_bytes_nondestructive``'s: opened without O_TRUNC,
+    truncated only after the new content is written and fsynced, previous
+    bytes restored if the write raises -- so a crash never reduces config.json
+    to zero bytes. ``_backup_previous`` adds the second copy, so it never
+    loses the previous good state either. The remaining exposure is a crash
+    in the gap between the overwrite and the next save, leaving
+    ``new_prefix + old_tail`` - invalid JSON, which load_settings treats as an
+    empty config: strictly better than an empty file and recoverable from the
+    .bak.
     """
     previous = b""
     try:
@@ -928,7 +904,7 @@ def load_settings(path: str | None = None) -> Settings:
     # measure.
     accounts = _dedupe_accounts(accounts)
     if len(accounts) > MAX_ACCOUNTS_LIMIT:
-        # Warn, never truncate. MAX_ACCOUNTS (server_routes.py:55) is an
+        # Warn, never truncate. MAX_ACCOUNTS (server_routes.py:57) is an
         # admission cap on POST /v1/accounts, meant to stop that endpoint from
         # being a disk-write amplifier; a config file over the limit is the
         # operator's own account list, and dropping entries here would delete

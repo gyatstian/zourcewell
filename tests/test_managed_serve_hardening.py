@@ -13,7 +13,10 @@ pre-change code:
   ``OPENCODE_SERVER_PASSWORD`` in cleartext and the dir was created with
   mkdir()'s umask, while the sibling obscura cookie-jar dir had just been
   hardened to 0700 + a one-shot Windows ACL warning. ``os.chmod(f, 0o600)``
-  is a documented no-op on win32.
+  is a documented no-op on win32, so the Windows half now stores the
+  password DPAPI-wrapped for the current user and the ACL warning fires only
+  while a cleartext ``password`` is actually on disk (see the P2-2 tests,
+  and ``_warn_plaintext_port_file``).
 * P2-3 -- the upstream-text scrubber redacted ``[A-Za-z0-9_-]{32,}`` only, so
   a dotted (JWT-shaped) secret passed through whole: short segments never trip
   a 32-char run rule.
@@ -37,7 +40,6 @@ monkeypatched command line and every "os.kill" is a fake.
 
 from __future__ import annotations
 
-import ast
 import inspect
 import json
 import logging
@@ -189,6 +191,34 @@ def test_reaper_gate_skips_a_port_that_disagrees_with_the_port_file():
     assert MS._looks_like_managed_serve(line, "") is True
 
 
+def test_reaper_gate_refuses_a_serve_line_without_the_recorded_port():
+    """When the base carries a port, a line without ``--port`` is not ours.
+
+    Every managed boot passes ``--port``; measured live, opencode's OWN
+    background service runs as ``opencode serve --service`` with no ``--port``
+    at all, so a recycled pid landing on such a line must not satisfy the gate
+    merely because the cross-check was skipped.
+    """
+    assert MS._looks_like_managed_serve(
+        "opencode serve --service", "http://127.0.0.1:45999") is False
+    assert MS._looks_like_managed_serve(
+        "opencode serve", "http://127.0.0.1:45999") is False
+    # A base without a port (a legacy or hand-edited serve.json) keeps the old
+    # lenient read: there is nothing to cross-check against.
+    assert MS._looks_like_managed_serve("opencode serve --service", "") is True
+
+
+def _force_alive(monkeypatch) -> None:
+    """Pin the OS liveness probe to "running" for these tests.
+
+    Their subject is the command-line identity gate. Without this the fake pid
+    4242 is dead on every runner, and the dead-pid fast path
+    (``test_secret_and_leak_gaps.py`` owns its behavior) returns before the
+    gate under test is ever consulted.
+    """
+    monkeypatch.setattr(MS, "_pid_alive", lambda pid: True, raising=False)
+
+
 def _no_signals(monkeypatch) -> list:
     """Record every channel the reaper could use, as ``(channel, pid)``.
 
@@ -214,6 +244,7 @@ def test_reaper_does_not_signal_a_spoofed_opencode_serve(monkeypatch, tmp_path):
     """End to end: a serve.json written by something other than us must not be
     able to move the SIGTERM onto another program."""
     signalled = _no_signals(monkeypatch)
+    _force_alive(monkeypatch)
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
     (tmp_path / "m").mkdir()
     monkeypatch.setattr(MS, "_process_command_line",
@@ -231,6 +262,7 @@ def test_reaper_still_signals_the_real_serve_with_matching_port(monkeypatch, tmp
     """The port file is the source of the cross-check, so it must be read from
     there and must not break the reap when it agrees."""
     signalled = _no_signals(monkeypatch)
+    _force_alive(monkeypatch)
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
     (tmp_path / "m").mkdir()
     monkeypatch.setattr(MS, "_process_command_line",
@@ -253,6 +285,7 @@ def test_reaper_signals_the_windows_wrapper_that_spawned_the_serve(monkeypatch,
     serve running on its port.
     """
     signalled = _no_signals(monkeypatch)
+    _force_alive(monkeypatch)
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
     (tmp_path / "m").mkdir()
     monkeypatch.setattr(MS, "_process_command_line",
@@ -379,6 +412,7 @@ def test_terminate_proc_on_posix_still_terminates_the_child(monkeypatch):
 
 def test_reaper_skips_when_the_recorded_port_disagrees(monkeypatch, tmp_path):
     signalled = _no_signals(monkeypatch)
+    _force_alive(monkeypatch)
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
     (tmp_path / "m").mkdir()
     monkeypatch.setattr(MS, "_process_command_line",
@@ -473,34 +507,76 @@ def test_managed_acl_warning_is_silent_on_posix(tmp_path, monkeypatch, caplog):
     assert OB._ACL_WARNED_LABELS == set()
 
 
-def test_write_isolated_files_reports_the_serve_json_acl(tmp_path, monkeypatch):
-    """Wiring: the dir creator is where the warning has to be emitted."""
+def test_write_isolated_files_warns_only_while_a_cleartext_password_is_on_disk(
+        tmp_path, monkeypatch):
+    """Wiring: the dir creator re-checks the port file, but to see whether the
+    cleartext fallback is what is actually stored there.
+
+    A fresh write on Windows is DPAPI-wrapped, so the exposure the warning
+    describes does not exist and the warning would be noise on every boot.
+    """
     seen: list = []
     monkeypatch.setattr(
         OB, "warn_inherited_acl_once",
         lambda target, **kw: seen.append((str(target), kw)), raising=False)
 
-    paths = MS.write_isolated_files(tmp_path / "m")
+    base = tmp_path / "m"
+    paths = MS.write_isolated_files(base)
+    assert seen == [], "a missing serve.json must not warn"
+
+    # An older deepseaport (or a DPAPI-less machine) left it cleartext.
+    paths["port_file"].write_text(json.dumps(
+        {"base": "http://127.0.0.1:9", "pid": 1, "password": "pw"}),
+        encoding="utf-8")
+    MS.write_isolated_files(base)
 
     assert [t for t, _kw in seen] == [str(paths["port_file"])], \
-        "write_isolated_files never reported the port file"
-    assert "password" in seen[0][1].get("secret", "")
+        "write_isolated_files never reported the cleartext port file"
+    assert "basic-auth password" in seen[0][1].get("secret", "")
+
+    # Wrapped: same file, no cleartext field, no warning.
+    seen.clear()
+    paths["port_file"].write_text(json.dumps(
+        {"base": "http://127.0.0.1:9", "pid": 1, "password_dpapi": "blob"}),
+        encoding="utf-8")
+    MS.write_isolated_files(base)
+    assert seen == [], "a DPAPI-wrapped port file must not warn"
 
 
 @pytest.mark.skipif(os.name != "nt",
-                    reason="the no-op chmod only bites on Windows")
-def test_managed_dir_really_warns_on_windows(tmp_path, monkeypatch, caplog):
+                    reason="DPAPI and the no-op chmod are Windows-only")
+def test_windows_port_file_is_dpapi_wrapped_and_only_cleartext_warns(
+        tmp_path, monkeypatch, caplog):
     """End to end on the platform where the no-op chmod actually applies."""
     monkeypatch.setattr(OB, "_ACL_WARNED_LABELS", set(), raising=False)
+    base = tmp_path / "m"
 
     with caplog.at_level(logging.WARNING, logger="deepseaport.obscura"):
-        paths = MS.write_isolated_files(tmp_path / "m")
+        paths = MS.write_isolated_files(base)
+        MS._write_port_file(paths["port_file"], "http://127.0.0.1:45999",
+                            "pw", 1, "h")
+
+    assert "inherits the ACL" not in caplog.text, \
+        "a fresh (wrapped) port file must not warn"
+    written = json.loads(paths["port_file"].read_text(encoding="utf-8"))
+    assert "password" not in written
+    assert written["password_dpapi"]
+    assert MS._read_port_file(paths["port_file"])[1] == "pw", \
+        "the wrapped password must round-trip for the same user"
+
+    # DPAPI unavailable -> the cleartext fallback, which IS the exposure the
+    # warning describes.
+    monkeypatch.setattr(MS, "_dpapi_protect", lambda secret: "")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="deepseaport.obscura"):
+        MS._write_port_file(paths["port_file"], "http://127.0.0.1:45999",
+                            "pw", 1, "h")
 
     assert "inherits the ACL" in caplog.text
     assert str(paths["port_file"]) in caplog.text
-    MS._write_port_file(paths["port_file"], "http://127.0.0.1:45999", "pw", 1, "h")
     written = json.loads(paths["port_file"].read_text(encoding="utf-8"))
-    assert written["password"] == "pw", "the port file itself must still work"
+    assert written["password"] == "pw"
+    assert MS._read_port_file(paths["port_file"])[1] == "pw"
 
 
 # --------------------------------------------------------------------------

@@ -2,27 +2,18 @@
 
 from __future__ import annotations
 
-import json
-import logging
 import math
 import os
-from dataclasses import dataclass
-from typing import Iterator, Literal
 
-from ...core.transport import BAN_WORD_RE as _SHARED_BAN_RE
 from ...core.transport import has_ban_word as _shared_has_ban_word
 from ...core.transport import parse_json_response as _shared_parse_json
 
-logger = logging.getLogger("deepseaport.protocol")
-
-# Structural split (behavior-preserving): SSE parsing lives in sse_parser.py;
-# re-exported here so `deepseaport.protocol.StreamParser` etc. keep working.
-from .sse_parser import StreamEvent, StreamParser, parse_sse_line  # noqa: F401,E402
+# SSE events are built through this module (deepseek/client.py uses
+# ``P.StreamEvent``); the parsers themselves live in sse_parser.py.
+from .sse_parser import StreamEvent  # noqa: F401,E402
 
 __all__ = [
     "StreamEvent",
-    "StreamParser",
-    "parse_sse_line",
     "parse_json",
     "base_headers",
     "bridge_headers",
@@ -65,10 +56,8 @@ CHROME_UA = (
 BANNED_BIZ_CODES = {"5", "5.0"}
 
 # Ban word-match is shared (core.transport.BAN_WORD_RE): identical regex
-# previously tripled here/Qwen/transport. Local aliases stay so existing
-# ``P._BAN_RE`` / ``P._has_ban_word`` imports keep working; the ban-envelope
-# verdicts below stay DeepSeek-specific.
-_BAN_RE = _SHARED_BAN_RE
+# previously tripled here/Qwen/transport. The ban-envelope verdicts below
+# stay DeepSeek-specific.
 
 
 def _has_ban_word(text: str) -> bool:

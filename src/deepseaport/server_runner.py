@@ -336,9 +336,7 @@ def _stop_all_servers(servers, threads, timeout: float = 5.0) -> None:
             pass
 
 
-def _start_background_server(app, host: str, port: int,
-                             log_level: str = "error",
-                             access_log: bool = False):
+def _start_background_server(app, host: str, port: int):
     """Build a uvicorn Config/Server and run it in a daemon thread.
 
     Shared by `serve + chat` (one server) and multi-chat (N servers).
@@ -358,7 +356,7 @@ def _start_background_server(app, host: str, port: int,
         except Exception:
             pass
     config = uvicorn.Config(app, host=host, port=int(port),
-                            log_level=log_level, access_log=access_log,
+                            log_level="error", access_log=False,
                             limit_concurrency=UVICORN_LIMIT_CONCURRENCY,
                             timeout_keep_alive=UVICORN_TIMEOUT_KEEP_ALIVE)
     server = uvicorn.Server(config)
@@ -367,34 +365,8 @@ def _start_background_server(app, host: str, port: int,
     return server, thread
 
 
-def _multiworker_rejection(workers: int) -> str:
-    """Return the failure message for an unsupported --workers N, else "".
-
-    Kept separate from the call site so the guard is testable without building
-    an app or touching uvicorn.
-    """
-    if int(workers or 1) == 1:
-        return ""
-    return (
-        f"--workers {int(workers)} is not supported. deepseaport serves an "
-        "in-process app object and uvicorn needs an import string for "
-        "workers>1: it logs \"You must pass the application as an import "
-        "string to enable 'reload' or 'workers'\" and exits 3 before the "
-        "menu opens. Run one worker (--workers 1), or one server per port / "
-        "per config file; process-local state (token-refresh singleflight, "
-        "login backoff, the config-save lock) would not cross workers "
-        "anyway, so concurrent saves last-writer-win.")
-
-
 def _run_server(settings, args, ensure_free=None) -> int:
-    """Blocking serve loop (single worker). ``--workers N>1`` is rejected.
-
-    Multi-worker was never actually reachable: `uvicorn.run(app, ...)` with an
-    app *instance* and workers>1 is a startup failure in uvicorn (it logs the
-    import-string requirement and calls sys.exit(3)), so the old branch fell
-    through to a hard exit with a process-local-state warning as the only
-    explanation. Fail loudly and specifically instead
-    (see `_multiworker_rejection`).
+    """Blocking serve loop.
 
     `ensure_free` is an injection seam for deepseaport.cli so the historical
     cli-level `_ensure_free_port` monkeypatch keeps working.
@@ -412,33 +384,23 @@ def _run_server(settings, args, ensure_free=None) -> int:
     # out of the pre-flight line as a traceback.
     port = getattr(settings, "port", 5001)
     log_level = str(getattr(settings, "log_level", "info")).lower()
-    workers = int(getattr(args, "workers", 1) or 1)
-    # Before the port fix-up: no config save, no prompt, no bind for a mode
-    # that cannot start.
-    if workers != 1:
-        raise SystemExit(_multiworker_rejection(workers))
     if ensure_free is None:
         ensure_free = _ensure_free_port
     port = ensure_free(settings, host, port)
     config = uvicorn.Config(app, host=host, port=port, log_level=log_level,
-                            # Access log OFF, same as dry_run and the
-                            # background/chat server. Reason: an account
-                            # identifier may be a FULL token (accounts._matches
-                            # allows a full-token match so
-                            # `DELETE /v1/accounts/<token>` can remove a
-                            # token-only account) and uvicorn's access line
-                            # prints the raw request target, so that one
-                            # request writes a live 64-char bearer token --
-                            # and the whole query string -- into the log.
-                            # Chosen over dropping full-token matching from the
-                            # HTTP route layer because that would break a
-                            # documented route and would not actually close the
-                            # hole: the CLI keeps the match, and the access log
-                            # is a plain file on the same machine.
-                            # Untouched: uvicorn's error log (startup banner,
-                            # unhandled exceptions, shutdown) is a different
-                            # logger and still configured by `log_level`; only
-                            # the `uvicorn.access` per-request lines go away.
+                            # Access log OFF (see src/deepseaport/AGENTS.md for
+                            # the three serve paths and the untouched error
+                            # log). Reason: an account identifier may be a FULL
+                            # token (accounts._matches allows a full-token
+                            # match so `DELETE /v1/accounts/<token>` can remove
+                            # a token-only account) and the access line prints
+                            # the raw request target, so that one request
+                            # writes a live 64-char bearer token -- and the
+                            # whole query string -- into the log. Dropping
+                            # full-token matching instead would break a
+                            # documented route and would not close the hole:
+                            # the CLI keeps the match, and the log file is on
+                            # the same machine.
                             access_log=False,
                             limit_concurrency=UVICORN_LIMIT_CONCURRENCY,
                             timeout_keep_alive=UVICORN_TIMEOUT_KEEP_ALIVE)
@@ -451,10 +413,6 @@ def _run_server(settings, args, ensure_free=None) -> int:
     notice = lan_exposure_notice(settings, host, port)
     if notice:
         print(notice)
-        try:
-            logger.warning(notice)
-        except Exception:
-            pass
     stop_keys = threading.Event()
     watcher = threading.Thread(target=_watch_stop_keys, args=(server, stop_keys),
                                daemon=True)

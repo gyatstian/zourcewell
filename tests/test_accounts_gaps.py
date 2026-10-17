@@ -116,7 +116,6 @@ def test_busy_true_when_lock_held():
     item.lock.acquire()
     try:
         assert item.busy is True
-        assert item.available is False
     finally:
         item.lock.release()
     assert item.busy is False
@@ -128,7 +127,6 @@ def test_banned_flag_and_expiry_clear():
     cfg.banned_until = 0.0
     item = PooledAccount(cfg=cfg)
     assert item.banned is True
-    assert item.available is False
     # expired known-expiry clears lazily
     cfg2 = _cfg(email="b@x.com")
     cfg2.banned = True
@@ -147,7 +145,6 @@ def test_mark_banned_future_until_cooldown():
     assert item.cfg.banned_until == pytest.approx(until)
     assert item.banned is True
     assert 290 < item.cooldown_remaining <= 300
-    assert item.available is False
 
 
 def test_mark_banned_unknown_expiry_uses_default():
@@ -158,13 +155,11 @@ def test_mark_banned_unknown_expiry_uses_default():
     assert 40 < item.cooldown_remaining <= 50
 
 
-def test_cooldown_remaining_and_available():
+def test_cooldown_remaining():
     item = PooledAccount(cfg=_cfg(email="a@x.com"))
     assert item.cooldown_remaining == 0.0
-    assert item.available is True
     AccountPool.mark_bad(item, seconds=60)
     assert 50 < item.cooldown_remaining <= 60
-    assert item.available is False
 
 
 def test_status_keys():
@@ -287,7 +282,6 @@ def test_mark_bad_sets_cooldown():
     assert item is not None
     AccountPool.mark_bad(item, seconds=45)
     assert 30 < item.cooldown_remaining <= 45
-    assert item.available is False
 
 
 def test_mark_banned_persists_on_cfg():
@@ -490,7 +484,7 @@ def test_collect_parallel_banned_mapping(monkeypatch):
     a = _cfg(email="a@x.com", token=LONG + "a")
     b = _cfg(email="b@x.com", token=LONG + "b")
 
-    def _fake(tok, timeout=12):
+    def _fake(tok, timeout=12, provider="deepseek"):
         assert timeout == 12
         if tok == LONG + "a":
             return True, 77.0
@@ -505,7 +499,7 @@ def test_collect_ttl_hit_avoids_reprobe(monkeypatch):
     a = _cfg(email="a@x.com", token=LONG)
     calls = []
 
-    def _fake(tok, timeout=12):
+    def _fake(tok, timeout=12, provider="deepseek"):
         calls.append(tok)
         return True, 5.0
 
@@ -523,7 +517,7 @@ def test_collect_offline_empty_returns_empty(monkeypatch):
     assert collect_ban_labels([_cfg(email="s@x.com", token="t1")],
                               force_refresh=True) == {}
 
-    def _boom(tok, timeout=12):
+    def _boom(tok, timeout=12, provider="deepseek"):
         raise RuntimeError("offline")
 
     monkeypatch.setattr(A, "check_ban_for_token", _boom)

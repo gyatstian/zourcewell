@@ -266,6 +266,37 @@ def test_port_file_roundtrip_with_hash(tmp_path):
     assert MS._read_port_file(pf) == ("http://127.0.0.1:9", "pw", 1234, "abc123")
 
 
+def test_port_file_stores_no_cleartext_password_when_it_can_wrap(tmp_path):
+    """Windows keeps a DPAPI-wrapped password in the 0600-in-name-only file.
+
+    Tolerant by design: a host without DPAPI falls back to the cleartext field
+    (and the ACL warning that goes with it); the round trip is what must hold
+    either way.
+    """
+    pf = tmp_path / "serve.json"
+    MS._write_port_file(pf, "http://127.0.0.1:9", "pw", 1234, "abc123")
+    written = json.loads(pf.read_text(encoding="utf-8"))
+    assert MS._read_port_file(pf)[1] == "pw", "the round trip must always work"
+    if os.name == "nt" and "password_dpapi" in written:
+        assert "password" not in written, "a cleartext password survived the write"
+    else:
+        assert written.get("password") == "pw"
+
+
+def test_port_file_password_not_this_users_to_open_reads_as_missing(tmp_path):
+    """A serve.json written by another user degrades to "no usable password".
+
+    The wrapped field is unreadable there; the reader must hand back blanks so
+    ensure() takes the fresh-boot path instead of raising out of the probe.
+    """
+    pf = tmp_path / "serve.json"
+    pf.write_text(json.dumps({"base": "http://127.0.0.1:9",
+                              "password_dpapi": "bm90LW91cnM=",
+                              "pid": 1234, "config_hash": "h"}),
+                  encoding="utf-8")
+    assert MS._read_port_file(pf) == ("http://127.0.0.1:9", "", 1234, "h")
+
+
 def test_ensure_reuses_healthy_same_hash_without_spawning(monkeypatch, tmp_path):
     monkeypatch.delenv("DEEPSEAPORT_OPENCODE_BASE", raising=False)
     monkeypatch.delenv("DEEPSEAPORT_OPENCODE_MANAGED", raising=False)

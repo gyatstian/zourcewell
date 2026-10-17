@@ -172,7 +172,9 @@ def test_dry_frontend_flag_roundtrip_and_env(tmp_path, monkeypatch):
 def test_main_menu_dry_routing_no_chat(monkeypatch):
     s = _fresh_no_accounts()
     called = {"n": 0}
-    inputs = iter(["4", "q"])
+    # Rows: 1 serve, 2 Account manager, 3 Settings, 4 Dry run. Quit moved into
+    # the provider chooser, so "q" then "q" is how the menu ends.
+    inputs = iter(["4", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     rc = main_menu(s, lambda st: 0,
                    dry_fn=lambda st: called.__setitem__("n", 1) or 0)
@@ -182,7 +184,8 @@ def test_main_menu_dry_routing_no_chat(monkeypatch):
 def test_main_menu_dry_routing_with_chat(monkeypatch):
     s = _fresh_no_accounts()
     called = {"n": 0}
-    inputs = iter(["6", "q"])
+    # chat_fn adds chat (2) and multi (5), so Dry run is 6; "q" then "q" quits.
+    inputs = iter(["6", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     rc = main_menu(s, lambda st: 0, lambda st: 0, lambda st: 0,
                    lambda st: called.__setitem__("n", 1) or 0)
@@ -193,7 +196,7 @@ def test_main_menu_dry_needs_no_accounts(monkeypatch):
     """Empty pool must not block dry run (no preflight, no browser)."""
     s = _settings(accounts=[])
     called = {"n": 0}
-    inputs = iter(["4", "q"])
+    inputs = iter(["4", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     monkeypatch.setattr(tui, "accounts_menu",
                         lambda st: (_ for _ in ()).throw(AssertionError("must not preflight")))

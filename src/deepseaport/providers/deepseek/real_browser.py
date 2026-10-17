@@ -316,12 +316,13 @@ class RealBrowser:
                     f"{body[:300]}" + (_BAN_HINT_SUFFIX if ban_hint else ""))
             if kind == "ban":
                 # One sighting is a HINT, not a verdict -- same rule as the MCP
-                # driver (auth.py:267-274, ban_streak >= 2). LOGIN_BAN_PHRASES
+                # driver (auth.py:264-270, ban_streak >= 2). LOGIN_BAN_PHRASES
                 # holds bare tokens ("muted", "banned", "suspend", "violation")
                 # and this loop takes ~125 snapshots over 75s, so latching on a
                 # single frame (a terms block, a footer, a toast, a route
-                # transition) permanently bans a healthy account: auth.py:347
-                # throws the freshly obtained token away and _refresh_token_once
+                # transition) permanently bans a healthy account:
+                # completion_service.py:353-362 throws the freshly obtained
+                # token away and _refresh_token_once
                 # persists `banned: true` to config.json, with a cooldown of up
                 # to a year when parse_ban_until finds a date in the body. A
                 # persisted false ban is near-unrecoverable from the user's

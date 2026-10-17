@@ -1,4 +1,4 @@
-﻿"""CLI: serve | waf | models | chat."""
+﻿"""CLI: serve | waf | models | accounts | login | chat."""
 
 from __future__ import annotations
 
@@ -8,8 +8,11 @@ import re
 import sys
 
 from . import server_runner as _runner
-from .providers.deepseek.auth import unpack_login_result as _unpack_login_result
-from .server_runner import _resolve_bind_host, _watch_stop_keys
+from .providers.deepseek.auth import unpack_login_result
+from .server_runner import _resolve_bind_host
+# The console probe lives in tui_editor (the lowest-level terminal module).
+# Imported at module scope so `cli._stdin_is_tty` stays monkeypatchable.
+from .tui_editor import _stdin_is_tty
 
 # Shared server bootstrap lives in deepseaport.server_runner (single source of
 # truth for cli + chat_ui). Thin wrappers below keep the historical cli-level
@@ -18,11 +21,6 @@ from .server_runner import _resolve_bind_host, _watch_stop_keys
 
 def _is_port_free(host: str, port: int) -> bool:
     return _runner._is_port_free(host, port)
-
-
-def _scan_free_ports(host: str, start: int, count: int,
-                     limit: int | None = None, check=None) -> list[int]:
-    return _runner._scan_free_ports(host, start, count, limit=limit, check=check)
 
 
 def _next_free_port(host: str, port: int, limit: int = 50) -> int | None:
@@ -106,33 +104,6 @@ def _unknown_provider_exit(raw) -> int:
     return 2
 
 
-def _provider_display_name(pid: str) -> str:
-    """Human name for a provider id, from the registry (falls back to the id)."""
-    key = str(pid or "").strip().lower() or "deepseek"
-    try:
-        from .core import registry as _reg
-
-        name = str(getattr(_reg.get(key), "display_name", "") or "").strip()
-        if name:
-            return name
-    except Exception:
-        pass
-    return key
-
-
-def _stdin_is_tty() -> bool:
-    """True only when there is a console to prompt on. Never raises.
-
-    getattr-style because sys.stdin is None under pythonw.exe and some frozen
-    launchers; a bare sys.stdin.isatty() raised AttributeError there.
-    """
-    _stdin = getattr(sys, "stdin", None)
-    try:
-        return bool(getattr(_stdin, "isatty", None) and _stdin.isatty())
-    except Exception:
-        return False
-
-
 def _warn_secret_on_cmdline(*flags: str) -> None:
     """One line: a secret passed as a flag is visible to other processes."""
     print("  ! " + "/".join(flags) + " was given on the command line: the value "
@@ -144,23 +115,20 @@ def _read_secret_line() -> str:
     """One line from a non-tty stdin, or "" when there is nothing to read.
 
     The piped-secret path: ``getpass.getpass`` falls back to
-    ``getpass.fallback_getpass`` when it cannot open /dev/tty, which reads a
-    single line from stdin - that is how ``deepseaport login --email a@x.com
-    < password.txt``, service wrappers and CI steps pass a secret. Replacing
-    that with "" made every scripted login authenticate with an empty string.
-
-    EOF, a closed/NULL stdin (``sys.stdin is None`` under pythonw.exe) and a
+    ``fallback_getpass`` when it cannot open /dev/tty, which reads a single
+    line from stdin - that is how ``deepseaport login --email a@x.com <
+    password.txt``, service wrappers and CI steps pass a secret. EOF, a
+    closed/NULL stdin (``sys.stdin is None`` under pythonw.exe) and a
     read-blocked stream (pytest's captured stdin raises OSError) all mean "no
-    secret here", not a crash, and the caller's existing "no password" path
-    takes over. Only the line terminator is stripped, exactly as
-    ``fallback_getpass`` does: trailing spaces can be part of the secret.
-    ``fallback_getpass``'s "input may be echoed" warning is deliberately not
-    reproduced - it is printed *to stdin*, which for ``< password.txt``
-    overwrites the beginning of the very file holding the secret.
+    secret here", not a crash; the caller's "no password" path takes over.
 
+    Only the line terminator is stripped (trailing spaces are part of the
+    secret). ``fallback_getpass``'s "input may be echoed" warning is
+    deliberately not reproduced - it is printed *to stdin*, which for ``<
+    password.txt`` overwrites the beginning of the file holding the secret.
     Like ``fallback_getpass``, this blocks on an open-but-silent stdin (e.g.
-    ``docker run -i`` with no input): a secret the operator meant to pipe in
-    has not arrived yet, and silently logging in with "" is the worse failure.
+    ``docker run -i``): a piped secret has not arrived yet, and silently
+    logging in with "" is the worse failure.
     """
     try:
         stdin = getattr(sys, "stdin", None)
@@ -198,9 +166,7 @@ def _secret_from_arg(flag_value: str, flag: str, prompt: str) -> str:
 
 
 # Canonical short aliases shared by CLI flags and the TUI interactive gate.
-# Single home so `ds` means `deepseek` in both. TUI keeps thin wrappers
-# (_PROVIDER_ALIASES / _normalize_provider_choice) delegating here for
-# backward compatibility (tests import those names from tui).
+# Single home, so `ds` means `deepseek` in both.
 PROVIDER_ALIASES = {"ds": "deepseek"}
 
 
@@ -306,8 +272,9 @@ def cmd_serve(args) -> int:
     if not no_tui and _stdin_is_tty():
         from .tui import main_menu, provider_menu
 
-        if not explicit:
-            provider_menu(settings)
+        if not explicit and provider_menu(settings) is False:
+            # The startup chooser's "q. Quit" quits the serve.
+            return 0
 
         def serve_fn(current_settings) -> int:
             return _run_server(current_settings, args)
@@ -352,9 +319,7 @@ def cmd_models(args) -> int:
 
         prov = _reg.get(str(flag).strip().lower())
         if prov is None:
-            print(f"unknown provider: {flag}")
-            print("available: " + ", ".join(sorted(_reg.registered().keys())))
-            return 2
+            return _unknown_provider_exit(flag)
         try:
             ids = sorted(prov.models().keys())
         except Exception:
@@ -373,7 +338,8 @@ def cmd_models(args) -> int:
 
 
 def cmd_accounts(args) -> int:
-    from .accounts import TOKEN_HELP, AccountPool, extract_token, sync_current_from_settings
+    from .accounts import (TOKEN_HELP, AccountPool, account_has_token,
+                           extract_token, sync_current_from_settings)
     from .config import AccountConfig, load_settings
 
     settings = load_settings(args.config)
@@ -403,7 +369,7 @@ def cmd_accounts(args) -> int:
             _ban_label = None  # type: ignore
         for i, r in enumerate(rows, 1):
             mark = " *CURRENT*" if r.get("current") else ""
-            token_flag = "yes" if _account_has_token(settings, str(r["identifier"])) else "MISSING"
+            token_flag = "yes" if account_has_token(settings, str(r["identifier"])) else "MISSING"
             ban_flag = ""
             try:
                 found, until = (_ban_lookup(ban_map, str(r["identifier"]))
@@ -415,7 +381,7 @@ def cmd_accounts(args) -> int:
             print(f"{i}. {r['identifier']}{mark}  uses={r['uses']}  "
                   f"busy={r['busy']}  cooldown={r['cooldown_remaining']}s  token={token_flag}{ban_flag}")
         missing = [r["identifier"] for r in rows
-                   if not _account_has_token(settings, str(r["identifier"]))
+                   if not account_has_token(settings, str(r["identifier"]))
                    and not r.get("banned")]
         if missing:
             print(f"missing token: {', '.join(missing)}")
@@ -424,7 +390,7 @@ def cmd_accounts(args) -> int:
 
     if action == "select":
         ident = (getattr(args, "identifier", "") or "").strip()
-        if getattr(args, "clear", False) or not ident or ident.lower() in ("none", "all", "auto"):
+        if not ident or ident.lower() in ("none", "all", "auto"):
             settings.active_account = ""
             if not _save(settings):
                 return 1
@@ -556,11 +522,6 @@ def cmd_accounts(args) -> int:
     return 2
 
 
-def _account_has_token(settings, identifier: str) -> bool:
-    from .accounts import account_has_token
-    return account_has_token(settings, identifier)
-
-
 def _upsert_account(settings, email: str, password: str, token: str,
                     provider: str | None = None,
                     token_expires_at: float = 0.0):
@@ -611,7 +572,7 @@ def _upsert_account(settings, email: str, password: str, token: str,
 # stable and are intentionally tiny.
 
 def _unpack_login_token_result(res) -> tuple[str | None, bool, str]:
-    return _unpack_login_result(res)
+    return unpack_login_result(res)
 
 
 def _obscura_login_token(email: str, password: str, settings,
@@ -645,8 +606,8 @@ def _missing_credential(email: str, password: str) -> str:
     """One actionable block for a login that has no email and/or no password.
 
     Risk control is the reason this is a hard stop: with an empty password
-    ``providers/deepseek/auth.py:310`` calls ``login_with_real_browser``
-    BEFORE the empty check at ``auth.py:152``, so an Enter at the password
+    ``providers/deepseek/auth.py:309`` calls ``login_with_real_browser``
+    BEFORE the empty check at ``auth.py:149-150``, so an Enter at the password
     prompt (which carries no "Enter=skip" hint) opened a real Helium/Chrome
     window, filled the email with an empty password and clicked Log in. A
     failed sign-in from the user's own IP is exactly what puts the account
@@ -670,26 +631,10 @@ def _missing_credential(email: str, password: str) -> str:
     return "\n".join(lines)
 
 
-def _token_expires_at_for(provider_id: str, token: str) -> float:
-    """Best-effort JWT ``exp`` for a token from ``provider_id``. 0.0 when unknown.
-
-    Qwen's ``jwt_exp`` is the decoder: a generic base64url JWT-``exp`` read that
-    is right for Qwen and for every provider whose token is a plain JWT. It is
-    also the only ``jwt_exp`` in the tree, so per-provider dispatch resolved to
-    this same function and only added an ``importlib`` round-trip. 0.0 is always
-    a valid answer: the expiry is a pre-check, so "unknown" must never be fatal.
-    """
-    try:
-        from .providers.qwen.auth import jwt_exp as _qwen_jwt_exp
-
-        return float(_qwen_jwt_exp(token) or 0.0)
-    except Exception:
-        return 0.0
-
-
 def cmd_login(args) -> int:
     """Interactive login for the resolved provider -> saves the account token."""
 
+    from .accounts import provider_label
     from .config import load_settings
 
     settings = load_settings(args.config)
@@ -706,7 +651,7 @@ def cmd_login(args) -> int:
     _flag_pid = _valid_provider_id(getattr(args, "provider", None)) or None
     if _flag_pid and _flag_pid != "deepseek" and not provider_is_registered(_flag_pid):
         return _unknown_provider_exit(_flag_pid)
-    _label = _provider_display_name(_pid)
+    _label = provider_label(_pid)
     _email_arg = getattr(args, "email", "") or ""
     if _email_arg:
         email = _email_arg
@@ -771,8 +716,14 @@ def cmd_login(args) -> int:
     if _prov and _prov != "deepseek" and token:
         # providers.qwen.auth.login_with_expiry captures the signin expiry, but
         # the registry login() seam returns the legacy 3-tuple and discards it,
-        # so the expiry has to be recovered from the token afterwards.
-        _login_expires_at = _token_expires_at_for(_prov, token)
+        # so the expiry has to be recovered from the token afterwards. jwt_exp
+        # is the tree's only JWT ``exp`` reader; 0.0 = unknown, never fatal.
+        try:
+            from .providers.qwen.auth import jwt_exp as _jwt_exp
+
+            _login_expires_at = float(_jwt_exp(token) or 0.0)
+        except Exception:
+            _login_expires_at = 0.0
     acc = _upsert_account(settings, email, password, token, provider=_prov,
                           token_expires_at=_login_expires_at)
     if login_banned:
@@ -786,13 +737,9 @@ def cmd_login(args) -> int:
             until = None
         try:
             from .accounts import check_ban_for_token
-            try:
-                if _prov and _prov != "deepseek":
-                    _banned, _until = check_ban_for_token(token, provider=_prov)
-                else:
-                    _banned, _until = check_ban_for_token(token)
-            except TypeError:
-                # Legacy monkeypatch without the provider kwarg (tests).
+            if _prov and _prov != "deepseek":
+                _banned, _until = check_ban_for_token(token, provider=_prov)
+            else:
                 _banned, _until = check_ban_for_token(token)
             until = _until or until
         except Exception:
@@ -833,7 +780,6 @@ def cmd_chat(args) -> int:
 
     from .accounts import AccountPool, token_help_for
     from .config import load_settings
-    from .core.obscura_bridge import ObscuraBridge
     from .server import create_app
     from .server_routes import _prepare
 
@@ -864,9 +810,7 @@ def cmd_chat(args) -> int:
     if _chat_prov:
         _pid = str(_chat_prov).strip().lower()
         if _reg.get(_pid) is None:
-            print(f"unknown provider: {_chat_prov}")
-            print("available: " + ", ".join(sorted(_reg.registered().keys())))
-            return 2
+            return _unknown_provider_exit(_chat_prov)
         settings.provider = _pid
         settings.providers = []
     app = create_app(settings)
@@ -916,23 +860,20 @@ def cmd_chat(args) -> int:
     except Exception:
         _prov_accts = settings.accounts
         _current = getattr(settings, "active_account", "")
-    pool = AccountPool(_prov_accts, current=_current)
+    pool = AccountPool(_prov_accts, current=_current,
+                       provider=prep.get("provider", ""))
     try:
         item = pool.acquire(timeout=30,
                             allow_failover=bool(getattr(settings, "use_multiple_accounts", True)))
-        # Through the PROVIDER, never DeepSeek's engine directly. `chat` serves
-        # --provider qwen / opencode too, and calling DeepSeek's
-        # _complete_with_failover_sync here ran DeepSeek's whole code path for
-        # every provider: it closes over its own module globals and never reads
-        # prep["provider"], so `chat --provider qwen` transmitted the Qwen ES256
-        # JWT to chat.deepseek.com as a userToken.
-        #
-        # `complete` and not `complete_request` because it is the seam whose
-        # cancel_event defaults to None -- `chat` has no cancellation source --
-        # and because every provider forwards it to its OWN
-        # _complete_with_failover_sync as a KEYWORD, so the same-request ban
-        # failover this line existed for is unchanged and the existing
-        # 4-positional doubles of the engine seam still fit.
+        # Through the PROVIDER, never DeepSeek's engine directly: `chat` serves
+        # --provider qwen / opencode too, and that engine closes over its own
+        # module globals and never reads prep["provider"], so a Qwen ES256 JWT
+        # would go to chat.deepseek.com as a userToken. `complete`, not
+        # `complete_request`: its cancel_event defaults to None (chat has no
+        # cancellation source) and providers forward it to their OWN
+        # _complete_with_failover_sync as a keyword, keeping same-request ban
+        # failover and the 4-positional engine-seam doubles working (see
+        # src/deepseaport/AGENTS.md).
         result = _chat_provider.complete(app, pool, prep, item)
     except (ValueError, HTTPException, TimeoutError) as exc:
         return _chat_fail(exc)
@@ -950,7 +891,6 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--host", default="",
                        help="bind address; overrides config listen=true/false")
     serve.add_argument("--port", type=_port_number, default=0)
-    serve.add_argument("--workers", type=int, default=1)
     serve.add_argument("--no-tui", action="store_true",
                        help="skip the main-page TUI and start the server directly")
     serve.add_argument("--provider", default=None,
@@ -967,8 +907,6 @@ def main(argv: list[str] | None = None) -> int:
     acc_sel = acc_sub.add_parser("select", help="set CURRENT account (preferred first)")
     acc_sel.add_argument("identifier", nargs="?", default="",
                          help="email to select; empty/ALL/NONE clears")
-    acc_sel.add_argument("--clear", action="store_true",
-                         help="clear selection -> ALL (auto-failover)")
     acc_add = acc_sub.add_parser("add", help="add account (needs --token, see TOKEN_HELP)")
     acc_add.add_argument("--email", default="", help="account email")
     acc_add.add_argument("--mobile", default="", help="account mobile")
@@ -1017,7 +955,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd is None:
         # No subcommand (e.g. double-clicked exe) -> start the server.
         args = argparse.Namespace(config=args.config, host="", port=0,
-                                  workers=1, no_tui=False, cmd="serve",
+                                  no_tui=False, cmd="serve",
                                   provider=None, providers=None)
     if args.cmd == "serve":
         return cmd_serve(args)

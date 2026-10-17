@@ -22,23 +22,17 @@ def _int_env(name: str, default: int) -> int:
 
 
 # Default argument-size limit, used only when a caller passes no
-# `max_args_chars`. LIFETIME: this is a SNAPSHOT read once, when this module
-# is first imported, and never refreshed. `config.load_settings()` re-reads
-# the same environment variable on every call, so `Settings.tool_args_max_chars`
-# and this constant CAN disagree — that is the documented behaviour, not a bug:
-#   * They do NOT disagree on the real request path.
-#     `server_routes._prep_tool_limits()` reads `Settings.tool_args_max_chars`
-#     per request and threads it through the prep dict to
-#     `parse_tool_calls(..., max_args_chars=...)`, so the parser honours the
-#     live setting. ARCHITECTURE.md's claim holds because of that explicit
-#     plumbing, not because of this constant.
-#   * The snapshot is only the DEFAULT for callers that pass no limit:
-#     `tool_system_prompt()`, and direct `parse_tool_calls()` calls from a
-#     script or a test. Those keep whatever the environment held at first
-#     import; setting DEEPSEAPORT_MAX_ARGS_CHARS afterwards does not move them.
-# Import this name (re-exported by `deepseaport.core.tools`); do not expect
-# it to track the environment. To honour a live value, read it from `Settings`
-# and pass `max_args_chars` explicitly.
+# `max_args_chars`. LIFETIME: a SNAPSHOT read once at first import and never
+# refreshed, so `Settings.tool_args_max_chars` and this constant CAN
+# disagree — documented, not a bug: the real request path does not disagree,
+# because `server_routes._prep_tool_limits()` reads the Setting per request
+# and threads it through the prep dict to `parse_tool_calls(...,
+# max_args_chars=...)`. The snapshot is only the DEFAULT for callers that pass
+# no limit (`tool_system_prompt()`, direct `parse_tool_calls()` from a script
+# or a test), which keep whatever the environment held at first import.
+# Import this name (re-exported by `deepseaport.core.tools`); it will never
+# track the environment — to honour a live value, read it from `Settings` and
+# pass `max_args_chars` explicitly.
 MAX_ARGS_CHARS = _int_env("DEEPSEAPORT_MAX_ARGS_CHARS", 200_000)
 MAX_BARE_OBJECTS = _int_env("DEEPSEAPORT_MAX_BARE_OBJECTS", 40)
 # Universal bound for parser scans (json_array/fence/tags/DSML) and total
@@ -429,7 +423,7 @@ def _normalize_calls(
     hallucination guard: ``None`` means the request declared NO tools (a
     plain chat — there is no allowlist, so nothing is name-checked), while a
     possibly-empty set means tools WERE declared. ``parse_tool_calls_ex``
-    (core/tools/parser/__init__.py:113-114) is what keeps the two apart: it
+    (core/tools/parser/__init__.py:132-133) is what keeps the two apart: it
     passes ``None`` only when ``tools`` is falsy, and the set otherwise — so
     an empty set can only mean "declared, but no name could be extracted"
     (``_valid_names`` returns set() for a malformed or Anthropic-shaped

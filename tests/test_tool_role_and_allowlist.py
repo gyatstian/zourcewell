@@ -77,7 +77,7 @@ def test_mixed_malformed_tools_keep_the_readable_allowlist(caplog):
     assert calls is not None and calls[0]["function"]["name"] == "read"
     unknown, _ = T.parse_tool_calls(_reply("nope"), tools)
     assert unknown is None
-    assert "unknown tool" in caplog.text or unknown is None
+    assert "unknown tool" in caplog.text
 
 
 def test_valid_allowlist_drops_unknown_and_keeps_declared(caplog):

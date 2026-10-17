@@ -1,7 +1,7 @@
-"""FastAPI server: OpenAI-compatible endpoints over the DeepSeek web client.
+"""FastAPI server: OpenAI-compatible endpoints over the DeepSeek, Qwen and opencode backends.
 
-Concurrency model: endpoints are async; all blocking DeepSeek I/O runs in
-worker threads. Streaming responses bridge a producer thread (DeepSeek SSE)
+Concurrency model: endpoints are async; all blocking upstream I/O runs in
+worker threads. Streaming responses bridge a producer thread (upstream SSE)
 to the response generator through a queue, so first tokens reach the
 harness without waiting for the full reply. Tool calls are parsed from the
 buffered full text at FINISHED and emitted as OpenAI tool_call deltas.
@@ -17,7 +17,6 @@ Everything else is imported from the module that owns it.
 from __future__ import annotations
 
 import logging
-import os
 
 from fastapi import FastAPI
 
@@ -40,8 +39,6 @@ from .server_routes import _pool, register_routes
 from .core.openai import _openai_response
 from .core.tools import parse_tool_calls
 
-logger = logging.getLogger("deepseaport.server")
-
 # Log format for the process-owning entry point (create_app). It used to run at
 # import time, which made `import deepseaport.server` mutate process-global
 # logging for every embedder, test run and CLI import that never serves a
@@ -52,9 +49,9 @@ logger = logging.getLogger("deepseaport.server")
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 
-def configure_logging(level: int = logging.INFO, *, force: bool = False) -> None:
+def configure_logging(*, force: bool = False) -> None:
     """Install the deepseaport console log format (no-op when already set up)."""
-    logging.basicConfig(level=level, format=LOG_FORMAT, force=force)
+    logging.basicConfig(format=LOG_FORMAT, force=force)
 
 
 # Derived from the DeepSeek provider catalogue, kept as a plain dict for

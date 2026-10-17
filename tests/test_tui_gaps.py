@@ -13,7 +13,6 @@ from deepseaport.config import AccountConfig, Settings
 from deepseaport.tui import (
     _ask,
     _c,
-    _edit_chat_model,
     _edit_choice,
     _edit_keys,
     _edit_obscura_bin,
@@ -301,20 +300,6 @@ def test_edit_obscura_bin_clear_resets(monkeypatch):
     assert s.obscura_bin == ""
 
 
-def test_edit_chat_model_invalid_keeps(monkeypatch):
-    s = _fresh(chat_model="deepseek-flash")
-    monkeypatch.setattr("builtins.input", lambda *a, **k: "bogus-model-xyz")
-    _edit_chat_model(s)
-    assert s.chat_model == "deepseek-flash"
-
-
-def test_edit_chat_model_out_of_range_keeps(monkeypatch):
-    s = _fresh(chat_model="deepseek-flash")
-    monkeypatch.setattr("builtins.input", lambda *a, **k: "99")
-    _edit_chat_model(s)
-    assert s.chat_model == "deepseek-flash"
-
-
 def test_preflight_empty_tokenless_ok():
     assert _preflight_reason(_fresh(accounts=[])) != ""
     r = _preflight_reason(_fresh(accounts=[AccountConfig(email="a@x.com", token="")]))
@@ -471,8 +456,10 @@ def test_read_interactive_non_tty_unescapes(monkeypatch):
     assert tui._read_interactive("Label: ") == "a\nb"
 
 
-def test_unescape_newlines_double_backslash(monkeypatch):
-    assert tui._unescape_newlines("a\\\\nb") == "a\\nb"
+def test_unescape_newlines_double_backslash():
+    from deepseaport import tui_editor
+
+    assert tui_editor._unescape_newlines("a\\\\nb") == "a\\nb"
 
 
 def test_settings_menu_toggle_dry_frontend(monkeypatch):
@@ -551,17 +538,9 @@ def test_settings_menu_obscura_invalid_keeps(monkeypatch):
     assert s.obscura_bin == ""
 
 
-def test_settings_menu_chat_model_invalid_keeps(monkeypatch):
-    s = _fresh(chat_model="deepseek-flash")
-    inputs = iter(["13", "bogus-model-xyz", "q"])
-    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
-    settings_menu(s)
-    assert s.chat_model == "deepseek-flash"
-
-
 def test_settings_menu_toggle_failover(monkeypatch):
     s = _fresh(use_multiple_accounts=True)
-    inputs = iter(["14", "q"])
+    inputs = iter(["13", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     settings_menu(s)
     assert s.use_multiple_accounts is False
@@ -585,7 +564,7 @@ def test_accounts_menu_offer_auto_login_declined(monkeypatch):
         raise AssertionError("login must not run on decline")
 
     monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token", _fail)
-    inputs = iter(["t", "a@x.com", "", "n", "b"])
+    inputs = iter(["t", "a@x.com", "", "n", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert s.accounts[0].token == ""
@@ -595,7 +574,7 @@ def test_accounts_menu_offer_auto_login_confirmed(monkeypatch):
     s = _fresh(accounts=[AccountConfig(email="a@x.com", password="pw", token="")])
     monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
                         lambda email, pw, st: ("tok-confirmed", False, ""))
-    inputs = iter(["t", "a@x.com", "", "", "b"])
+    inputs = iter(["t", "a@x.com", "", "", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert s.accounts[0].token == "tok-confirmed"
@@ -609,7 +588,7 @@ def test_accounts_menu_login_ban_wording_hint_is_surfaced(monkeypatch, capsys):
         "deepseaport.providers.deepseek.auth.obscura_login_token",
         lambda email, pw, st: (None, False,
                                "captcha [ban wording seen: suspended]"))
-    inputs = iter(["t", "a@x.com", "", "", "b"])
+    inputs = iter(["t", "a@x.com", "", "", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert s.accounts[0].token == ""
@@ -624,7 +603,7 @@ def test_accounts_menu_set_token_literal(monkeypatch):
         raise AssertionError("login must not run for literal token")
 
     monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token", _fail)
-    inputs = iter(["t", "a@x.com", "newtok123", "b"])
+    inputs = iter(["t", "a@x.com", "newtok123", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert s.accounts[0].token == "newtok123"
@@ -632,7 +611,7 @@ def test_accounts_menu_set_token_literal(monkeypatch):
 
 def test_accounts_menu_set_token_not_found(monkeypatch):
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")])
-    inputs = iter(["t", "missing@x.com", "sometok", "b"])
+    inputs = iter(["t", "missing@x.com", "sometok", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert [a.email for a in s.accounts] == ["a@x.com"]
@@ -641,19 +620,54 @@ def test_accounts_menu_set_token_not_found(monkeypatch):
 
 def test_accounts_menu_invalid_loops_then_back(monkeypatch):
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")])
-    inputs = iter(["zzz", "b"])
+    inputs = iter(["zzz", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert len(s.accounts) == 1 and s.accounts[0].token == "t1"
 
 
+def test_accounts_menu_help_waits_then_returns(monkeypatch, capsys):
+    """The token help is paged, not flashed: the menu redraws only after the
+    Enter wait, so a 24-row console still shows the help it just printed."""
+    s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")])
+    prompts: list[str] = []
+
+    def _inp(prompt=""):
+        prompts.append(prompt)
+        return next(inputs)
+
+    inputs = iter(["h", "", "q"])
+    monkeypatch.setattr("builtins.input", _inp)
+    accounts_menu(s)
+    assert "Press Enter to return: " in prompts
+    # One menu draw before the help, one after the wait.
+    assert capsys.readouterr().out.count("a. Add account") == 2
+
+
+def test_accounts_menu_add_password_is_visible(monkeypatch):
+    """Account passwords are typed in the clear: getpass is never consulted,
+    and _ask_raw keeps inner/edge spaces the old hidden fallback stripped."""
+    def _no_getpass(*a, **k):
+        raise AssertionError("the account password went through getpass")
+
+    monkeypatch.setattr("getpass.getpass", _no_getpass)
+    s = _fresh(accounts=[])
+    inputs = iter(["a", "new@x.com", " pass word ", "tok123", "q"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+    accounts_menu(s)
+    assert s.accounts[0].password == " pass word "
+
+
 # --- main_menu ---
 
-def test_main_menu_invalid_then_quit(monkeypatch):
+def test_main_menu_invalid_then_quit(monkeypatch, capsys):
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")])
-    inputs = iter(["bogus", "q"])
+    # "bogus" falls through to the unknown branch and re-prompts; quit lives
+    # in the provider chooser ("q. Go back", then "q. Quit" in there).
+    inputs = iter(["bogus", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     assert main_menu(s, lambda st: 0) == 0
+    assert "Unknown option: type 1-4 or q." in capsys.readouterr().out
 
 
 def test_main_menu_quit_on_eof(monkeypatch):
@@ -681,7 +695,7 @@ def test_main_menu_settings_routing(monkeypatch):
     called = {"n": 0}
     monkeypatch.setattr(tui, "settings_menu", lambda st: called.__setitem__("n", 1))
     monkeypatch.setattr(tui, "accounts_menu", lambda st: (_ for _ in ()).throw(AssertionError("no accounts")))
-    inputs = iter(["2", "q"])
+    inputs = iter(["3", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     assert main_menu(s, lambda st: 0) == 0
     assert called["n"] == 1
@@ -692,7 +706,7 @@ def test_main_menu_accounts_routing(monkeypatch):
     called = {"n": 0}
     monkeypatch.setattr(tui, "accounts_menu", lambda st: called.__setitem__("n", 1))
     monkeypatch.setattr(tui, "settings_menu", lambda st: (_ for _ in ()).throw(AssertionError("no settings")))
-    inputs = iter(["3", "q"])
+    inputs = iter(["2", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     assert main_menu(s, lambda st: 0) == 0
     assert called["n"] == 1
@@ -702,7 +716,7 @@ def test_main_menu_settings_routing_with_chat(monkeypatch):
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")])
     called = {"n": 0}
     monkeypatch.setattr(tui, "settings_menu", lambda st: called.__setitem__("n", 1))
-    inputs = iter(["4", "q"])
+    inputs = iter(["4", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     assert main_menu(s, lambda st: 0, lambda st: 0) == 0
     assert called["n"] == 1
@@ -712,7 +726,7 @@ def test_main_menu_accounts_routing_with_chat(monkeypatch):
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")])
     called = {"n": 0}
     monkeypatch.setattr(tui, "accounts_menu", lambda st: called.__setitem__("n", 1))
-    inputs = iter(["5", "q"])
+    inputs = iter(["3", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     assert main_menu(s, lambda st: 0, lambda st: 0) == 0
     assert called["n"] == 1
@@ -727,7 +741,7 @@ def test_main_menu_multi_chat_routing():
 def test_main_menu_multi_chat_calls_multi_fn(monkeypatch):
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")])
     calls = {"serve": 0, "chat": 0, "multi": 0}
-    inputs = iter(["3", "q"])
+    inputs = iter(["5", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     rc = main_menu(s,
                    lambda st: calls.__setitem__("serve", 1) or 0,
@@ -738,14 +752,13 @@ def test_main_menu_multi_chat_calls_multi_fn(monkeypatch):
 
 # --- C11: dead code / duplication cleanup-----------------------------------------
 
-def test_tui_reexports_the_two_pinned_editor_names():
-    """The re-export block existed for exactly these two names; the rest were
+def test_tui_reexports_only_the_pinned_editor_name():
+    """The module-scope import exists for this one name; the rest were
     tui_editor internals leaking into the TUI namespace (and `from tui import *`).
     """
     from deepseaport import tui_editor
 
     assert tui._read_interactive is tui_editor._read_interactive
-    assert tui._unescape_newlines is tui_editor._unescape_newlines
 
 
 def test_ask_password_fallback_announces_echo_and_keeps_spaces(monkeypatch, capsys):

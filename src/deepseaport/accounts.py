@@ -191,10 +191,6 @@ class AccountHealth:
     login_until: float = 0.0
     login_reason: str = ""
 
-    @property
-    def login_backoff_remaining(self) -> float:
-        return max(0.0, self.login_until - time.time())
-
     def clear(self) -> None:
         self.bad_until = 0.0
         self.login_until = 0.0
@@ -282,10 +278,6 @@ class PooledAccount:
     @property
     def cooldown_remaining(self) -> float:
         return max(0.0, self.bad_until - time.time())
-
-    @property
-    def available(self) -> bool:
-        return not self.busy and self.cooldown_remaining <= 0 and not self.banned
 
     def status(self) -> dict:
         return {
@@ -473,12 +465,13 @@ class AccountPool:
         self._cursor = 0
         self._guard = threading.Lock()
         self._current: str = (current or "").strip()
-        # Optional explicit label. Normally omitted (``pools.make_pool`` does
-        # not pass one) and the id is then derived from the member accounts'
-        # own ``provider`` field -- the same field ``pools._provider_of`` /
-        # ``accounts_for_provider`` build the pool from. An explicit value is
-        # only needed to name the provider of a pool that is EMPTY, where no
-        # member can answer the question.
+        # Explicit label. Provider-scoped pools always pass one
+        # (``pools.make_pool``, the account routes); the unscoped management
+        # pools (cli/tui) omit it and the id is then derived from the member
+        # accounts' own ``provider`` field -- the same field
+        # ``pools._provider_of`` / ``accounts_for_provider`` build the pool
+        # from. The explicit value is what names the provider of a pool that
+        # is EMPTY, where no member can answer the question.
         self._provider_id: str = (provider or "").strip().lower()
 
     @property
@@ -625,19 +618,6 @@ class AccountPool:
                         pass
         if n:
             logger.info("cooldown/ban/login state cleared for %d account(s)", n)
-        return n
-
-    def clear_login_backoff(self, identifier: str | None = None) -> int:
-        """Clear only the browser-login backoff for one account (or all)."""
-        n = 0
-        with self._guard:
-            for item in self._items:
-                if identifier is None or _matches(item.cfg, identifier):
-                    if item.health.login_until > 0:
-                        n += 1
-                    item.clear_login_backoff()
-        if n:
-            logger.info("login backoff cleared for %d account(s)", n)
         return n
 
     def _next_ordered(self, allow_failover: bool
@@ -999,12 +979,8 @@ def collect_ban_labels(accounts: list[AccountConfig],
         ident, tok = pair[0], pair[1]
         prov = provider_by_pair.get((ident, (tok or "").strip()), "deepseek")
         try:
-            try:
-                banned, until = check_ban_for_token(tok, timeout=timeout,
-                                                    provider=prov)
-            except TypeError:
-                # Legacy monkeypatch without the provider kwarg (tests).
-                banned, until = check_ban_for_token(tok, timeout=timeout)
+            banned, until = check_ban_for_token(tok, timeout=timeout,
+                                               provider=prov)
             return ident, banned, until
         except Exception:
             return ident, False, None

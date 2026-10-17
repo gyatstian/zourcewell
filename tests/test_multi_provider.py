@@ -61,14 +61,11 @@ def test_config_missing_provider_migrates_to_deepseek(tmp_path):
 # 2. pools helpers --------------------------------------------------------------
 
 
-def test_active_provider_ids_single_vs_multi():
-    assert pools.active_provider_ids(_settings(provider="deepseek")) == ["deepseek"]
-    assert pools.active_provider_ids(_settings(providers=[])) == ["deepseek"]
+def test_unknown_provider_entry_falls_back_and_single_is_not_multi():
+    """The two verdicts test_config_integrity.py's warning tests do not pin:
+    an unrecognised entry is dropped, and single mode is not multi mode."""
     assert pools.active_provider_ids(_settings(providers=["no-such-provider"])) == ["deepseek"]
-    assert pools.active_provider_ids(
-        _settings(providers=["deepseek", "qwen", "DEEPSEEK", ""])) == ["deepseek", "qwen"]
     assert pools.is_multi(_settings(provider="deepseek")) is False
-    assert pools.is_multi(_settings(providers=["deepseek", "qwen"])) is True
 
 
 def test_accounts_for_provider_filters():

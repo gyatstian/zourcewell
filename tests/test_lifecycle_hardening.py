@@ -240,7 +240,7 @@ def test_login_single_ban_frame_then_token_is_not_a_ban(monkeypatch):
 
 
 def test_login_two_consecutive_ban_frames_are_banned(monkeypatch):
-    """Mirror of the MCP driver: ban_streak >= 2 (auth.py:267-274)."""
+    """Mirror of the MCP driver: ban_streak >= 2 (auth.py:264-270)."""
     browser, _ = _login_browser(monkeypatch, [
         _snap("account has been suspended"),
         _snap("account has been suspended"),
@@ -264,7 +264,7 @@ def test_login_ban_streak_resets_on_a_healthy_frame(monkeypatch):
 
 
 def test_login_captcha_mid_streak_still_surfaces_the_hint(monkeypatch):
-    """Mirror of tests/test_auth_browser_gaps.py:758-783: a ban hint seen on
+    """Mirror of tests/test_auth_browser_gaps.py:756-780: a ban hint seen on
     an earlier frame is reported on a captcha exit, which cannot state a
     verdict of its own -- the hint goes to the DETAIL, never the banned slot
     (auth.py only stops on a token or a confirmed ban, so the Obscura fallback

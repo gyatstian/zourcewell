@@ -31,7 +31,6 @@ from .chat_repl import (
     _restore_chat_logs,
     _select_usable_accounts_live,
     _silence_chat_logs,
-    _warn_chat_workers,
     resolve_chat_models,
 )
 from .server_runner import (
@@ -109,7 +108,6 @@ def run_multi_chat_servers(settings, args=None, count: int | None = None) -> int
     (no port save, no account rewrite). Returns 0 on clean stop/cancel,
     1 when startup is blocked or a server never became ready.
     """
-    _warn_chat_workers(args)
     # Account gating only applies when a provider that needs accounts is
     # active; an accountless local provider (opencode) has nothing to
     # provision, so an empty pool must not block the start.
@@ -225,8 +223,8 @@ def run_multi_chat_servers(settings, args=None, count: int | None = None) -> int
             api_key = _first_api_key(settings)
         except Exception:
             api_key = ""
-        # Central catalogue (F6): union across instances, fallback to MODELS.
-        _catalogue, models, model = resolve_chat_models(settings, instances)
+        # Central catalogue: union across instances, fallback to MODELS.
+        models, model = resolve_chat_models(settings, instances)
         history: list[dict] = []
 
         print()
@@ -306,7 +304,6 @@ def run_chat_server(settings, args=None) -> int:
     from .cli import _ensure_free_port
     from .server import create_app
 
-    _warn_chat_workers(args)
     bind_host = _resolve_bind_host(settings, args)
     # No int() here: _ensure_free_port owns the coercion (garbage -> warn +
     # scan from 5001), and a cast first is the traceback it exists to prevent.
@@ -372,8 +369,8 @@ def run_chat_server(settings, args=None) -> int:
             print(f"  ! server slow to respond, continuing anyway ({client_base}).")
 
         api_key = _first_api_key(settings)
-        # Central catalogue (F6): shared with multi-chat via chat_repl.
-        _catalogue, models, model = resolve_chat_models(settings)
+        # Central catalogue: shared with multi-chat via chat_repl.
+        models, model = resolve_chat_models(settings)
         history: list[dict] = []
 
         print()

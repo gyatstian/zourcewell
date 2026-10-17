@@ -11,7 +11,7 @@ model runs through it. Three defects these tests pin, all of which surface as
   ``new_stream_context(..., buffered=True)`` so the consumer watchdog covers
   the whole producer budget; Qwen passed nothing, so a valid-but-slow answer
   was thrown away and replaced with a client-visible ``upstream timed out``.
-  DeepSeek complies at ``providers/deepseek/completion_service.py:1154-1156``.
+  DeepSeek complies at ``providers/deepseek/completion_service.py:1155-1157``.
 * Q2 the terminal 401 quoted the raw upstream body, and the qwen credential IS
   a JWT, whose dot-framed segments no run-length redactor can see.
 * Q3 every WAF/401 recovery rebound ``chat_id`` without deleting the previous
@@ -495,12 +495,15 @@ def test_qwen_scrub_sites_cover_every_upstream_body_sink():
         "the overload retry log still slices the raw upstream error"
     # Every other terminal path delegates to core.engine, which scrubs inside
     # raise_rate_limit / raise_overload / raise_upstream* / ban_403_for_item.
-    # Qwen's own two provider-specific handlers must reach engine directly;
-    # the label-only ones are built by the shared factory, so check the factory
+    # Qwen's own provider-specific handler must reach engine directly; the
+    # label-only ones are built by the shared factory, so check the factory
     # routes each kind to a scrubbing raise_* rather than re-pinning a list of
     # handler names that the table happens to contain today.
-    for name in ("_terminal_invalid_token", "_terminal_upstream"):
-        assert "_engine" in inspect.getsource(getattr(QCS, name)), name
+    assert "_engine" in inspect.getsource(QCS._terminal_invalid_token)
+    # The WAF row is the shared upstream raiser (a retryable kind lands here
+    # only once the retry budget is spent), not a local wrapper.
+    assert "raise_upstream" in inspect.getsource(
+        QCS._TERMINAL_HANDLERS[QCS.RetryKind.WAF])
     # _terminal_ban answers through the ban helper, which scrubs inside.
     assert "_ban_403_for_item" in inspect.getsource(QCS._terminal_ban)
     shared = inspect.getsource(_engine.generic_terminal_handlers)
@@ -678,7 +681,7 @@ def test_public_and_patchable_names_survive():
     DeepSeek's equivalent is a closure for the same reason. The guard is that
     the module-level seams around it did not move.
     """
-    for name in ("_headers", "_delete_chat_bg", "_attempt", "_run_completion",
+    for name in ("_headers", "_delete_chat_bg", "_attempt",
                  "_run_completion_core", "_complete_with_failover_sync",
                  "_stream_completion", "_raise_for_terminal_error",
                  "_TERMINAL_HANDLERS", "classify_error"):

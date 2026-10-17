@@ -1,26 +1,22 @@
-"""Qwen SSE event parsing: state-free lenient QwenStreamParser + one-liner.
+"""Qwen SSE event parsing: state-free ``QwenStreamParser`` + one-liner.
 
-Qwen's stream (POST /api/v2/chat/completions) is OpenAI-style JSON per
+Qwen's stream (``POST /api/v2/chat/completions``) is OpenAI-style JSON per
 ``data:`` line — NOT the DeepSeek ``{p,v}`` path protocol, so this parser is
-intentionally separate. Event shapes below are LIVE-VERIFIED (2026-09-22 real
-completions streams); the parser stays lenient and ignores unknown keys.
+intentionally separate. Event shapes are LIVE-VERIFIED (2026-09-22 real
+completion streams); the parser stays lenient and ignores unknown keys.
 
-Live stream facts:
 - FINISH signal = ``choices[0].delta.status == "finished"`` (empty content).
   No ``[DONE]`` line / ``response.stopped`` / ``done:true`` observed — the
   stream simply ends after the finished chunk (done:[DONE] still handled).
-- usage keys are ``input_tokens``/``output_tokens``/``total_tokens``. The
-  usage event carries the COMPLETION count (``output_tokens``, then
-  ``completion_tokens``, ``total_tokens`` only as a last resort) because
-  ``core.openai.build_usage`` feeds that number straight into
-  ``completion_tokens`` — see :meth:`QwenStreamParser._usage_count`.
+- usage keys are ``input_tokens``/``output_tokens``/``total_tokens``; the
+  usage event carries the COMPLETION count — see
+  :meth:`QwenStreamParser._usage_count` for the key order and why.
 - error envelope: ``{"error":{"code":"quota_limit","details":"..."}}`` — the
   message lives in ``details``, not ``message``.
 
-Ownership:
-- This module owns SSE line/event parsing for Qwen.
-- Header/payload helpers and WAF/ban detection live in protocol.py
-  (re-exported only via deferred local import to avoid a module cycle).
+Ownership: SSE line/event parsing here; header/payload helpers and WAF/ban
+detection stay in protocol.py (deferred local import, to avoid the module
+cycle).
 """
 
 from __future__ import annotations

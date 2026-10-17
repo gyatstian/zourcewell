@@ -38,11 +38,10 @@ def _patch_serve(monkeypatch, content: str = "hi", thinking: str = "",
                         lambda sid, timeout=10, **kw: None)
 
 
-def test_registered_with_default_model():
+def test_registered_with_fallback_catalogue():
     prov = registry.get("opencode")
     assert prov is not None
     assert prov.id == "opencode"
-    assert prov.default_model() == DEFAULT_MODEL
     assert DEFAULT_MODEL in prov.models()
     assert prov.requires_accounts is False
     assert prov.needs_bridge is False
@@ -65,10 +64,9 @@ def test_model_spec_exact_and_passthrough():
     # Any provider/model passes through instead of 404ing.
     spec = prov.model_spec("anthropic/claude-sonnet-4")
     assert spec is not None and spec.id == "anthropic/claude-sonnet-4"
-    assert prov.accepts_model("openrouter/anthropic/claude-x")
+    assert prov.model_spec("openrouter/anthropic/claude-x") is not None
     # Bare ids outside the catalogue stay unknown (typo guard).
     assert prov.model_spec("gpt-99") is None
-    assert not prov.accepts_model("gpt-99")
     assert prov.model_spec("") is None
     assert prov.model_spec("   ") is None
 
@@ -252,8 +250,6 @@ def test_provider_models_prefers_live_over_static(monkeypatch):
     assert ids == ["openrouter/anthropic/claude-x"], ids
     spec = prov.model_spec("openrouter/anthropic/claude-x")
     assert spec is not None and spec.thinking is True and spec.owned_by == "openrouter"
-    # The default stays the explicit constant, not the first live key.
-    assert prov.default_model() == DEFAULT_MODEL
     # The static set is a fallback, not a floor: with a live catalogue that
     # omits the default, the id still resolves -- as a passthrough spec.
     assert prov.model_spec(DEFAULT_MODEL).thinking is False
@@ -266,6 +262,65 @@ def test_provider_models_falls_back_when_the_serve_is_down(monkeypatch):
     assert prov.model_spec(DEFAULT_MODEL).thinking is True
     # A provider/model the serve cannot advertise still passes through.
     assert prov.model_spec("anthropic/claude-x").id == "anthropic/claude-x"
+
+
+def test_models_hint_is_in_process_only(monkeypatch):
+    """A menu must not read, connect or boot for a list of model ids.
+
+    ``models()`` reads the serve and BOOTS the managed instance when nothing
+    answers; a picker row called it once, and the opencode row landed after the
+    other two by that boot plus a failed connect to the dead base (a refused
+    loopback connect itself costs seconds on some hosts).
+    """
+    prov = registry.get("opencode")
+    boots: list[float] = []
+
+    def _ensure(timeout=30.0):
+        boots.append(timeout)
+        return None
+
+    monkeypatch.setattr(MS, "ensure", _ensure)
+
+    def _no_io(*a, **k):
+        raise AssertionError("models_hint() performed I/O")
+
+    # Nothing read yet: the static fallback, no HTTP, no boot.
+    monkeypatch.setattr(OC, "_request", _no_io)
+    assert dict(prov.models_hint()) == MODELS_SPEC
+
+    # What another caller already read is what the row shows.
+    monkeypatch.setattr(OC, "_request",
+                        lambda *a, **k: (200, {"data": [
+                            {"providerID": "zen", "modelID": "m",
+                             "status": "active"}]}))
+    assert list(models.live_specs()) == ["zen/m"]
+    monkeypatch.setattr(OC, "_request", _no_io)
+    assert list(prov.models_hint()) == ["zen/m"]
+    assert boots == [], "a menu row booted the managed serve"
+
+
+def test_models_hint_never_waits_on_a_read_that_holds_the_lock():
+    """The lock is held ACROSS a fetch and a boot, so the hint must not take it.
+
+    A menu drawn while the warmup thread is booting (or a route is reading)
+    would otherwise inherit that wait -- up to ``_BOOT_READ_TIMEOUT``. Stale is
+    acceptable; blocked is not.
+    """
+    import threading
+
+    spec = models.ModelSpec(id="zen/m")
+    models._cached = {"zen/m": spec}
+    models._cache_lock.acquire()
+    try:
+        got: list = []
+        thread = threading.Thread(target=lambda: got.append(models.cached_specs()),
+                                  daemon=True)
+        thread.start()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "cached_specs() waited on a held lock"
+        assert list(got[0]) == ["zen/m"]
+    finally:
+        models._cache_lock.release()
 
 
 def test_message_payload_shape():
@@ -298,7 +353,6 @@ def test_classify_error():
 def test_no_account_seams():
     prov = registry.get("opencode")
     assert prov.probe_ban({}, timeout=5) == (False, None)
-    assert prov.normalize_token('{"value":"tok64"}') == "tok64"
     with pytest.raises(NotImplementedError):
         prov.login("a@x.com", "pw", None)
 
@@ -360,6 +414,46 @@ def test_stream_needs_no_pool(monkeypatch):
     assert resp.status_code == 200, resp.text
     assert "hello stream" in resp.text
     assert "[DONE]" in resp.text
+
+
+def test_live_variant_resend(monkeypatch):
+    """The live path resends without a rejected variant, never falls back twice.
+
+    A variant refusal is not an SSE failure: when the resend itself fails the
+    error is returned as-is (a blocking fallback here would be a third turn on
+    a new session); when it succeeds it is the attempt that answers.
+    """
+    calls: list = []
+    blocking: list = []
+    fail_resend = {"on": True}
+
+    def _stream(sid, pid, mid, agent, prompt, timeout=180, variant=None, **kw):
+        calls.append(variant)
+        if variant == "medium":
+            raise RuntimeError("OPENCODE_UPSTREAM: Variant unavailable for m")
+        if fail_resend["on"]:
+            raise RuntimeError("OPENCODE_UPSTREAM: resend failed")
+        return {"content": "ok", "thinking": "",
+                "usage_total": 1, "finish": "stop"}
+
+    monkeypatch.setattr(OC, "create_session", lambda timeout=20, **kw: "ses_vl")
+    monkeypatch.setattr(OC, "stream_message", _stream)
+    monkeypatch.setattr(OC, "send_message",
+                        lambda *a, **kw: blocking.append(1) or {
+                            "content": "blocking", "thinking": "",
+                            "usage_total": 1, "finish": "stop"})
+    monkeypatch.setattr(OC, "delete_session", lambda sid, timeout=10, **kw: None)
+
+    content, _think, error, _usage = OCS._attempt_live(
+        "hi", DEFAULT_MODEL, 30, variant="medium")
+    assert content == "" and "resend failed" in (error or "")
+    assert blocking == [] and calls == ["medium", None]
+
+    fail_resend["on"] = False
+    calls.clear()
+    assert OCS._attempt_live("hi", DEFAULT_MODEL, 30, variant="medium") == (
+        "ok", "", None, 1)
+    assert calls == ["medium", None]
 
 
 def test_turn_outcome_only_reads_items_after_the_prompt_id():

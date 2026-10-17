@@ -215,9 +215,9 @@ def test_qwen_waf_is_200_html_not_403(monkeypatch):
 
 
 def test_qwen_provider_reads_its_own_models_module(monkeypatch):
-    """F10. provider.models() returns its own MODELS_SPEC, default_model()
-    its own DEFAULT_MODEL, so a filled-in models.py shows up through the
-    provider and the catalogue never stays permanently empty.
+    """F10. provider.models() returns its own MODELS_SPEC, so a filled-in
+    models.py shows up through the provider and the catalogue never stays
+    permanently empty.
     """
     import importlib
 
@@ -230,11 +230,7 @@ def test_qwen_provider_reads_its_own_models_module(monkeypatch):
                      model_type="default", owned_by="qwen")
     monkeypatch.setattr(mod, "MODELS_SPEC", {"qwen-probe": spec,
                                              "qwen-probe-2": spec})
-    # DEFAULT_MODEL deliberately != the first key, so the override is visible
-    # and not just the base class's "first key" fallback.
-    monkeypatch.setattr(mod, "DEFAULT_MODEL", "qwen-probe-2")
     assert prov.models() == {"qwen-probe": spec, "qwen-probe-2": spec}
-    assert prov.default_model() == "qwen-probe-2"
     assert prov.tuple_spec()["qwen-probe"] == (True, False, "default")
     # Copy, not the module dict itself (callers may not mutate the catalogue).
     got = prov.models()
@@ -303,6 +299,7 @@ def test_server_reexports_still_resolve():
     F11c logging move did not shadow anything."""
     import deepseaport.core.openai as core_openai
     import deepseaport.core.tools as core_tools
+    import deepseaport.providers.deepseek.completion_service as ds_completion
     import deepseaport.server as S
     import deepseaport.server_routes as sr
 
@@ -313,6 +310,7 @@ def test_server_reexports_still_resolve():
         assert getattr(S, name, None) is not None, name
     # Seams must be the same objects, not aliases that can drift.
     assert S._openai_response is core_openai._openai_response
+    assert ds_completion._openai_response is S._openai_response
     assert S.parse_tool_calls is core_tools.parse_tool_calls
     assert S._pool is sr._pool
 

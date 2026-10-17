@@ -75,7 +75,7 @@ def _headers(app: FastAPI, token: str) -> dict:
                           waf_cookies=bridge.cookie_header(), bearer=token)
 
 
-def _ensure_token(app: FastAPI, item: PooledAccount) -> str:
+def _ensure_token(item: PooledAccount) -> str:
     """Return the account token, or a fast 401 that callers can fail over on.
 
     A missing token is a provisioning state, not something to solve by
@@ -387,11 +387,9 @@ def _refresh_token_via_obscura(app: FastAPI, item: PooledAccount,
         if detail:
             # Scrubbed: the note is the Obscura login result, which for a
             # no-token run is the raw page/body (localStorage JSON with the
-            # userToken in it). It reaches the 401 detail AND this log, so
-            # the long opaque runs go before either.
+            # userToken in it). It reaches the 401 detail, so the long opaque
+            # runs go before it.
             login_note = _engine.scrub_upstream_text(detail, 500)
-            logger.warning("Obscura login for %s produced no usable token: %s",
-                           item.cfg.identifier, login_note[:300])
         else:
             login_note = ""
         low = (detail or "").lower()
@@ -815,7 +813,7 @@ def _run_completion_core(
     max_retries = max(0, int(getattr(settings, "max_retries", 1)))
     parallel = bool(getattr(settings, "parallel_challenge_fetch", True))
     auto_delete = bool(getattr(settings, "auto_delete_session", True))
-    token = _ensure_token(app, item)
+    token = _ensure_token(item)
     session_id: str | None = None
     token_refreshed = False
     # Diagnostic from the browser login (no-token reason, last URL/body) so
@@ -1141,12 +1139,6 @@ def _attempt(headers: dict, payload: dict, on_content=None, on_thinking=None,
     return _engine.drain_attempt(DS.stream_completion, headers, payload,
                                  on_content=on_content, on_thinking=on_thinking,
                                  cancel_event=cancel_event)
-
-
-def _run_completion(app: FastAPI, item: PooledAccount, prep: dict,
-                    cancel_event: threading.Event | None = None) -> dict:
-    """Blocking full completion with retries per failure class."""
-    return _run_completion_core(app, item, prep, cancel_event=cancel_event)
 
 
 async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccount, prep: dict):

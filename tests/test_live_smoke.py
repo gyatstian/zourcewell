@@ -33,7 +33,7 @@ Design rules
 * **No import-time side effects.** ``load_settings()`` is called inside the
   gate, never at module scope, so ``--collect-only`` on a machine with no
   config reads no file and opens no socket. Same discipline as
-  ``tests/test_speed.py:308`` ("imported late so module import never fails").
+  ``tests/test_speed.py:285`` ("imported late so module import never fails").
 * **The gate skips, it never fails.** A maintainer with no account, no
   ``obscura``, no ``opencode`` binary, or a Qwen-only config must get
   ``pytest.skip`` with a precise, actionable reason -- never a red suite.
@@ -225,8 +225,8 @@ def _collect_stream(raw: str) -> dict:
             continue
         if not line.startswith("data: "):
             # No `event:` lines, no comment lines, no bare JSON: every frame
-            # the bridge writes is `data: <payload>` (engine.py:929, :983,
-            # :1015). Anything else means the framing changed.
+            # the bridge writes is `data: <payload>` (engine.py:946, :994,
+            # :1034). Anything else means the framing changed.
             out["bad_lines"].append(line)
             continue
         payload = line[len("data: "):].strip()
@@ -326,12 +326,12 @@ _GATE_LOCK = threading.Lock()
 
 
 def _pick_chat_model(provider) -> str:
-    """Cheapest answering model: no thinking, no search, else the default."""
+    """Cheapest answering model: no thinking, no search, else the first id."""
     specs = provider.models()
     for mid, spec in specs.items():
         if not spec.thinking and not spec.search:
             return mid
-    return provider.default_model() or next(iter(specs), "")
+    return next(iter(specs), "")
 
 
 def _pick_reasoner_model(provider) -> str:
@@ -346,7 +346,7 @@ def _binary_ok(path: str) -> bool:
     """True when a resolved binary is a real file or resolvable on PATH.
 
     ``ObscuraBridge._discover`` returns the bare string ``"obscura"`` when it
-    finds nothing (core/obscura_bridge.py:304), so an unresolved binary looks
+    finds nothing (core/obscura_bridge.py:286), so an unresolved binary looks
     like a plausible command name. Both halves have to be checked or the gate
     would proceed to spawn a process that does not exist.
     """
@@ -477,7 +477,7 @@ def _build_gate() -> _Live:
         if getattr(provider, "needs_bridge", True):
             # One bridge for the whole run: it owns a single persistent Obscura
             # profile, and two bridges over one --storage-dir race the cookie
-            # jar (core/obscura_bridge.py:235).
+            # jar (core/obscura_bridge.py:214-220).
             if bridge is None:
                 bridge = ObscuraBridge(settings.obscura_bin,
                                        settings.obscura_profile)
@@ -1262,7 +1262,7 @@ def test_live_smoke_diagnostics_cannot_leak_a_credential(secret):
 
     The project already pins the scrubber itself
     (``tests/test_secret_and_leak_gaps.py``, and the AST scan at
-    ``tests/test_managed_serve_hardening.py:436`` that forbids an unscrubbed
+    ``tests/test_qwen_stream_parity.py:449`` that forbids an unscrubbed
     variant of a message). That leaves one hole those tests cannot see: THIS
     file formats upstream bodies, SSE frames and exception text into
     assertion messages by hand, and a live failure lands in whatever log the

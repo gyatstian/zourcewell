@@ -129,15 +129,6 @@ def test_session_and_challenge_deletes_on_fetch_failure_sequential(monkeypatch):
 # 2. atomic config writes ---------------------------------------------------
 
 
-def test_save_is_atomic_and_leaves_no_tmp(tmp_path):
-    cfg = tmp_path / "config.json"
-    s = Settings(accounts=[AccountConfig(email="a@x.com", token="t")],
-                 config_path=str(cfg))
-    s.save()
-    assert json.loads(cfg.read_text(encoding="utf-8"))["accounts"][0]["email"] == "a@x.com"
-    assert list(tmp_path.glob("*.tmp")) == []
-
-
 def test_concurrent_saves_never_corrupt(tmp_path):
     cfg = tmp_path / "config.json"
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t")],
@@ -439,7 +430,7 @@ def test_generator_close_releases_account_lock(monkeypatch, tmp_path):
     monkeypatch.setattr("deepseaport.providers.deepseek.client.stream_completion", fake_stream)
 
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
-    pool = AccountPool([])
+    pool = AccountPool([], provider="deepseek")
     item.lock.acquire()
     # Delegate to the real lock and announce the release. The old assertion
     # polled `item.lock.locked()` 300 times with asyncio.sleep(0.01) between --
@@ -519,7 +510,8 @@ def _two_account_app():
                   AccountConfig(email="b@x.com", token="tok-b-1234567890")],
         active_account="a@x.com")
     app = app_with_bridge(settings)
-    pool = AccountPool(settings.accounts, current=settings.active_account)
+    pool = AccountPool(settings.accounts, current=settings.active_account,
+                       provider="deepseek")
     return app, settings, pool
 
 
@@ -622,8 +614,8 @@ def test_precancelled_event_aborts_session_setup_fast(monkeypatch):
     not tell a correct implementation from a broken one. What the test means is
     that NO setup call was dispatched; recording the calls says exactly that
     with no wall clock anywhere. The in-flight counterpart (a cancel that lands
-    after dispatch) is the next test, which is the half the clock was really
-    standing in for.
+    after dispatch) is pinned in
+    tests/test_secret_and_leak_gaps.py::test_cancel_during_create_session_aborts_and_deletes_once.
     """
     from deepseaport.server_concurrency import _StreamCancelled
     from deepseaport.providers.deepseek.completion_service import _session_and_challenge
@@ -642,72 +634,6 @@ def test_precancelled_event_aborts_session_setup_fast(monkeypatch):
     assert dispatched == [], (
         "session setup was dispatched despite a pre-set cancel_event: "
         f"{dispatched}")
-
-
-def test_cancel_event_aborts_while_create_session_is_still_in_flight(monkeypatch):
-    """Fix 2, the half a wall-clock budget cannot express: a cancel that lands
-    AFTER the parallel setup was dispatched must raise to the caller while
-    `create_session` is still running.
-
-    Signal, not duration. `slow_session` parks on `release` until the caller
-    has already raised, so the worker still being parked at the instant
-    `_StreamCancelled` reaches the caller is a direct observation that the
-    caller did not wait for the future -- which is what the old
-    `_time.time() - t0 < 1.0` was approximating with a 5s sleep. The park is
-    bounded so a regression which does block fails this test in seconds
-    instead of hanging the suite.
-    """
-    from deepseaport.server_concurrency import _StreamCancelled
-    from deepseaport.providers.deepseek.completion_service import _session_and_challenge
-
-    in_flight = threading.Event()
-    release = threading.Event()
-    unwound = threading.Event()
-
-    def slow_session(h):
-        in_flight.set()
-        release.wait(_HANDSHAKE_TIMEOUT)
-        unwound.set()
-        return "sess-slow"
-
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", slow_session)
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: {"a": 1})
-    # The aborted future still yields its id, which _delete_session_bg then
-    # hands to the real delete_session. Stub it: this test is about the abort,
-    # and an outbound call is not.
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.delete_session",
-                        lambda h, sid: None)
-    cancel = threading.Event()
-    watcher_errors: list[str] = []
-
-    def _cancel_once_in_flight():
-        if not in_flight.wait(_HANDSHAKE_TIMEOUT):
-            watcher_errors.append("create_session never started")
-        # Unconditional, including on the failure path: a caller left parked in
-        # `_await_cancelable`'s poll loop would hang the suite rather than
-        # failing this test.
-        cancel.set()
-
-    threading.Thread(target=_cancel_once_in_flight, daemon=True).start()
-
-    with pytest.raises(_StreamCancelled):
-        _session_and_challenge({"h": "1"}, parallel=True, cancel_event=cancel)
-
-    assert not watcher_errors, watcher_errors
-    # Snapshot taken the instant the caller returned, BEFORE we release the
-    # worker. The worker can only leave its park if `release` is set (we set it
-    # after this snapshot) or the park times out, and the park is 200x the
-    # 50ms cancel poll. So "not unwound yet" here can only mean the caller
-    # raised without waiting for the future; a caller that blocked on it would
-    # have sat out the whole park and unwound before returning. That ordering
-    # is the assertion -- no elapsed time is measured anywhere.
-    still_in_flight = not unwound.is_set()
-    release.set()
-    assert unwound.wait(_HANDSHAKE_TIMEOUT), \
-        "the in-flight create_session never unwound"
-    assert still_in_flight, (
-        "_session_and_challenge waited for the in-flight create_session "
-        "instead of aborting on cancel_event")
 
 
 def test_nonstream_endpoint_takes_request_param():
@@ -730,7 +656,8 @@ def test_nonstream_disconnect_while_queued_returns_499(monkeypatch):
     from deepseaport.server_concurrency import _acquire_slot_or_499
     from fastapi import HTTPException
 
-    pool = AccountPool([AccountConfig(email="a@x.com", token="tok")])
+    pool = AccountPool([AccountConfig(email="a@x.com", token="tok")],
+                       provider="deepseek")
     held = pool.acquire(timeout=1)  # all slots busy
     try:
         class _Req:

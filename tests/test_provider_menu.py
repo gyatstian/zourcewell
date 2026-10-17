@@ -7,11 +7,10 @@ import json
 
 from functools import partial
 from support import settings, write_config
+from deepseaport.accounts import provider_label
 from deepseaport.config import AccountConfig, Settings, load_settings
 from deepseaport.tui import (
     _login_banner,
-    _preflight_reason,
-    _provider_label,
     main_menu,
     provider_menu,
 )
@@ -54,7 +53,7 @@ def test_provider_menu_invalid_reprompts(monkeypatch):
     s = _fresh(provider="deepseek", providers=[])
     inputs = iter(["zzz", "1", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
-    provider_menu(s)  # must not raise, ends on q
+    provider_menu(s)  # must not raise; the valid pick ends the loop
     assert s.provider == "deepseek"
 
 
@@ -69,6 +68,56 @@ def test_provider_menu_multi_select(monkeypatch):
     provider_menu(s)
     assert sorted(s.providers) == ids
     assert s.provider == ids[0]
+
+
+# 2b. menu rows draw no catalogue and no counts --------------------------------
+
+
+def _probe_provider():
+    """Provider that records catalogue calls, with models() rigged to explode.
+
+    ``models()`` may be a live read that BOOTS a local process (opencode's
+    managed serve), so a menu either asks ``models_hint()`` -- the in-process
+    view -- or does not ask at all.
+    """
+    from deepseaport.core.provider import ModelSpec, Provider
+
+    class _Probe(Provider):
+        id = "hintonly"
+        display_name = "HintOnly"
+        hint_calls = 0
+
+        def models(self):
+            raise AssertionError("a menu called models(), which may boot")
+
+        def models_hint(self):
+            type(self).hint_calls += 1
+            return {"hintonly/one": ModelSpec(id="hintonly/one",
+                                              owned_by="hintonly")}
+
+    return _Probe()
+
+
+def test_provider_menu_row_is_a_label_only(monkeypatch, capsys):
+    """A row is a label: no id, no model count, no account/token count.
+
+    The id is already on the mode line above; the counts were derived values
+    nobody picks a provider by, and the model count cost a catalogue read
+    per row.
+    """
+    from deepseaport.core import registry
+
+    fake = _probe_provider()
+    registry._REGISTRY[registry._key(fake)] = fake
+    try:
+        s = _fresh(provider="deepseek", providers=[])
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "q")
+        provider_menu(s)
+    finally:
+        registry._REGISTRY.pop("hintonly", None)
+    row = next(l for l in capsys.readouterr().out.splitlines() if "HintOnly" in l)
+    assert row.split(". ", 1)[1] == "HintOnly"
+    assert fake.hint_calls == 0, "the row read a catalogue"
 
 
 # 3. cmd_serve --provider flag + unknown ----------------------------------------
@@ -86,7 +135,7 @@ def test_cmd_serve_provider_flag_skips_gate_and_saves(tmp_path, monkeypatch, cap
     monkeypatch.setattr(tui_mod, "provider_menu",
                         lambda st: calls.__setitem__("gate", 1))
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-    args = argparse.Namespace(config=cfg, host="", port=0, workers=1,
+    args = argparse.Namespace(config=cfg, host="", port=0,
                               no_tui=False, cmd="serve",
                               provider="deepseek", providers=None)
     assert cli_mod.cmd_serve(args) == 0
@@ -99,7 +148,7 @@ def test_cmd_serve_unknown_provider_returns_2(tmp_path, capsys):
     import deepseaport.cli as cli_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
-    args = argparse.Namespace(config=cfg, host="", port=0, workers=1,
+    args = argparse.Namespace(config=cfg, host="", port=0,
                               no_tui=True, cmd="serve",
                               provider="nope", providers=None)
     assert cli_mod.cmd_serve(args) == 2
@@ -119,11 +168,31 @@ def test_cmd_serve_gate_runs_when_no_flag(tmp_path, monkeypatch):
     monkeypatch.setattr(tui_mod, "provider_menu",
                         lambda st: calls.__setitem__("gate", 1))
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-    args = argparse.Namespace(config=cfg, host="", port=0, workers=1,
+    args = argparse.Namespace(config=cfg, host="", port=0,
                               no_tui=False, cmd="serve",
                               provider=None, providers=None)
     assert cli_mod.cmd_serve(args) == 0
     assert calls == {"menu": 1, "gate": 1}
+
+
+def test_cmd_serve_chooser_quit_exits_cleanly(tmp_path, monkeypatch):
+    """The startup chooser's "q. Quit" quits the serve: rc 0, no main menu."""
+    import sys
+
+    import deepseaport.cli as cli_mod
+    import deepseaport.tui as tui_mod
+
+    cfg = write_config(tmp_path, {"keys": [], "accounts": []})
+    calls = {"menu": 0}
+    monkeypatch.setattr(tui_mod, "main_menu",
+                        lambda st, *a, **k: calls.__setitem__("menu", 1) or 0)
+    monkeypatch.setattr(tui_mod, "provider_menu", lambda st: False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    args = argparse.Namespace(config=cfg, host="", port=0,
+                              no_tui=False, cmd="serve",
+                              provider=None, providers=None)
+    assert cli_mod.cmd_serve(args) == 0
+    assert calls["menu"] == 0
 
 
 # 4. CLI accounts add binds provider ---------------------------------------------
@@ -154,49 +223,43 @@ def test_tui_add_binds_selected_provider(monkeypatch):
 
     s = Settings(accounts=[], active_account="", config_path="",
                  provider="deepseek")
-    inputs = iter(["a", "new@x.com", "pw", "tok123", "b"])
+    inputs = iter(["a", "new@x.com", "pw", "tok123", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert len(s.accounts) == 1
     assert s.accounts[0].provider == "deepseek"
 
 
-# 6. preflight ----------------------------------------------------------------------
+# 6. main_menu header -----------------------------------------------------------------
 
-def test_preflight_blocks_empty_tokenless_passes_token():
-    assert _preflight_reason(_fresh(accounts=[])) != ""
-    r = _preflight_reason(_fresh(accounts=[AccountConfig(email="a@x.com", token="")]))
-    assert r != "" and "token" in r.lower()
-    assert _preflight_reason(
-        _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")])) == ""
-
-
-# 7. main_menu header -----------------------------------------------------------------
-
-def test_main_menu_shows_provider_line(monkeypatch, capsys):
+def test_main_menu_shows_provider_in_header(monkeypatch, capsys):
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")])
-    monkeypatch.setattr("builtins.input", lambda *a, **k: "q")
+    # Quit is the provider chooser's own "q. Quit" (Go back here, then q there).
+    inputs = iter(["q", "q"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     assert main_menu(s, lambda st: 0) == 0
     out = capsys.readouterr().out
+    # The header names the active provider, the row reopens the chooser.
+    assert "=== deepseek ===" in out
     assert "1. Start server" in out
-    assert "Provider" in out
+    assert "q. Go back" in out
     # "1. Start server" stays the first menu item.
-    assert out.index("1. Start server") < out.index("q. Quit")
+    assert out.index("1. Start server") < out.index("q. Go back")
 
 
-# 8. provider-aware login prompts (C8) ------------------------------------------------
+# 7. provider-aware login prompts (C8) ------------------------------------------------
 
 def test_provider_label_and_login_banner_follow_the_registry():
     # DeepSeek keeps its historical strings; other providers stop claiming to
     # be DeepSeek and stop promising a browser they never launch.
-    assert _provider_label("deepseek") == "DeepSeek"
-    assert _provider_label("qwen") == "Qwen"
+    assert provider_label("deepseek") == "DeepSeek"
+    assert provider_label("qwen") == "Qwen"
     assert _login_banner("deepseek") == "Running Obscura login (browser, ~30s)..."
     assert "Obscura" not in _login_banner("qwen")
     assert "browser" not in _login_banner("qwen")
     assert "Qwen" in _login_banner("qwen")
     # Unknown id must still produce something printable, never an empty label.
-    assert _provider_label("nope-xyz") == "nope-xyz"
+    assert provider_label("nope-xyz") == "nope-xyz"
 
 
 def test_tui_auto_login_prompt_names_the_selected_provider(monkeypatch, capsys):
@@ -208,20 +271,21 @@ def test_tui_auto_login_prompt_names_the_selected_provider(monkeypatch, capsys):
 
     prompts: list[str] = []
 
-    def _gp(p=""):
-        # Skip only the outer add-form password ("Password (Enter=skip): ") so
-        # the auto-login step has to ask for one itself: that inner prompt's
-        # wording is what is under test.
-        prompts.append(p)
-        return "" if p == "Password (Enter=skip): " else "pw"
+    def _inp(prompt=""):
+        prompts.append(prompt)
+        return next(inputs)
 
-    monkeypatch.setattr("getpass.getpass", _gp)
     monkeypatch.setattr(_ds, "obscura_login_token",
                         lambda e, p, s: "tok-from-login")
     s = _fresh(accounts=[], active_account="", provider="qwen", providers=[])
-    inputs = iter(["a", "new@x.com", "y", "b"])
-    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+    # a=add, email, ""=skip the add-form password so the auto-login step has
+    # to ask for one itself (that inner prompt's wording is what is under
+    # test), y=auto-token, pw=the inner password answer, q=back.
+    inputs = iter(["a", "new@x.com", "", "y", "pw", "q"])
+    monkeypatch.setattr("builtins.input", _inp)
     accounts_menu(s)
+    # Both password fields are visible prompts now, so the wording comes
+    # through builtins.input rather than getpass.
     assert any("Qwen password" in p for p in prompts)
     assert not any("DeepSeek password" in p for p in prompts)
     out = capsys.readouterr().out
@@ -338,7 +402,7 @@ def test_tui_login_refuses_an_unregistered_provider_and_stays_alive(
         monkeypatch, capsys):
     """The TUI half of finding 8, through its real entry point.
 
-    ``tui.py:1241-1276`` is a byte-identical shape to the CLI one: an id the
+    ``tui.py:1096-1099`` is a byte-identical shape to the CLI one: an id the
     registry does not know returned ``None``, so the else branch drove the
     DeepSeek Obscura browser -- while ``_login_banner`` had already promised
     "Running glm login (direct API signin, ~5s)". The TUI cannot exit 2, so the
@@ -362,8 +426,9 @@ def test_tui_login_refuses_an_unregistered_provider_and_stays_alive(
     s = _fresh(provider="glm",
                accounts=[AccountConfig(email="a@x.com", password="pw",
                                        token="", provider="glm")])
-    # t=set token, email, ""=no token -> auto-login, ""=confirm, b=back.
-    inputs = iter(["t", "a@x.com", "", "", "b"])
+    # t=set token, email, ""=no token -> the auto-login offer refuses in-app
+    # (unknown provider) before it can consume anything, q=back.
+    inputs = iter(["t", "a@x.com", "", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
 
     accounts_menu(s)

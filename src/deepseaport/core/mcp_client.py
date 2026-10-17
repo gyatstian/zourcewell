@@ -22,8 +22,6 @@ class McpClient:
     """Line-delimited JSON-RPC client over a child process stdio pair."""
 
     def __init__(self, binary: str, profile: str, timeout: float = DEFAULT_TIMEOUT):
-        self.binary = binary
-        self.profile = profile
         self.timeout = timeout
         self._id = 0
         self._closed = False

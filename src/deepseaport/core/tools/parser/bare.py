@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 
 from ..common import (
@@ -13,8 +12,6 @@ from ..common import (
     _loads_json_lenient,
     _strip_spans,
 )
-
-logger = logging.getLogger("deepseaport.tools")
 
 # Near-miss counter for diagnostics only (unknown-name {"name": ...} shapes).
 # Module-level so the success/miss path never recompiles per call.

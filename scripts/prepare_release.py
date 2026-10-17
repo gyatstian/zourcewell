@@ -1,32 +1,25 @@
 #!/usr/bin/env python
 """Assemble a release directory + zip from ``dist/`` without shipping credentials.
 
-``dist/`` is two things at once: the PyInstaller output directory and the frozen
-app's live credential store. ``config._app_dir()`` resolves to
-``Path(sys.executable).parent`` when frozen, so ``dist/config.json`` is the file
-the shipped ``deepseaport.exe`` reads and writes -- account emails, plaintext
-passwords, 64-char bearer tokens and API keys. The release archive is a zip of
-``dist/``, so zipping it by hand publishes every account the operator owns, and
-a credential in a published artifact is a published credential even though the
-repository itself never tracked one (``config.json`` is gitignored).
+``dist/`` doubles as the frozen app's live credential store; ``ARCHITECTURE.md``
+("The release guard is ``scripts/prepare_release.py``") owns the rationale.
 
 So this script is the packaging step, not a lint on it:
 
 * it never writes to, deletes from, or moves anything inside the source tree --
   the operator's live ``config.json`` stays exactly where the exe expects it;
-* it drops build noise (``*.bak``, ``*.tmp``, ``*.log``, ``__pycache__``,
-  ``*.pyc``) and secret-shaped leftovers that are not the credential store;
+* it drops build noise and secret-shaped leftovers that are not the credential
+  store (the globs and suffixes below are the list);
 * it REFUSES to produce an artifact when the tree holds a ``config.json`` or any
   other JSON carrying a non-empty ``email`` / ``mobile`` / ``token`` /
   ``password`` / ``keys`` / ``api_key`` / ``secret`` value, and names the file
-  and the path inside it, because that is the whole failure this exists to
-  prevent. A JSON file it cannot read or decode is blocked the same way:
-  "clean" is only ever the verdict for a file it actually read and walked.
+  and the path inside it. A JSON file it cannot read or decode is blocked the
+  same way: "clean" is only ever the verdict for a file it actually read and
+  walked.
 
 Content scanning is JSON-only: a secret in ``settings.ini``, ``credentials.txt``,
 a ``.har`` capture or a screenshot of the TUI is dropped only if its NAME matches
-one of the exclusion globs below, and otherwise ships. JSON is what this project
-actually stores credentials in, so that is what it reads.
+one of the exclusion globs below, and otherwise ships.
 
 Dependency-free (stdlib only) so it runs on the same interpreter that built the
 exe with nothing else installed.
@@ -83,7 +76,7 @@ EXCLUDE_NAMES = frozenset({".env", "credentials", "credentials.json", "id_rsa"})
 # profile directory (WAF cookies + logged-in localStorage, gitignored for the
 # same reason config.json is) is dropped whole rather than one file at a time.
 EXCLUDE_GLOBS = ("*.pem", "*.key", "secrets*.json", "*obscura-profile*",
-                 "*/obscura-profile/*", "*profile*/Cookies")
+                 "*profile*/Cookies")
 
 
 def exclusion_reason(rel: Path) -> str | None:
@@ -231,11 +224,7 @@ def _guard_paths(src: Path, out: Path) -> None:
     src_r, out_r = src.resolve(), out.resolve()
     if src_r == out_r or out_r == Path(out_r.anchor) or src_r == Path(src_r.anchor):
         raise SystemExit(f"refusing to operate on {src_r} -> {out_r}")
-    try:
-        inside = out_r.is_relative_to(src_r)
-    except AttributeError:  # pragma: no cover - pre-3.9 pathlib
-        inside = str(out_r).startswith(str(src_r) + os.sep)
-    if inside:
+    if out_r.is_relative_to(src_r):
         raise SystemExit(f"refusing to write inside the source tree: "
                          f"{out_r} is under {src_r}")
 

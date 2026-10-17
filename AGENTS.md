@@ -91,7 +91,7 @@ and educational use only.
 - `src/` layout. `pythonpath = ["src"]` under `[tool.pytest.ini_options]` makes the suite resolve this checkout instead of another install.
 - `config.json` is the live credential store: account emails, plaintext passwords, bearer tokens, API keys. Gitignored, never committed, never copied into an artifact.
 - `[project] version` in `pyproject.toml` is the only place a version is written. `src/deepseaport/__init__.py` derives `__version__` from that file (pyproject first, installed metadata second, `"0.0.0"` last), `server.py` / `dry_run.py` pass it to `FastAPI(version=...)`, and `deepseaport.spec` stamps it into the frozen exe. `server_routes.py` wires the same `deepseaport.__version__` into `/health` and `/v1/models`; never add a second literal.
-- `scripts/prepare_release.py --check` is a hard gate: it runs before every publish step and no workflow step that publishes may carry `continue-on-error`. `dist/` is both the build output directory and the frozen app's credential store.
+- `scripts/prepare_release.py --check` is a hard gate: it runs before every publish step and no workflow step that publishes may carry `continue-on-error`. `dist/` doubles as the frozen app's credential store; full rationale in `ARCHITECTURE.md`.
 - `ARCHITECTURE.md` and `PROVIDERS.md` are the authoritative long-form docs and are owned here: request lifecycle, auth, PoW, SSE shapes, tool calling, environment, the `Provider` ABC contract, and the steps for adding an upstream. Update them in the same change as the behavior they describe.
 - Runtime output (`build/`, `dist/`, `data/`, `dummy-profile/`, `.pi/`, local `obscura*` binaries) is gitignored and owns no docs.
 - No module under `src/deepseaport/core/` or `src/deepseaport/providers/` may import `deepseaport.server` at module scope. Where a seam needs it, late-import inside the function so monkeypatching `deepseaport.server` keeps working.
@@ -112,6 +112,6 @@ and educational use only.
 - `src/deepseaport/providers/qwen/AGENTS.md` owns the Qwen upstream: JWT auth, Aliyun WAF, chat lifecycle.
 - `src/deepseaport/providers/opencode/AGENTS.md` owns the local opencode CLI upstream and its managed serve subprocess.
 - `tests/AGENTS.md` owns the hermetic suite and the live tier.
-- `scripts/AGENTS.md` owns release packaging and the demo harness.
+- `scripts/AGENTS.md` owns the release packaging script, `prepare_release.py`.
 
 Deliberately unindexed: `.github/`, whose two workflows (`ci` runs the root command above, `release` publishes on a `v*` tag behind the `prepare_release.py --check` gate), and every gitignored runtime directory.

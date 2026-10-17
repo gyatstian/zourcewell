@@ -1,4 +1,4 @@
-"""deepseaport: Obscura-backed DeepSeek web2api with OpenAI-compatible API."""
+"""deepseaport: unofficial OpenAI-compatible web2api for DeepSeek, Qwen and opencode. Research/educational use only."""
 
 import importlib.metadata
 from pathlib import Path

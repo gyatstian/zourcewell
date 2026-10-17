@@ -248,61 +248,29 @@ def _build_instance_settings(settings, assigned, spares, port):
     return inst
 
 
-def _warn_chat_workers(args) -> None:
-    """Shared --workers note for single + multi chat (F6).
+def resolve_chat_models(settings, instances=None) -> tuple[list[str], str]:
+    """Return (models, model) for chat REPL startup.
 
-    Chat mode always uses 1 worker; warn once instead of duplicating the
-    gate in both chat_ui entry points.
+    The catalogue is the union of ``active_models`` across ``instances``
+    (multi chat), else ``active_models(settings)``; ``MODELS`` when that
+    fails or comes back empty. Never raises.
     """
-    if args is not None and int(getattr(args, "workers", 1) or 1) != 1:
-        print("  note: chat mode uses 1 worker (ignoring --workers).")
+    from .server import MODELS, active_models
 
-
-# Last-resort catalogue when even `deepseaport.server` cannot be imported: one
-# usable DeepSeek model, so a chat REPL still starts and can print something.
-_FALLBACK_CATALOGUE = {"deepseek-flash": (False, False, "default")}
-
-
-def resolve_chat_catalogue(settings, instances=None) -> dict:
-    """Central chat catalogue dict (F6): union across instances or single.
-
-    Multi: union ``active_models(inst)`` for each instance, falling back to
-    ``active_models(settings)`` then ``MODELS``. Single: ``active_models``
-    then ``MODELS``. Never raises; outer fallback is the DeepSeek default.
-    """
     try:
-        from .server import MODELS, active_models
+        catalogue: dict = {}
+        for inst in instances or []:
+            try:
+                catalogue.update(active_models(inst) or {})
+            except Exception:
+                pass
+        if not catalogue:
+            catalogue = active_models(settings) or dict(MODELS)
     except Exception:
-        return dict(_FALLBACK_CATALOGUE)
-    try:
-        if instances:
-            catalogue: dict = {}
-            for inst in instances:
-                try:
-                    catalogue.update(active_models(inst) or {})
-                except Exception:
-                    pass
-            if catalogue:
-                return catalogue
-        return active_models(settings) or dict(MODELS)
-    except Exception:
-        return dict(MODELS)
-
-
-def resolve_chat_models(settings, instances=None) -> tuple[dict, list[str], str]:
-    """Return (catalogue, models, model) for chat REPL startup (F6).
-
-    Composes ``resolve_chat_catalogue`` + ``_model_list`` +
-    ``_initial_chat_model`` so single + multi chat share one path.
-    """
-    try:
-        from .server import MODELS as _MODELS
-    except Exception:
-        _MODELS = _FALLBACK_CATALOGUE  # type: ignore
-    catalogue = resolve_chat_catalogue(settings, instances)
-    models = _model_list(catalogue or _MODELS)
+        catalogue = dict(MODELS)
+    models = _model_list(catalogue)
     model = _initial_chat_model(settings, models)
-    return catalogue, models, model
+    return models, model
 
 
 def run_repl(*, model: str, models: list[str], api_key: str, history: list[dict],
@@ -324,7 +292,7 @@ def run_repl(*, model: str, models: list[str], api_key: str, history: list[dict]
       when the loop was NOT ended by /quit, /clear... /exit or Ctrl+C, so a
       user who asked to leave is never told the server died.
 
-    F6 note: the lambdas/closures passed for these seams are intentional
+    Note: the lambdas/closures passed for these seams are intentional
     strategy injection (single vs round-robin), not duplication — verified
     healthy, kept as-is.
     """
@@ -341,13 +309,13 @@ def run_repl(*, model: str, models: list[str], api_key: str, history: list[dict]
         if not text:
             continue
         low = text.lower()
-        if low in ("/quit", "/exit", "/q"):
+        if low in ("/quit", "/exit"):
             by_user = True
             break
-        if low in ("/help", "/?", "/h"):
+        if low == "/help":
             print_help()
             continue
-        if low in ("/clear", "/reset"):
+        if low == "/clear":
             history.clear()
             print("  ok: history cleared")
             continue

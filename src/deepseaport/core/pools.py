@@ -130,19 +130,8 @@ def make_pool(settings, provider_id, current: str = ""):
     pool construction here so the two route helpers never diverge.
     """
     from ..accounts import AccountPool
-    return AccountPool(accounts_for_provider(settings, provider_id), current=current)
-
-
-def needs_provider_pool(settings, provider_id) -> bool:
-    """True when ``provider_id`` selects a dedicated per-provider pool.
-
-    Centralizes the ``pid and is_multi(settings)`` gate that was previously
-    repeated as a ternary in every account route. Empty/blank ids and
-    single-provider mode return False (caller uses the selected-provider
-    pool, preserving the ``deepseaport.server._pool`` monkeypatch seam).
-    Unknown-id fallback still lives in server_routes._pool_for.
-    """
-    return bool(str(provider_id or "").strip()) and is_multi(settings)
+    return AccountPool(accounts_for_provider(settings, provider_id),
+                       current=current, provider=provider_id)
 
 
 def current_for(settings, provider_id) -> str:

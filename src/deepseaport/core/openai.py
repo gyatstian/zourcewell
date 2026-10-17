@@ -9,7 +9,6 @@ otherwise the real parser is used. An explicit ``parse_fn`` overrides both.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 import uuid
@@ -110,50 +109,16 @@ def _resolve_parse_fn(explicit=None):
     return _real_parse, _real_parse, _real_ex
 
 
-def _log_tool_miss(prep: dict, content: str, where: str = "response") -> None:
+def _log_tool_miss(prep: dict, content: str,
+                   diagnostics: list[dict] | None = None,
+                   *, where: str = "response") -> None:
     """Warning-level miss log with diagnostics (unknown vs oversize vs drift).
 
-    Runs the real ``parse_tool_calls_ex`` for logging only — the response
-    itself still comes from the (possibly monkeypatched) ``parse_tool_calls``
-    seam above, so tests keep patching that seam. Never raises.
-    """
-    try:
-        from .tools.parser import parse_tool_calls_ex as _ex
-        from .tools import _valid_names
-    except Exception:
-        logger.debug("no tool call parsed %s model=%s preview=%.200s",
-                     where, prep.get("model"), (content or "")[:200])
-        return
-    try:
-        limit = prep.get("tool_args_max_chars")
-        forgiving = bool(prep.get("forgiving_toolcalls", False))
-        tools = prep.get("tools") or []
-        kwargs: dict = {"forgiving": forgiving}
-        if limit:
-            kwargs["max_args_chars"] = limit
-        res = _ex(content or "", tools, **kwargs)
-        valid = _valid_names(tools)
-        summary = format_miss_trail(res.diagnostics, valid)
-        logger.warning(
-            "tool-call miss (%s) model=%s forgiving=%s %s preview=%.300s",
-            where, prep.get("model"), forgiving, summary,
-            (content or "")[:300])
-    except Exception:
-        logger.debug("no tool call parsed %s model=%s preview=%.200s",
-                     where, prep.get("model"), (content or "")[:200])
-
-
-async def _alog_tool_miss(prep: dict, content: str,
-                          diagnostics: list[dict] | None = None,
-                          *, where: str = "stream") -> None:
-    """Async twin of :func:`_log_tool_miss` for the streaming parse path.
-
-    Same warning-level miss log with the diagnostics trail. Takes the
-    ``diagnostics`` the stream parse already produced; when it has none (the
-    parse ran through a monkeypatched seam) it re-runs ``parse_tool_calls_ex``
-    for logging only, exactly like the sync helper. The parse itself stays on
-    the caller's off-thread call, so this stays off the event loop. Never
-    raises.
+    The response always comes from the (possibly monkeypatched)
+    ``parse_tool_calls`` seam above, so tests keep patching that seam. When the
+    caller already has the ``diagnostics`` trail (the streaming path passes the
+    one its own parse produced) no second parse runs; otherwise the real
+    ``parse_tool_calls_ex`` is run for logging only. Never raises.
     """
     try:
         from .tools import _valid_names
@@ -166,8 +131,7 @@ async def _alog_tool_miss(prep: dict, content: str,
             kwargs: dict = {"forgiving": forgiving}
             if limit:
                 kwargs["max_args_chars"] = limit
-            res = await asyncio.to_thread(_ex, content or "", tools, **kwargs)
-            diagnostics = res.diagnostics
+            diagnostics = _ex(content or "", tools, **kwargs).diagnostics
         summary = format_miss_trail(diagnostics, _valid_names(tools))
         logger.warning(
             "tool-call miss (%s) model=%s forgiving=%s %s preview=%.300s",

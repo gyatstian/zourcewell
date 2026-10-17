@@ -534,6 +534,13 @@ def test_extract_token_outer_quote_json_literal():
     assert extract_token(json.dumps("tok99")) == "tok99"
 
 
+def test_extract_token_null_value_and_double_encoded():
+    # The literal JSON-null shape is "missing token", not an upstream 40003.
+    assert extract_token('{"value":null,"__version":"0"}') == ""
+    double = json.dumps(json.dumps({"value": "tok99", "__version": "0"}))
+    assert extract_token(double) == "tok99"
+
+
 # --- config.py AccountConfig ---
 
 

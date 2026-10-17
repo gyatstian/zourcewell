@@ -18,10 +18,10 @@ Covered:
   9. A configured ``provider`` id nothing validated against the registry.
   10. Hand-edited account shapes: ``"accounts": null`` and numeric fields.
 
-Idioms mirror the existing atomic-save tests in tests/test_reliability.py
-(`test_save_is_atomic_and_leaves_no_tmp`, `test_concurrent_saves_never_corrupt`):
-tmp_path for the config, real Settings.save(), and assertions on the actual
-bytes on disk rather than on internal calls.
+Idioms mirror the concurrent-save test in tests/test_reliability.py
+(`test_concurrent_saves_never_corrupt`): tmp_path for the config, real
+Settings.save(), and assertions on the actual bytes on disk rather than on
+internal calls.
 """
 
 from __future__ import annotations
@@ -428,7 +428,7 @@ def test_pool_rejects_what_load_dedupes(tmp_path):
     ]})
     loaded = load_settings(p).accounts
     assert len(loaded) == 2
-    pool = AccountPool(loaded)
+    pool = AccountPool(loaded, provider="deepseek")
     assert len(pool) == 2
     with pytest.raises(ValueError):
         pool.add(AccountConfig(email="a@x.com", token="t9"))

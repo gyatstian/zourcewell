@@ -25,8 +25,7 @@ flat `{"_tag": "...", "message": "..."}`.
 - `POST /api/session {location:{directory}}` -> `{data:{id}}`. The model is
   **not** accepted here, and v2 can only be born with one, so the turn selects
   it instead. `location.directory` pins the worktree the agent's file tools run
-  in; v2 has no `?directory=` query at all (`protocol.session_query()` is kept
-  as an always-empty compat shim).
+  in; v2 has no `?directory=` query at all.
 - `POST /api/session/:id/model {model:{id, providerID, variant?}}` and
   `POST /api/session/:id/agent {agent}` -> 204. The model, its reasoning
   `variant` and the agent are all **session-scoped** in v2, so every turn
@@ -113,30 +112,49 @@ OS shell, so the pid recorded in `serve.json` belongs to
 serve itself is that wrapper's child. Two consequences, both fixed and pinned
 in `tests/test_managed_serve_hardening.py`: the identity gate reads the
 launcher as the third token after `cmd /c` (so `cmd /c start opencode serve`
-still fails) and still cross-checks `--port` against the base recorded beside
-the pid; and the kill is `taskkill /T /F`, because `terminate()` kills the
-wrapper and leaves `opencode.exe` holding the port. Verified live on Windows:
-the recorded pid now passes the gate, the tree kill frees the port, and two
-boot/shutdown cycles leave nothing behind.
+still fails) and requires `--port` to agree with the base recorded beside the
+pid whenever that base carries one; and the kill is `taskkill /T /F`, because
+`terminate()` kills the wrapper and leaves `opencode.exe` holding the port.
+Verified live on Windows: the recorded pid now passes the gate, the tree kill
+frees the port, and two boot/shutdown cycles leave nothing behind.
+
+The pid a reap starts from is stale by default — the atexit kill retires the
+process, not `serve.json` — so `_kill_pid` asks the OS whether the pid exists
+at all before reading anything about it, and a pid that is gone is skipped
+silently. Without that check the command-line reader could not tell "gone"
+from "unreadable", and every clean restart spent ~0.5 s on a PowerShell spawn
+and then logged "does not look like 'opencode serve'" about a process that no
+longer existed. Liveness is ctypes `OpenProcess(SYNCHRONIZE)` plus a zero-wait
+on Windows — `os.kill` on a Windows pid is `TerminateProcess`, so the check
+would be the kill — and `os.kill(pid, 0)` on POSIX; "cannot tell" falls
+through to the identity gate. A pid that is provably gone also narrows the
+reuse-probe ladder to one attempt, because the retries exist for a serve that
+is alive but too busy to answer.
 
 ## Model ids
 
 Two layers. `live_specs()` reads `GET /api/model` and serves ids as
 `providerID/modelID` — that is the truth, and it turns over weekly.
-`MODELS_SPEC` is the offline fallback: the eight free entries verified by hand
-against a serve, matching `https://opencode.ai/zen/v1/models`. `models()` (and
-`model_spec()`) serve the live set whenever it is non-empty; the fallback is a
-fallback, not a floor, so the two are never merged. When nothing answers at the
+`MODELS_SPEC` is the hand-verified fallback list; exact ids and current
+availability live in `models.py`. `models()` (and `model_spec()`) serve the
+live set whenever it is non-empty; the fallback is a fallback, not a floor, so
+the two are never merged. When nothing answers at the
 configured base, `live_specs()` boots the managed serve and reads again: the
 list must not depend on which process asks, or a fresh `deepseaport models`
-answers with the hand-written eight while the running server answers with the
-live twelve. `ensure()` respects both opt-outs (an operator-pinned
+answers with the hand-written fallback while the running server answers with
+the live catalogue. `ensure()` respects both opt-outs (an operator-pinned
 `DEEPSEAPORT_OPENCODE_BASE`, and `DEEPSEAPORT_OPENCODE_MANAGED=0`, which is
 what `tests/conftest.py` sets so the hermetic tier never spawns it). Cached
 process-wide under one lock: a success for 5 minutes, a failure for 30, so a
 serve that is still booting is retried soon rather than in five minutes. The
 read that follows a boot gets a 30 s budget because a freshly booted serve
 builds its model registry on that first call.
+
+A menu goes through `cached_specs()` (i.e. `Provider.models_hint()`): the last
+read this process made, else the fallback, with no I/O and no lock. A menu must
+not pay the dead-base timeout, the boot, or a wait on a read that holds the lock
+across both -- the lock is held ACROSS the fetch and the boot on purpose, so a
+hint that took it would inherit the whole stall.
 
 `thinking` is derived from `compatibility.reasoningField` alone: that field is
 where the serve puts a model's thinking. The free tier declared one for every
@@ -146,20 +164,13 @@ variants are not evidence of a thinking channel.
 
 Canonical shape is `providerID/modelID`, split at the FIRST slash (the model
 part may contain slashes). Bare ids ride provider `opencode` (see
-`protocol.split_model`). `default_model()` is the explicit
-`opencode/muse-spark-1.3-contributor-free`, NOT the first catalogue key: the
-live catalogue is in upstream order and would otherwise move the default
-underneath the TUI picker and every defaulting client. `model_spec` accepts
+`protocol.split_model`); a blank model id falls back to `models.DEFAULT_MODEL`
+(`opencode/muse-spark-1.3-contributor-free`), which is also the first entry of
+the fallback list. `model_spec` accepts
 any other id containing a slash as passthrough (user-configured proxy
 providers on the same serve instance) so those work in chat too; bare
 catalogue-unknown ids stay unknown (typo guard — the unknown-model 404
 contract holds).
-
-In the fallback, seven entries are `*-free` and `opencode/big-pickle` is not
-(7 + 1, not "8 free"). Two of the eight are no longer served upstream at all
-(`opencode/muse-spark-1.2-contributor-free`,
-`opencode/ling-3.0-flash-fin-free`) and are kept only so a serve-less start
-still answers with something plausible.
 
 Disabled and non-`active` live entries are dropped, because a model the
 operator cannot pick must not be advertised.
@@ -197,7 +208,13 @@ operator cannot pick must not be advertised.
    (prefix strip + explicit deny list in `_child_env`), so neither the parent's
    `OPENCODE_CONFIG` path nor the operator's API keys / account tokens can
    reach a process the model can be talked into reading. The password is
-   ephemeral per boot and `serve.json` plus every managed dir are owner-only.
+   ephemeral per boot; on POSIX `serve.json` and every managed dir are
+   owner-only (0700/0600), and on Windows the password is stored
+   DPAPI-wrapped for the current user (`password_dpapi`) instead of
+   cleartext, so the one-shot ACL warning fires only while a cleartext
+   `password` is still on disk (a real exposure left by an older build or a
+   DPAPI-less machine, not a per-boot ritual) and a reuse of such a file
+   upgrades it through the current writer.
    The user's `~/.config/opencode`, project files, and plain `opencode` runs
    stay intact. Extra workers reuse it via the `serve.json` port file.
    Opt-outs: `DEEPSEAPORT_OPENCODE_BASE` (use your own serve as-is),

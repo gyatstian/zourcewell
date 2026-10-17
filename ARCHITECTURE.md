@@ -282,9 +282,9 @@ why the access log is off on every serve path (below).
 
 | Path | Where | `access_log` | LAN warning |
 |---|---|---|---|
-| Plain serve (`cli._run_server` → `server_runner._run_server`) | `server_runner.py:427` | `False` | `server_runner.py:436` |
-| Server-with-chat / multiple servers (`_start_background_server`, called from `chat_ui.py:197` and `:348`) | `server_runner.py:329` (parameter default) | `False` | `server_runner.py:340` |
-| Dry run | `dry_run.py:261` | `False` | `dry_run.py:253` |
+| Plain serve (`cli._run_server` → `server_runner._run_server`) | uvicorn config in `_run_server` | `False` | `lan_exposure_notice` in `_run_server` |
+| Server-with-chat / multiple servers (`_start_background_server`, called from `chat_ui.py:207` and `:361`) | uvicorn config in `_start_background_server` | `False` | `lan_exposure_notice` in `_start_background_server` |
+| Dry run | `dry_run.py:265` | `False` | `dry_run.py:257` |
 
 Both columns are the same rule applied twice: nothing on a serve path may print
 a request target (an identifier can be a full token), and a non-loopback bind
@@ -309,7 +309,7 @@ Untouched: uvicorn's **error** log (startup banner, unhandled exceptions,
 shutdown) is a different logger and is still configured by `log_level`. Only
 the `uvicorn.access` per-request lines go away. Paths in *error* logs are
 bounded and redacted separately — `_redact_path` / `_log_target`
-(`server_routes.py:110-137`) replace every token-shaped segment with
+(`server_routes.py:113-140`) replace every token-shaped segment with
 `<redacted>` and cap the logged path at 200 chars, preferring the route
 template once the router has matched.
 
@@ -354,7 +354,7 @@ OpenAI-style `arguments`. Unknown names are dropped, args are normalized to
 JSON strings, ids are `call_001…`. Per-argument size is capped by
 `Settings.tool_args_max_chars` / `DEEPSEAPORT_MAX_ARGS_CHARS` (default
 200000); `DEEPSEAPORT_MAX_BARE_OBJECTS` (default 40,
-`core/tools/common.py:43`) bounds how many JSON objects the parser scans for a
+`core/tools/common.py:37`) bounds how many JSON objects the parser scans for a
 bare name+arguments call, and `MAX_SCAN_OBJECTS` / `MAX_TOTAL_CALLS` reuse the
 same number so one env knob bounds every scan. Opt-in
 `Settings.forgiving_toolcalls` / `DEEPSEAPORT_FORGIVING_TOOLCALLS` (default off)
@@ -386,7 +386,7 @@ Two boundary rules keep a sloppy client from smuggling a call or a turn through:
   a dispatch of a tool that does not exist.
 
 **Streamed `tool_calls` deltas carry `index`** — their position in `calls`, in
-emission order (`core/engine.py:936-956`). Each delta is otherwise a complete,
+emission order (`core/engine.py:953-976`). Each delta is otherwise a complete,
 standalone call, so `index` is the only field that says which of N parallel
 calls it belongs to. OpenAI's streaming contract makes it mandatory on
 `tool_calls` deltas and `openai-python` validates every chunk against its
@@ -408,8 +408,7 @@ DeepSeek (v4.1 lineup, Sep 2026) — only these four; no Pro/expert exists yet
 | `deepseek-flash-reasoner-search` | yes | yes |
 
 `thinking_enabled`/`search_enabled` are the real backend switches;
-`model_type` stays `"default"`. Removed: `deepseek-chat/v3/r1`, `-search`
-variants under old names, `deepseek-vision`.
+`model_type` stays `"default"`.
 
 Qwen (`providers/qwen/models.py`): `qwen3.7-plus` (default, thinking +
 search), `qwen3.8-max` (thinking + search), `qwen3.8-omni-flash` (thinking,
@@ -417,15 +416,19 @@ no search). `/v1/models` serves the union of the active providers.
 
 ## TUI / serve modes (`tui.py`, `chat_ui.py`, `cli.py`)
 
-- `main_menu` loop: provider gate first (single/multi select over
-  `Settings.provider`/`providers`), then
-  `1 Start server / 2 Start server with chat / 3 Run multiple servers /
-  4 Settings / 5 Accounts / 6 Dry run / q Quit`.
-  Item 3 (`Run multiple servers`) exists only when a chat front-end was
-  passed in (`chat_fn is not None`); without one the menu falls back to the
-  legacy 1-4 layout `1 Start server / 2 Settings / 3 Accounts / 4 Dry run /
-  q Quit` and the on-screen "no accounts" hint renumbers accordingly
-  (`tui.py:1449-1503`). CLI
+- `main_menu` loop: for `serve` the provider chooser runs first (single/multi
+  select over `Settings.provider`/`providers`) unless a CLI
+  `--provider`/`--providers` flag answers it; the chooser is also the menu's
+  `q. Go back` row, and it is where the serve is quit (`q. Quit` in there;
+  Ctrl+C/EOF on the menu prompt quits directly). The header is the one place
+  the active mode is read (e.g. `=== deepseek + qwen (multi) ===`). Rows are
+  numbered by position from one list, in this order: `Start server`,
+  `Start server with chat` (only when a chat front-end was passed in,
+  `chat_fn is not None`), `Account manager` (hidden when every active provider
+  is account-less, e.g. opencode), `Settings`, `Run multiple servers` (chat
+  front-end again), `Dry run`, then the unnumbered `q. Go back` row
+  — so the on-screen "no accounts" hint's number is derived, never
+  hand-written. CLI
   `--provider`/`--providers` flags do the same non-interactively. Both
   serve paths return to the menu on stop — no app restart to switch
   accounts; API-side account changes are reloaded from disk afterwards
@@ -442,11 +445,10 @@ no search). `/v1/models` serves the union of the active providers.
 - Pre-flight guard (`_preflight_reason`): Start is blocked when the pool is
   empty or no account has a token (first request would 503/401). The menu
   prints why and jumps into `accounts_menu` so the fix is one step away.
-- Plain serve (`cli._run_server`, single worker): `uvicorn.Server` in the
-  main thread + `_watch_stop_keys` daemon (`msvcrt` on Windows,
-  `termios`+`select` on POSIX) mapping `Esc`/`q` to `server.should_exit`;
-  `Ctrl+C` arrives via SIGINT. Multi-worker falls back to `uvicorn.run`
-  (no Esc listener — it can't reach subprocesses).
+- Plain serve (`cli._run_server`): one uvicorn process, no worker option —
+  `uvicorn.Server` in the main thread + `_watch_stop_keys` daemon (`msvcrt` on
+  Windows, `termios`+`select` on POSIX) mapping `Esc`/`q` to
+  `server.should_exit`; `Ctrl+C` arrives via SIGINT.
 - Port auto-fix (`server_runner._ensure_free_port`, thin-wrapped by
   `cli._ensure_free_port`): `cli._port_number` rejects `--port` outside
   1-65535 at parse time; `_ensure_free_port` warns and falls back to scanning
@@ -500,8 +502,8 @@ no search). `/v1/models` serves the union of the active providers.
   (`config.py:788`) strips a leading UTF-8 BOM (what Windows editors add, and
   what `json.loads` rejects) and repairs it, but genuinely broken input —
   truncated, hand-mangled, or valid JSON of the wrong shape — is latched in
-  `_UNPARSABLE_CONFIG` (`config.py:763`) and `save()` **raises** rather than
-  writing (`config.py:382`). Loading it as `{}` was how a BOM became "no accounts" and
+  `_UNPARSABLE_CONFIG` (`config.py:739`, `:826`) and `save()` **raises** rather than
+  writing (`config.py:366-372`). Loading it as `{}` was how a BOM became "no accounts" and
   the next `save()` — any account action, any TUI toggle, any ban persist —
   rewrote the file with `"accounts": []`, destroying every email, password and
   64-char bearer token in it. The app still *starts* on a broken config (a
@@ -513,7 +515,7 @@ no search). `/v1/models` serves the union of the active providers.
   save ran against the recreated file. A missing or blank file is a
   legitimate fresh install and is never latched.
 - **A present-but-empty env var is treated as absent** (`_env_str`,
-  `config.py:740`). `os.environ.get("OBSCURA_BIN", raw.get("obscura_bin", ""))`
+  `config.py:747-761`). `os.environ.get("OBSCURA_BIN", raw.get("obscura_bin", ""))`
   returns `""` for `OBSCURA_BIN=`, so a `.env` copied from the example file
   silently reverted `obscura_bin` to `""` and the WAF path began
   auto-discovering a *different* binary than the operator pinned, with no
@@ -521,13 +523,11 @@ no search). `/v1/models` serves the union of the active providers.
 - The load path treats a hand-edited file as hostile input, because every field
   in it can be wrong in a way that is unrecoverable from the outside:
   - **`banned` goes through the string-aware bool** (`_as_bool`,
-    `config.py:629-647`, called at `:773`), the same mapping every other
-    `Settings` flag gets from the `_bool` closure. `bool("false")` is `True`, so
-    a hand-edited `"banned": "false"` used to load as a banned account
-    *permanently*: `__post_init__` only expires a ban whose `banned_until` has
-    passed, and a false-but-truthy string carries `banned_until: 0.0` — expiry
-    unknown, so there is nothing to expire.
-  - **`port` is range-checked at load** (`config.py:888-907`). `0` is a legal
+    `config.py:646-664`, called at `:884`), the same mapping every other
+    `Settings` flag gets from the `_bool` closure: a hand-edited
+    `"banned": "false"` loads as an un-banned account, never as a permanent ban
+    (`tests/test_config_integrity.py:10,88`).
+  - **`port` is range-checked at load** (`config.py:992-1018`). `0` is a legal
     `bind()` argument ("any free port") and never a legal config value: the
     server takes an ephemeral port while every screen keeps printing
     `http://127.0.0.1:0`, so each request fails connection-refused and nothing
@@ -537,15 +537,13 @@ no search). `/v1/models` serves the union of the active providers.
     recorded like the `max_retries` clamp, so an unrelated `save()` cannot
     rewrite the operator's own number.
   - **Same-identity accounts are deduped** (`_dedupe_accounts`,
-    `config.py:679-714`, over the shared `account_identity` notion). The loader
-    builds the list directly and bypasses `AccountPool.add` — the only place
-    duplicates used to be rejected — so one login listed twice became two pool
-    entries rotating over a single credential, halving the effective pool and
-    doubling the load on that account's rate limit. Conservative by
-    construction: only entries sharing a provider *and* a non-empty
-    email/mobile/token are the same, so a legitimate account is never dropped.
-    The surviving identifier is logged at WARNING — silently editing an
-    operator's credential list would be worse than the duplicate.
+    `config.py:695-730`, over the shared `account_identity` notion), because
+    the loader builds the list directly and bypasses `AccountPool.add`:
+    duplicates must not become two pool entries rotating over one credential.
+    Conservative by construction: only entries sharing a provider *and* a
+    non-empty email/mobile/token are the same, so a legitimate account is never
+    dropped, and the surviving identifier is logged at WARNING
+    (`tests/test_config_integrity.py:377-420`).
 - **`Settings.save`'s degraded path is non-destructive.** The atomic path
   (`mkstemp` + `os.replace`) holds; when `os.replace` is refused — Windows
   rename needs `FILE_SHARE_DELETE` on every open handle, so an editor, AV or
@@ -562,7 +560,7 @@ no search). `/v1/models` serves the union of the active providers.
   from the `.bak`. Avoiding even that would mean not writing at all when the
   rename is blocked, silently discarding every ban and token refresh.
 - **`Settings` / `AccountConfig` mask secrets in `__repr__`**
-  (`config.py:135-157`, `:280-304`): `keys` render as a count (`['<set x2>']`),
+  (`config.py:135-157`, `:276-300`): `keys` render as a count (`['<set x2>']`),
   passwords and tokens as `<set>`/`<empty>` — presence, never a length or a
   prefix, because "the token is 64 chars" is itself a credential fingerprint.
   Both objects hold the operator's complete credential set and the dataclass
@@ -583,12 +581,13 @@ no search). `/v1/models` serves the union of the active providers.
   so this script is the packaging step, and `.github/workflows/release.yml`
   runs `--check` as a hard gate on a `v*` tag before it publishes.
 - `data/` (gitignored): PoW wasm. `~/.deepseaport/obscura-profile`: WAF cookies + login localStorage.
-- `src/deepseaport/real_browser.py` drives Helium/Chrome/Edge/Chromium login
-  over CDP; `browser_paths.py` discovers the binary. `auth.py` chooses real
-  browser first and falls back to Obscura; `mcp_client.py` is the Obscura
-  stdio transport. None of these are on the HTTP hot path.
+- `providers/deepseek/real_browser.py` drives Helium/Chrome/Edge/Chromium
+  login over CDP; `core/browser_paths.py` discovers the binary.
+  `providers/deepseek/auth.py` chooses real browser first and falls back to
+  Obscura; `core/mcp_client.py` is the Obscura stdio transport. None of these
+  are on the HTTP hot path.
 - `GET /v1/waf/status` shows binary/profile/WAF-cookie state and REQUIRES the
-  API key (`server_routes.py:151-158`): the payload names the absolute
+  API key (`server_routes.py:309`): the payload names the absolute
   obscura binary path, the absolute profile path and the WAF cookie names,
   which is what a LAN scanner wants. Nothing polls it (readiness uses
   `/health`), so the gate costs nothing. `/health` deliberately stays
@@ -631,17 +630,11 @@ no search). `/v1/models` serves the union of the active providers.
 - Registry (`core/registry.py:26-27`): lazy discovery via `_BUILTIN_MODULES`
   (`deepseek`, `qwen`, `opencode`) + `create_provider()` factories;
   failures log and never raise; never imports `deepseaport.server` (no cycle).
-  The imports run under `_LOAD_LOCK` and the registry plus the `_LOADED` flag
-  are published
-  as one step (`core/registry.py:45-82`). `_LOADED` used to latch *before* the
-  imports, so a concurrent reader could see a half-populated registry:
-  `resolve_model()` returned None and a perfectly valid model answered 404.
-  That window was not theoretical — `warmup_on_startup` defaults on and the
-  lifespan yields while its daemon thread imports, so uvicorn accepts
-  connections for the whole load. A module that fails to import is logged and
-  skipped, so it costs only that provider and one warning; the load still
-  latches, because re-importing a module named one line away in
-  `_BUILTIN_MODULES` on every access only bought a log flood.
+  The imports run under `_LOAD_LOCK`, and the registry plus the `_LOADED` flag
+  are published as one step (`core/registry.py:45-82`), so a concurrent reader
+  never sees a half-populated registry (a 404 for a valid model) and a module
+  that fails to import costs only that provider and one warning, while the load
+  still latches once (`tests/test_route_params_and_registry.py:332,389`).
 - Provider-scoped pools (`core/pools.py`): `active_provider_ids`,
   `accounts_for_provider`, `make_pool` build one `AccountPool` per active
   provider; failover stays within provider.
@@ -682,8 +675,11 @@ no search). `/v1/models` serves the union of the active providers.
   upstream or `providers/opencode/` (reference #3) for a local one, then add
   one line to `_BUILTIN_MODULES`. New providers write a thin adapter over
   `core/engine.py` — do NOT copy `completion_service.py`. See `PROVIDERS.md`.
-- Back-compat: old module paths (`deepseaport.server`, `completion_service`,
-  `client`, ...) remain as alias shims; all monkeypatch seams preserved.
+- Back-compat: the old root paths (`deepseaport.client`, `deepseaport.pow`,
+  `deepseaport.tools_support`, ...) are gone — import from where the code lives
+  (`PROVIDERS.md`, "Back-compat notes"). `deepseaport.server` stays thin wiring
+  whose `_pool` / `_openai_response` / `parse_tool_calls` attributes remain
+  patchable seams.
 
 ### The opencode provider (a local CLI, not a web upstream)
 
@@ -693,14 +689,14 @@ so none of the web-provider machinery applies. It speaks opencode v2's HttpApi
 below are v2-specific. Full protocol detail lives in
 `src/deepseaport/providers/opencode/README.md`; this is the shape.
 
-- **`requires_accounts = False`** (`providers/opencode/provider.py:29`). No
+- **`requires_accounts = False`** (`providers/opencode/provider.py:31`). No
   tokens, no `AccountPool`, no `AccountConfig`. The route layer reads the flag
   and skips acquisition entirely — `needs_slot` in
-  `server_routes.py:334` means `pool` stays `None` and `item` is passed as
-  `None` (the opencode engine ignores both). Downstream: `tui.py:1343` and
-  `chat_ui.py:73` filter the provider menu so accountless providers are
+  `server_routes.py:345` means `pool` stays `None` and `item` is passed as
+  `None` (the opencode engine ignores both). Downstream: `tui.py:337` and
+  `chat_ui.py:87` filter the provider menu so accountless providers are
   selectable with an empty account list, `_preflight_reason` passes with zero
-  accounts, and `cli.py:656` bypasses the pool in chat mode. The adapter still
+  accounts, and `cli.py:867-871` bypasses the pool in chat mode. The adapter still
   accepts `pool`/`item` in its signatures so the route contract is unchanged.
 - **No PoW, no WAF, no ban, no login.** `probe_ban` is `(False, None)`,
   `login` raises, `warmup` is a log-only `GET /api/info` probe that boots the
@@ -719,13 +715,21 @@ below are v2-specific. Full protocol detail lives in
   reading via prompt injection. `~/.config/opencode`, project files and plain
   `opencode` runs are untouched. Extra workers reuse the instance through the
   `serve.json` port file, and a recorded serve is reaped only after a retried
-  probe (`_probe_alive`, 3 attempts) fails — one missed probe no longer kills a
-  busy instance. Opt out with `DEEPSEAPORT_OPENCODE_BASE` (use your own serve
+  probe fails (`_probe_alive`; 3 attempts, or one when the OS reports the
+  recorded pid gone — a serve the retries protect has to exist in the first
+  place) — one missed probe no longer kills a busy instance. Before any
+  command-line read the recorded pid is checked against the OS (`_pid_alive`:
+  ctypes `OpenProcess` + zero-wait on Windows, where `os.kill` on a pid is
+  `TerminateProcess`; `kill(pid, 0)` on POSIX), and a dead pid — the normal
+  state of `serve.json`, since the atexit kill retires the process and not the
+  file — is skipped silently instead of being reported as a stale serve left
+  running. Opt out with `DEEPSEAPORT_OPENCODE_BASE` (use your own serve
   as-is) or `DEEPSEAPORT_OPENCODE_MANAGED=0`.
 - **Since v2 the serve always requires HTTP basic auth.** It generates a
   password at boot and prints it unless `OPENCODE_SERVER_PASSWORD` pins one, so
   the managed child sets that env and hands the same value to the client
-  (`serve.json` stores it, owner-only; a probed base must be given the password
+  (`serve.json` stores it — DPAPI-wrapped for the current user on Windows,
+  cleartext under 0700/0600 on POSIX; a probed base must be given the password
   too). An operator's own serve is used with
   `DEEPSEAPORT_OPENCODE_USERNAME/PASSWORD`; a 401 is terminal and names both.
 - **The turn is prompt-then-poll.** v2 has no blocking message endpoint:
@@ -796,13 +800,16 @@ below are v2-specific. Full protocol detail lives in
 - **Model catalogue.** Two layers in `providers/opencode/models.py`:
   `live_specs()` reads `GET /api/model` (thinking when an entry declares
   `compatibility.reasoningField`; disabled and non-`active` entries dropped)
-  and `MODELS_SPEC` is the 8-entry offline fallback used when
-  no serve answers — seven `*-free` plus `opencode/big-pickle`, which is *not* a
-  `-free` id. One process-wide cache under a lock holds a success for 5 minutes
+  and `MODELS_SPEC` is the hand-verified offline fallback used when no serve
+  answers — exact ids and current availability live in that module. One
+  process-wide cache under a lock holds a success for 5 minutes
   and a failure for 30; when nothing answers at the configured base the read
   boots the managed serve and retries, so the catalogue does not depend on which
-  process asks. `default_model()` is the explicit
-  `opencode/muse-spark-1.3-contributor-free`, never the first catalogue key.
+  process asks. Menus (`provider.models_hint()` -> `cached_specs`) get the last
+  read, else the fallback, with no I/O at all (and no lock: `live_specs` holds
+  `_cache_lock` across its fetch and its boot). A blank model id resolves to the explicit
+  `opencode/muse-spark-1.3-contributor-free` (`models.DEFAULT_MODEL`, read by
+  `protocol.split_model`), never the first catalogue key.
   `protocol.split_model` splits `providerID/modelID` at the FIRST slash, and
   `model_spec` accepts any other id containing a slash as a passthrough
   (user-configured proxy providers on the same serve) so those work in chat.

@@ -10,17 +10,23 @@ serve`` is up:
   minutes) holds BOTH the catalogue and a failure, because ``/v1/models`` is
   hit on every request and a serve that is not running must not cost one
   timeout per call.
-* :data:`MODELS_SPEC` below is the OFFLINE FALLBACK: the eight free models
-  verified by hand against a serve (session -> message -> ``finish: stop``
-  with real text, no auth). They match the Zen catalog
-  (``https://opencode.ai/zen/v1/models``). All are flagged thinking-capable:
-  ``reasoning`` parts were observed by default (muse-spark live: 203
-  reasoning tokens) and the rest are adapter-attested thinking models, so
-  ``reasoning_effort`` is accepted as the serve message ``variant`` for all.
+* :data:`MODELS_SPEC` below is the OFFLINE FALLBACK: the hand-verified list,
+  and where the exact ids and their current upstream availability are written
+  down. It was verified by hand against a serve (session -> message ->
+  ``finish: stop`` with real text, no auth) and matches the Zen catalog
+  (``https://opencode.ai/zen/v1/models``). An entry upstream no longer serves
+  stays listed so a serve-less start still answers; it fails live with
+  ``Model unavailable``. All are flagged thinking-capable: ``reasoning`` parts
+  were observed by default (muse-spark live: 203 reasoning tokens) and the rest
+  are adapter-attested thinking models, so ``reasoning_effort`` is accepted as
+  the serve message ``variant`` for all.
 
 ``provider.models()`` serves the live set whenever it is non-empty and
-:data:`MODELS_SPEC` otherwise, so ``/v1/models``, the TUI picker and the CLI
-list are as current as the serve. ``provider.model_spec`` additionally accepts
+:data:`MODELS_SPEC` otherwise, so ``/v1/models`` and the CLI list are as
+current as the serve. ``provider.models_hint()``, behind :func:`cached_specs`,
+is the menus' variant of the same two layers: answered from what this process
+already read, never touching the network and never booting anything.
+``provider.model_spec`` additionally accepts
 any catalogue-unknown ``provider/model`` id as a passthrough (user-configured
 proxy providers on the same serve instance), so ``/v1/chat/completions``
 works with those too.
@@ -152,12 +158,13 @@ def live_specs(timeout: float = _LIVE_TIMEOUT) -> dict[str, ModelSpec]:
 
     When nothing answers at the configured base it BOOTS the managed serve and
     reads again. That is what makes the list the same in every process: a fresh
-    ``deepseaport models``, the TUI picker and a server that booted before this
-    change all report the same ids, instead of the fresh ones silently falling
-    back to a hand-written list that is stale within days. ``ensure()`` is a
-    no-op when the operator pinned their own ``DEEPSEAPORT_OPENCODE_BASE`` (it
-    is not ours to replace) and when ``DEEPSEAPORT_OPENCODE_MANAGED`` is off,
-    which is how the hermetic tier keeps subprocesses out of the suite.
+    ``deepseaport models`` and a server that booted before this change report
+    the same ids, instead of the fresh ones silently falling back to a
+    hand-written list that is stale within days. ``ensure()`` is a no-op when
+    the operator pinned their own ``DEEPSEAPORT_OPENCODE_BASE`` (it is not ours
+    to replace) and when ``DEEPSEAPORT_OPENCODE_MANAGED`` is off, which is how
+    the hermetic tier keeps subprocesses out of the suite. A MENU row must not
+    call this: use :func:`cached_specs`.
 
     Cached process-wide: :data:`_CACHE_TTL` for a catalogue read,
     :data:`_FAIL_TTL` for a failed one (so a serve that is still booting is
@@ -187,3 +194,22 @@ def live_specs(timeout: float = _LIVE_TIMEOUT) -> dict[str, ModelSpec]:
             logger.debug("opencode live catalogue empty; using the static set")
         _cached, _cached_at = specs, now
         return dict(specs)
+
+
+def cached_specs() -> dict[str, ModelSpec]:
+    """The catalogue this process already knows, without touching anything.
+
+    ``{}`` when nothing has been read yet (or the last read failed), which is
+    the caller's signal to use :data:`MODELS_SPEC`. No I/O of any kind and no
+    lock: this is what a MENU row may call. A live read against a dead base
+    costs a full timeout where loopback connects hang (this codebase has seen
+    hosts where a *refused* connect takes seconds), a read that boots the
+    managed serve costs the boot on top, and ``_cache_lock`` is held ACROSS
+    both -- so waiting for it would inherit exactly the stall this exists to
+    avoid.
+    """
+    # Deliberately lock-free: the only writer REBINDS _cached (never mutates
+    # it in place), so a racing read yields an older catalogue or {}, which is
+    # all a hint promises.
+    cached = _cached
+    return dict(cached) if cached else {}

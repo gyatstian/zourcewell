@@ -61,8 +61,7 @@ LOGIN_TIMEOUT = 90.0  # Obscura/MCP driver (auth.BrowserLogin)
 POLL_START = 0.35
 POLL_MAX = 1.25
 POLL_BACKOFF = 1.35
-REAL_LOGIN_TIMEOUT = 75.0  # CDP driver (real_browser.RealBrowser)
-DEFAULT_LOGIN_TIMEOUT = REAL_LOGIN_TIMEOUT
+DEFAULT_LOGIN_TIMEOUT = 75.0  # CDP driver (real_browser.RealBrowser)
 REAL_POLL_INTERVAL = 0.6
 REACT_COMMIT_DELAY = 0.6  # SPA onChange commit wait before clicking submit
 COOKIE_DISMISS_DELAY_MCP = 0.25
@@ -201,13 +200,6 @@ CDP_CLICK_LOGIN_JS = (
 
 
 # --- text helpers --------------------------------------------------------
-def collapse_text(text: object, limit: int = 500) -> str:
-    try:
-        return " ".join(str(text or "").split())[:limit]
-    except Exception:
-        return ""
-
-
 def clean_text(text: object) -> str:
     try:
         return " ".join(str(text or "").split())
@@ -271,7 +263,7 @@ _MONTH_NUMBERS = {
     "stycze\u0144": 1, "kwiecie\u0144": 4,
     "sierpie\u0144": 8, "wrzesie\u0144": 9, "wrze\u015bnia": 9,
     "pa\u017adziernik": 10, "pa\u017adziernika": 10,
-    "grudzie\u0144": 12, "grudnia": 12,
+    "grudzie\u0144": 12,
 }
 _MONTH_RE = "|".join(sorted((re.escape(k) for k in _MONTH_NUMBERS), key=len, reverse=True))
 

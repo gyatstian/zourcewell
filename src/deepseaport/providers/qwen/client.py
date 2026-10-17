@@ -19,16 +19,7 @@ from curl_cffi import requests as crequests
 
 from . import protocol as P
 from ...core import transport as T
-# Backward-compat re-exports: canonical SSE parsing lives in sse_parser.py,
-# header/payload helpers in protocol.py — still importable from client.
-from .protocol import (  # noqa: F401
-    base_headers,
-    bridge_headers,
-    chat_new_payload,
-    completion_payload,
-    parse_json,
-)
-from .sse_parser import QwenStreamParser, StreamEvent, parse_sse_line  # noqa: F401
+from .sse_parser import QwenStreamParser, StreamEvent
 
 logger = logging.getLogger("deepseaport.client")
 
@@ -480,7 +471,7 @@ def _raise_biz_error(data: dict) -> None:
         raise RuntimeError(f"Qwen API error {code}: {msg}")
 
 
-def create_chat(headers: dict, model: str, chat_type: str = "t2t") -> str:
+def create_chat(headers: dict, model: str) -> str:
     """POST /api/v2/chats/new; return the chat id (data.id).
 
     WAF-gated: a bot request returns HTTP 200 with an HTML challenge page.
@@ -489,7 +480,7 @@ def create_chat(headers: dict, model: str, chat_type: str = "t2t") -> str:
     """
     _ensure_token_cookie(headers)
     resp = _SESSION.post(P.CHATS_NEW_URL, headers=headers,
-                         json=P.chat_new_payload(model, chat_type=chat_type),
+                         json=P.chat_new_payload(model),
                          impersonate=IMPERSONATE, timeout=30)
     if resp.status_code == 200 and P.is_waf_challenge(resp):
         resp.close()

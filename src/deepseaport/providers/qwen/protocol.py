@@ -10,27 +10,21 @@ lives in sse_parser.py.
 
 from __future__ import annotations
 
-import json
-import logging
 import os
 import time
 import uuid
 
-from ...core.transport import BAN_WORD_RE as _SHARED_BAN_RE
 from ...core.transport import has_ban_word as _shared_has_ban_word
 from ...core.transport import parse_json_response as _shared_parse_json
 
-logger = logging.getLogger("deepseaport.protocol")
-
-# Structural split (behavior-preserving): SSE parsing lives in sse_parser.py;
-# re-exported so `deepseaport.protocol.QwenStreamParser` etc. keep working.
-from .sse_parser import QwenStreamParser, StreamEvent, parse_sse_line  # noqa: F401,E402
+# SSE events are built through this module; the parsers themselves live in
+# sse_parser.py.
+from .sse_parser import StreamEvent  # noqa: F401,E402
 
 __all__ = [
     "API_BASE",
     "AUTH_URL",
     "BASE",
-    "CHAT_COMPLETIONS_STOP_URL",
     "CHAT_COMPLETIONS_URL",
     "CHAT_DELETE_URL",
     "CHATS_NEW_URL",
@@ -42,8 +36,6 @@ __all__ = [
     "MODEL_META",
     "SIGNIN_URL",
     "StreamEvent",
-    "QwenStreamParser",
-    "parse_sse_line",
     "base_headers",
     "bridge_headers",
     "chat_new_payload",
@@ -69,7 +61,6 @@ API_BASE = f"{BASE}/api/v2"
 MODELS_URL = f"{API_BASE}/models/"
 CHATS_NEW_URL = f"{API_BASE}/chats/new"
 CHAT_COMPLETIONS_URL = f"{API_BASE}/chat/completions"
-CHAT_COMPLETIONS_STOP_URL = f"{API_BASE}/chat/completions/stop"
 CHAT_DELETE_URL = f"{API_BASE}/chats/{{id}}"
 # v1 signin: POST {email, password:<sha256-hex>} -> flat user object with a
 # JWT ``token`` + ``token_type:"Bearer"`` + ``expires_at`` (live-verified).
@@ -106,11 +97,9 @@ MODEL_META: dict[str, dict] = {
 }
 
 # Ban family: no verified Qwen ban envelope exists. Word-match is the shared
-# core.transport.BAN_WORD_RE (identical regex previously tripled). Local
-# aliases stay so ``P._BAN_RE`` keeps working; the envelope verdicts below
-# stay Qwen-specific (UNVERIFIED — see the TODO list in README.md).
+# core.transport.has_ban_word; the envelope verdicts below stay Qwen-specific
+# (UNVERIFIED — see the TODO list in README.md).
 # TODO(unverified): Qwen ban envelope shape unknown.
-_BAN_RE = _SHARED_BAN_RE
 
 
 def _has_ban_word(text: str) -> bool:
@@ -398,21 +387,20 @@ def bridge_headers(bearer: str = "", bridge: object = _BRIDGE_UNSET) -> dict[str
     return base_headers(user_agent=ua, bearer=bearer)
 
 
-def chat_new_payload(model: str, chat_id: str = "", chat_type: str = "t2t",
-                     chat_mode: str = "normal") -> dict:
+def chat_new_payload(model: str, chat_id: str = "") -> dict:
     """Verified POST /api/v2/chats/new body; success returns data.id."""
     return {
         "chatId": chat_id,
         "models": [model],
         "project_id": None,
         "timestamp": int(time.time()),
-        "chat_type": chat_type,
-        "chat_mode": chat_mode,
+        "chat_type": "t2t",
+        "chat_mode": "normal",
     }
 
 
 def completion_payload(chat_id: str, prompt: str, model: str, thinking: bool,
-                       search: bool, stream: bool = True) -> dict:
+                       search: bool) -> dict:
     """Live-verified POST /api/v2/chat/completions body (sendPromptOpenAI).
 
     ``version`` is the completions version (default "2.1", NOT the app header
@@ -451,7 +439,7 @@ def completion_payload(chat_id: str, prompt: str, model: str, thinking: bool,
         "sub_chat_type": "t2t",
     }
     return {
-        "stream": bool(stream),
+        "stream": True,
         "version": COMPLETION_VERSION,
         "incremental_output": True,
         "chatId": chat_id,

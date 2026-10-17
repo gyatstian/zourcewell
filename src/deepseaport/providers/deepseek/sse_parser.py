@@ -1,17 +1,12 @@
 """SSE event parsing: Stateful StreamParser + stateless one-line helper.
 
-Behavior-preserving extraction from protocol.py (structural split only).
-Ban classification, retry codes, string matching, caps, and all
-live-traffic quirk handling are unchanged — see protocol.py for the
-authoritative ban helpers.
-
-Ownership:
-- This module owns SSE line/event parsing: StreamParser.feed, batched
-  v-list, usage/finished/error envelopes, continuation chunks, and the
-  fragments-based stream shape (response/fragments/-1/content).
-- Header builders and ban helpers stay in protocol.py (re-exported here
-  only via deferred local import to avoid a module cycle).
-- HTTP status/body/error-drain handling lives in core/transport.py.
+Owns SSE line/event parsing: StreamParser.feed, the batched v-list,
+usage/finished/error envelopes, continuation chunks, and the
+fragments-based stream shape (response/fragments/-1/content). Ban
+classification, retry codes, string matching and the header builders stay
+in protocol.py, the authoritative source (imported here only via a deferred
+local import, to avoid the module cycle); HTTP status/body/error-drain
+handling lives in core/transport.py.
 """
 
 from __future__ import annotations

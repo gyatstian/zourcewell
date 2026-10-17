@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-
 from ..common import (
     MAX_SCAN_OBJECTS,
     _FENCED_BLOCK_RE,
@@ -12,8 +10,6 @@ from ..common import (
     _finish,
     _loads_json_lenient,
 )
-
-logger = logging.getLogger("deepseaport.tools")
 
 
 def try_parse_fence(text, valid_or_none, limit_args, forgiving_on,

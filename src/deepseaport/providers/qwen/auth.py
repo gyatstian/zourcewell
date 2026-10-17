@@ -4,8 +4,8 @@ Live-verified 2026-09-22: POST /api/v1/auths/signin with a SHA-256-hex
 password returns a flat user object with a JWT ``token`` + ``token_type``
 ``"Bearer"`` + ``expires_at``. The same JWT is planted as a ``token`` cookie
 on ``.qwen.ai`` (the web session key). Self-contained: ``login`` and
-``login_with_expiry`` return plain tuples, and ``unpack_login_result`` /
-``unpack_login_result_ex`` normalize them, without importing deepseek.
+``login_with_expiry`` return plain tuples, and ``unpack_login_result``
+normalizes them, without importing deepseek.
 """
 
 from __future__ import annotations
@@ -26,33 +26,13 @@ logger = logging.getLogger("deepseaport.auth")
 EXPIRY_LEEWAY_SECONDS = 300.0
 
 __all__ = [
-    "EXPIRY_LEEWAY_SECONDS",
-    "effective_expiry",
     "is_expired",
     "jwt_exp",
     "login",
     "login_with_expiry",
-    "parse_expires_at",
     "token_expired",
     "unpack_login_result",
-    "unpack_login_result_ex",
 ]
-
-
-def _coerce_ts(value) -> float | None:
-    """Best-effort unix-ts coercion: numeric str ok; ms -> s; <=0 -> None."""
-    try:
-        if value is None or value == "":
-            return None
-        ts = float(value)
-    except (TypeError, ValueError):
-        return None
-    if ts <= 0:
-        return None
-    # Heuristic: ms timestamps are 1e12+; normal s timestamps are ~1e9-1e11.
-    if ts >= 1e12:
-        ts = ts / 1000.0
-    return ts if ts > 0 else None
 
 
 def parse_expires_at(user: dict | None) -> float | None:
@@ -62,7 +42,7 @@ def parse_expires_at(user: dict | None) -> float | None:
             return None
         for key in ("expires_at", "expiresAt", "expire_at", "exp"):
             if key in user:
-                ts = _coerce_ts(user.get(key))
+                ts = P._coerce_ban_ts(user.get(key))
                 if ts is not None:
                     return ts
         # Some envelopes nest the user object one level down.
@@ -86,7 +66,7 @@ def jwt_exp(token: str | None) -> float | None:
         payload_b64 += "=" * (-len(payload_b64) % 4)
         payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
         if isinstance(payload, dict):
-            return _coerce_ts(payload.get("exp"))
+            return P._coerce_ban_ts(payload.get("exp"))
     except Exception:
         pass
     return None
@@ -155,31 +135,6 @@ def unpack_login_result(res) -> tuple[str | None, bool, str]:
     if isinstance(res, str):
         return (res.strip() or None), False, ""
     return None, False, ""
-
-
-def unpack_login_result_ex(res) -> tuple[str | None, float | None, bool, str]:
-    """Normalize into (token, expires_at, banned, detail). Never raises."""
-    try:
-        if res is None:
-            return None, None, False, ""
-        if isinstance(res, tuple):
-            if len(res) == 4:
-                token = res[0].strip() if isinstance(res[0], str) else None
-                exp: float | None = None
-                try:
-                    exp = float(res[1]) if res[1] else None
-                    if exp is not None and exp <= 0:
-                        exp = None
-                except (TypeError, ValueError):
-                    exp = None
-                return (token or None), exp, bool(res[2]), str(res[3] or "")
-            token, banned, detail = unpack_login_result(res)
-            return token, None, banned, detail
-        if isinstance(res, str):
-            return (res.strip() or None), None, False, ""
-    except Exception:
-        pass
-    return None, None, False, ""
 
 
 def login_with_expiry(email: str, password: str,

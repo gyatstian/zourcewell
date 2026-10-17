@@ -252,8 +252,8 @@ def test_main_menu_guards_start_when_no_accounts(monkeypatch):
 
     s = Settings(accounts=[], active_account="", config_path="")
     calls = {"serve": 0}
-    # "1" blocked -> jumps to Accounts ("b" backs out), then quit.
-    inputs = iter(["1", "b", "q"])
+    # "1" blocked -> jumps to Account manager ("q" backs out); quit is q then q.
+    inputs = iter(["1", "q", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     assert main_menu(s, lambda st: calls.__setitem__("serve", 1) or 0) == 0
     assert calls["serve"] == 0
@@ -266,7 +266,7 @@ def test_main_menu_guards_chat_when_tokenless(monkeypatch):
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="")],
                  active_account="", config_path="")
     calls = {"chat": 0}
-    inputs = iter(["2", "b", "q"])
+    inputs = iter(["2", "q", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     rc = main_menu(s, lambda st: 0, lambda st: calls.__setitem__("chat", 1) or 0)
     assert rc == 0 and calls["chat"] == 0
@@ -279,7 +279,7 @@ def test_main_menu_starts_when_token_present(monkeypatch):
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1")],
                  active_account="", config_path="")
     calls = {"serve": 0}
-    inputs = iter(["1", "q"])
+    inputs = iter(["1", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     assert main_menu(s, lambda st: calls.__setitem__("serve", 1) or 0) == 0
     assert calls["serve"] == 1
@@ -327,7 +327,7 @@ def test_main_menu_routes_to_chat(monkeypatch):
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1")],
                  active_account="", config_path="")
     calls = {"serve": 0, "chat": 0}
-    inputs = iter(["2", "q"])
+    inputs = iter(["2", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     rc = main_menu(s, lambda st: calls.__setitem__("serve", 1) or 0,
                    lambda st: calls.__setitem__("chat", 1) or 0)
@@ -341,7 +341,7 @@ def test_main_menu_serve_still_first(monkeypatch):
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1")],
                  active_account="", config_path="")
     calls = {"serve": 0, "chat": 0}
-    inputs = iter(["1", "q"])
+    inputs = iter(["1", "q", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     rc = main_menu(s, lambda st: calls.__setitem__("serve", 1) or 0,
                    lambda st: calls.__setitem__("chat", 1) or 0)
@@ -371,11 +371,14 @@ def test_main_menu_flags_incomplete_setup(monkeypatch, capsys):
     from deepseaport.tui import main_menu
 
     s = Settings(accounts=[], active_account="", config_path="")
-    monkeypatch.setattr("builtins.input", lambda *a, **k: "q")
+    # Quit lives in the provider chooser ("q. Go back", then "q. Quit" there).
+    inputs = iter(["q", "q"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     assert main_menu(s, lambda st: 0) == 0
     out = capsys.readouterr().out
     assert "no accounts yet" in out
-    assert "Accounts (3)" in out
+    # The hint names the Account manager row (2 with no chat entry point wired).
+    assert "Account manager (2)" in out
 
 
 def test_load_settings_defaults_browser_bin_to_auto(tmp_path, monkeypatch):

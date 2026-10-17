@@ -1,16 +1,12 @@
 """Obscura bridge: WAF-cleared cookies + browser UA for the hot path.
 
 chat.deepseek.com sits behind an AWS WAF JavaScript challenge. Obscura
-(h4ckf0r0day/obscura) executes the challenge in its V8 engine and persists
-cookies in a profile dir. This module:
-
-1. warms the profile (two sequential fetches: challenge -> real app),
-2. dumps the cookie jar (`--dump cookies`, includes HttpOnly),
-3. captures the engine's User-Agent for header consistency,
-4. exposes the jar as a `Cookie` header for direct `curl_cffi` calls.
-
-Direct HTTP (not DOM driving) stays the hot path; Obscura is only
-re-invoked to refresh the WAF token (startup + on 403).
+(h4ckf0r0day/obscura) executes it in its V8 engine and persists cookies in a
+profile dir. This module warms the profile (challenge then real-app fetch),
+dumps the jar (`--dump cookies`, HttpOnly included), captures the engine's
+User-Agent for header consistency, and exposes the jar as a `Cookie` header
+for direct `curl_cffi` calls. Direct HTTP (not DOM driving) stays the hot
+path; Obscura is re-invoked only to refresh the WAF token (startup + on 403).
 """
 
 from __future__ import annotations
@@ -129,20 +125,16 @@ def secure_dir(path, label: str = "") -> None:
         logger.debug("%s chmod 0700 skipped for %s: %s", name, path, exc)
 
 
-# Windows half of ``secure_dir``. ``os.chmod(f, 0o600)`` only toggles the
-# read-only attribute on win32 and never touches the DACL, so a "protected"
-# file keeps whatever the containing directory grants -- on a default install
-# that includes read access for ``BUILTIN\Users``. Deliberately a warning
-# rather than a fix: rewriting the ACL behind the operator's back (``icacls``,
-# a deny ACE) can lock them out of their own credential store, and the
-# actionable part is WHERE the file lives, which is the operator's call.
-#
-# Mirrors the shape of ``config._warn_inherited_acl_once`` (config.py owns that
-# one and imports nothing from this module, so neither imports the other: this
-# copy exists so a second secret store can warn without a cycle). The once
-# flag is keyed by ``label`` instead of being a single module boolean: each
-# store has its own secret and must get its own warning, and neither may
-# consume the other's.
+# Windows half of ``secure_dir``: os.chmod on win32 only toggles the read-only
+# attribute and never touches the DACL, so a "protected" file keeps whatever
+# the containing directory grants (on a default install that includes read
+# access for ``BUILTIN\Users``). Warning, not a fix: rewriting the ACL behind
+# the operator's back (``icacls``, a deny ACE) can lock them out of their own
+# credential store, and where the file lives is their call. Mirrors
+# ``config._warn_inherited_acl_once`` (config.py owns that one and imports
+# nothing from here, so this copy keeps the modules cycle-free). The once flag
+# is keyed by ``label``, not a single module boolean, so each secret store
+# gets its own warning and neither consumes the other's.
 _ACL_WARNED_LABELS: set[str] = set()
 
 

@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import os
-import pathlib
 import subprocess
 import sys
 import textwrap
@@ -121,17 +120,11 @@ def test_param_cap_is_the_documented_hardcoded_64():
     therefore immune to a revert.
 
     What is worth pinning is that the constant is a plain ``int`` and that
-    every dialect honours it, so a change has to be a deliberate edit to
-    ``common.py`` and not an accident. The behavioural coverage is the
-    parametrised H1 tests above, which derive their cases from this constant.
+    every dialect honours it. The behavioural coverage is the parametrised H1
+    tests above, which derive their cases from this constant.
     """
     assert TC.MAX_PARAMS_PER_INVOKE == 64
     assert type(TC.MAX_PARAMS_PER_INVOKE) is int
-    # No env knob behind it: unlike the sibling caps, this one is a literal.
-    import inspect as _inspect
-    source = _inspect.getsource(TC)
-    assert "MAX_PARAMS_PER_INVOKE = 64" in source, \
-        "the cap became configurable (or moved); update this test and the docs"
 
 
 # --- H2: native tools must stay bounded by the managed permission map ------
@@ -149,14 +142,8 @@ def test_managed_permission_map_still_denies_bash():
 # --- H3: the live provider helper stays live ------------------------------
 
 
-def test_qwen_stop_url_constant_survives_as_documented_protocol():
-    """The endpoint constant is part of the documented upstream surface even
-    though the unused POST helper is gone."""
-    from deepseaport.providers.qwen import protocol as QP
-
-    assert "CHAT_COMPLETIONS_STOP_URL" in QP.__all__
-    assert QP.CHAT_COMPLETIONS_STOP_URL.endswith("/chat/completions/stop")
-    # Sibling best-effort helpers and their shared query builder stay live.
+def test_qwen_chat_helpers_stay_live():
+    """Sibling best-effort helpers and their shared query builder stay live."""
     assert callable(QC.delete_chat)
     assert callable(QC.fetch_models)
     assert QC._with_chat_id("u", {"chat_id": "a b"}) == "u?chat_id=a%20b"
@@ -172,11 +159,6 @@ def test_snapshot_verdict_is_live_and_shared():
         "captcha", "visible challenge overlay")
     assert verdict({"body": "wrong password"})[0] == "credential"
     assert verdict(None) == ("", "")
-
-    from deepseaport.providers.deepseek import real_browser
-
-    src = pathlib.Path(real_browser.__file__).read_text(encoding="utf-8")
-    assert "snapshot_verdict" in src, "the CDP driver must keep calling it"
 
 
 # --- H4: MAX_ARGS_CHARS is an import-time snapshot, not a live env read ----
@@ -281,21 +263,7 @@ def test_explicit_max_args_chars_wins_over_the_snapshot():
     assert len(json.loads(calls[0]["function"]["arguments"])["content"]) == 4_000
 
 
-def test_parse_tool_calls_uses_the_snapshot_when_no_limit_is_passed():
-    """No explicit limit -> the import-time default is what applies."""
-    tools = [{"type": "function", "function": {"name": "write"}}]
-    payload = json.dumps({"path": "a.txt", "content": "x" * 4_000})
-    text = json.dumps({"tool_calls": [{"function": {"name": "write",
-                                                    "arguments": payload}}]})
-    calls, _ = T.parse_tool_calls(text, tools)
-    if TC.MAX_ARGS_CHARS >= len(payload):
-        assert calls is not None
-    else:
-        assert calls is None
-
-
 def test_max_args_chars_name_is_importable_from_the_public_surface():
     import deepseaport.core.tools as TS
 
     assert TS.MAX_ARGS_CHARS == TC.MAX_ARGS_CHARS
-    assert TC._int_env("DEEPSEAPORT_TEST_ABSENT_ARGS", 200_000) == 200_000

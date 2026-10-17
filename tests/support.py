@@ -21,7 +21,6 @@ __all__ = [
     "FakeBridge",
     "FakeUvicornConfig",
     "FakeUvicornServer",
-    "FakeWafState",
     "JoinCountingThread",
     "Settings",
     "app_with_bridge",

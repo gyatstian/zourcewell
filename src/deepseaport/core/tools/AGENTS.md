@@ -25,6 +25,7 @@ reply is parsed back into OpenAI `tool_calls`.
 - `MAX_BARE_OBJECTS` / `DEEPSEAPORT_MAX_BARE_OBJECTS` (default 40) bounds how many JSON objects the bare name+arguments scan inspects, and the forgiving bucket's total-call scan reuses the same number.
 - `DEEPSEAPORT_FORGIVING_TOOLCALLS` (default off) enables the markup-repair bucket.
 - Import limits from `common.py`. Never redefine a bound inside a parser module; two copies drift and one of them stops being enforced.
+- The package `__init__` re-exports only the historical `core.tools` names that still have importers; import everything else from `common.py`, `parser/` or `prompt.py`. Adding a name back needs an importer.
 - These constants are captured at import time, which is why `tests/conftest.py` has to steer the environment before collection.
 - `role: tool` results are folded back into the web prompt. That fold is what makes multi-step agentic loops work against a model with no function-calling API.
 - Every parser is a pure function over text: no I/O, no network, no provider imports.

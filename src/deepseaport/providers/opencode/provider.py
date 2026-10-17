@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 
 from ...core.provider import ModelSpec, Provider
-from .models import DEFAULT_MODEL, MODELS_SPEC, live_specs
+from .models import MODELS_SPEC, cached_specs, live_specs
 
 logger = logging.getLogger("deepseaport.providers")
 
@@ -41,7 +41,7 @@ class OpencodeProvider(Provider):
 
         One view for ``models()`` and ``model_spec()``, so a model the serve
         advertises resolves with its own spec (thinking flag included) even
-        when it is not one of the eight verified entries. The static set is a
+        when it is not in the hand-verified fallback list. The static set is a
         fallback, not a floor: it is not merged in.
         """
         return live_specs() or dict(MODELS_SPEC)
@@ -50,15 +50,16 @@ class OpencodeProvider(Provider):
         """Return the opencode catalogue (live from serve, else static)."""
         return self.catalogue()
 
-    def default_model(self) -> str:
-        """Return the canonical default opencode model id.
+    def models_hint(self) -> dict[str, ModelSpec]:
+        """Catalogue for a menu row: in-process only, never I/O.
 
-        Explicit, NOT the first catalogue key: the live catalogue is served in
-        upstream order and turns over weekly, so inheriting ``models()`` would
-        let the default change underneath the TUI picker and every
-        defaulting client.
+        ``models()`` is a live read that BOOTS the managed serve when nothing
+        answers, so it froze the provider picker for the length of that boot
+        (plus a failed connect to the dead base, which costs seconds on a host
+        whose loopback refuses hang). A menu shows what this process already
+        knows instead: the last catalogue read, else the static fallback.
         """
-        return DEFAULT_MODEL
+        return cached_specs() or dict(MODELS_SPEC)
 
     def model_spec(self, model: str) -> ModelSpec | None:
         """Exact match first, else passthrough for ``provider/model`` ids.
@@ -92,11 +93,6 @@ class OpencodeProvider(Provider):
         raise NotImplementedError(
             "opencode has no web login: free models need nothing, "
             "key-gated providers use `opencode auth login` in the CLI")
-
-    def normalize_token(self, raw) -> str:
-        """Normalize a pasted token via the shared extractor (unused)."""
-        from ...core.tokens import extract_token
-        return extract_token(raw)
 
     def warmup(self, bridge) -> None:
         """Boot the managed isolated serve when nothing answers (never raises).

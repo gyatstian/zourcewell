@@ -167,25 +167,21 @@ async def _watch_disconnect(request: Request, cancel_event: threading.Event) -> 
 
 async def _acquire_slot_or_499(pool, request: Request,
                                cancel_event: threading.Event,
-                               timeout: float, allow_failover: bool,
-                               provider_label: str | None = None):
+                               timeout: float, allow_failover: bool):
     """Acquire an account slot, aborting the queue wait on disconnect.
 
     aacquire() alone would park the endpoint task for the full 90s even
     after the client gave up. Chunk the wait so a disconnect surfaces as
     499 within ~2s without ever holding a slot.
 
-    ``provider_label`` is optional and names the upstream in the 503/429
-    detail ("no Qwen accounts in pool" instead of telling a Qwen-only
-    operator to debug DeepSeek). Omitted -- the way every current call site
-    calls it -- it is resolved from the pool itself
+    The 503/429 detail names the upstream from the pool itself
     (``AccountPool.provider_label``, derived from the member accounts'
-    ``provider`` field), falling back to "DeepSeek". Status codes, ordering
-    and the exported signature are unchanged.
+    ``provider`` field), falling back to "DeepSeek" -- "no Qwen accounts in
+    pool" instead of telling a Qwen-only operator to debug DeepSeek.
     """
     from fastapi import HTTPException as _HTTPException
 
-    label = str(provider_label or "").strip() or pool_provider_label(pool)
+    label = pool_provider_label(pool)
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
         chunk = min(2.0, max(0.05, deadline - time.monotonic()))
@@ -272,7 +268,7 @@ async def lifespan(app: FastAPI):
     # parked on an upstream socket.
 
 
-def _startup_warm(bridge: ObscuraBridge, settings=None) -> None:
+def _startup_warm(bridge: ObscuraBridge, settings) -> None:
     # Local-only mode (opencode CLI) needs no WAF bridge: skip the obscura
     # warmup (and the DeepSeek PoW fallback below) when no active provider
     # consumes the bridge's harvested jar -- a qwen-only setup would otherwise
@@ -281,10 +277,7 @@ def _startup_warm(bridge: ObscuraBridge, settings=None) -> None:
     try:
         from .core import pools as _pools_w
         from .core import registry as _reg_w
-        if settings is not None:
-            _w_ids = _pools_w.active_provider_ids(settings)
-        else:
-            _w_ids = [_reg_w.default().id]
+        _w_ids = _pools_w.active_provider_ids(settings)
         # Resolve the ids ONCE and drop the unknown ones. getattr(None,
         # "needs_waf_jar", True) defaulted to True, so a provider the registry
         # does not have counted as "consumes the jar" and fetched the DeepSeek
@@ -307,10 +300,7 @@ def _startup_warm(bridge: ObscuraBridge, settings=None) -> None:
     # simply has nothing to warm.
     try:
         from .core import pools, registry
-        if settings is not None:
-            provider_ids = pools.active_provider_ids(settings)
-        else:
-            provider_ids = [registry.default().id]
+        provider_ids = pools.active_provider_ids(settings)
         for pid in provider_ids:
             provider = registry.get(pid)
             if provider is None:

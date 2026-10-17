@@ -195,9 +195,9 @@ def loads_lenient(body: str) -> Any:
         return {}
 
 
-def truncate_message(text: str, limit: int = UPSTREAM_MESSAGE_MAX) -> str:
-    """Truncate a surfaced upstream body (default 300, preserved)."""
-    return (text or "")[:limit]
+def truncate_message(text: str) -> str:
+    """Truncate a surfaced upstream body to ``UPSTREAM_MESSAGE_MAX`` (300)."""
+    return (text or "")[:UPSTREAM_MESSAGE_MAX]
 
 
 # --- Shared singletons (F9: one copy, providers alias/delve) -----------------

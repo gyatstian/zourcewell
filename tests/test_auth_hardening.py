@@ -15,8 +15,7 @@ blast radius they remove:
   one request into 5,000,000 upstream attempts.
 * Requests were unbounded in bytes and tool count.
 * ``POST /v1/accounts/select`` rewrote config.json on every no-op poll.
-* ``serve`` said nothing about a 0.0.0.0 bind, and ``--workers N>1`` fell
-  through into uvicorn's exit 3.
+* ``serve`` said nothing about a 0.0.0.0 bind.
 * The dry-run dump printed a multi-megabyte block on the event loop.
 
 The limits asserted below are the documented ones in the source:
@@ -30,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import itertools
 import json
 import logging
@@ -66,7 +66,6 @@ from deepseaport.server_routes import (
 from deepseaport.server_runner import (
     UVICORN_LIMIT_CONCURRENCY,
     UVICORN_TIMEOUT_KEEP_ALIVE,
-    _multiworker_rejection,
     lan_exposure_notice,
 )
 
@@ -654,7 +653,7 @@ def test_run_server_prints_exposure_and_auth_state_before_starting(capsys,
     monkeypatch.setattr(server_runner, "_watch_stop_keys", lambda *a, **k: None)
     settings = _settings(keys=["secret"], listen=True)
     assert server_runner._run_server(
-        settings, argparse.Namespace(host="", port=0, workers=1),
+        settings, argparse.Namespace(host="", port=0),
         ensure_free=lambda s, h, p: p) == 0
     printed = seen["out_at_run"]
     assert "0.0.0.0" in printed and "5001" in printed
@@ -670,39 +669,12 @@ def test_run_server_says_auth_disabled_on_loopback(capsys, monkeypatch):
         run=lambda: None))
     monkeypatch.setattr(server_runner, "_watch_stop_keys", lambda *a, **k: None)
     assert server_runner._run_server(
-        _settings(keys=[]), argparse.Namespace(host="127.0.0.1", port=0, workers=1),
+        _settings(keys=[]), argparse.Namespace(host="127.0.0.1", port=0),
         ensure_free=lambda s, h, p: p) == 0
     out = capsys.readouterr().out
     assert "127.0.0.1" in out
     assert "DISABLED" in out
     assert "non-loopback" not in out  # no LAN warning on a loopback bind
-
-
-# A10 -- --workers N>1 ----------------------------------------------------------
-
-
-def test_multiworker_rejection_message():
-    assert _multiworker_rejection(1) == ""
-    assert _multiworker_rejection(0) == ""
-    message = _multiworker_rejection(2)
-    assert "--workers 2" in message
-    assert "--workers 1" in message
-    assert "import string" in message
-
-
-def test_run_server_rejects_multi_workers(monkeypatch, tmp_path):
-    """uvicorn would exit 3 here; fail with a message that says why."""
-    called: list = []
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: called.append(k))
-    monkeypatch.setattr(uvicorn, "Config", lambda *a, **k: called.append("config"))
-    settings = _settings(config_path=str(tmp_path / "c.json"))
-    with pytest.raises(SystemExit) as ei:
-        server_runner._run_server(
-            settings, argparse.Namespace(host="", port=0, workers=2),
-            ensure_free=lambda s, h, p: pytest.fail("port fix-up must not run"))
-    message = str(ei.value)
-    assert "--workers 2" in message and "--workers 1" in message
-    assert called == []  # never reaches uvicorn
 
 
 # A11 -- uvicorn limits on every Config we own ----------------------------------
@@ -771,7 +743,7 @@ def test_dry_run_dump_is_printed_off_the_event_loop(monkeypatch, capsys):
 
 def test_print_dry_run_stays_a_sync_module_function(capsys):
     """TUI/CLI call it directly; it must not become a coroutine."""
-    assert not asyncio.iscoroutinefunction(dry_run_mod._print_dry_run)
+    assert not inspect.iscoroutinefunction(dry_run_mod._print_dry_run)
     prep = {"model": "deepseek-flash", "stream": False, "tools": [],
             "prompt": "hello", "thinking": False, "search": False}
     dry_run_mod._print_dry_run(99, {"model": "deepseek-flash"}, prep)

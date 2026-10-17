@@ -82,17 +82,22 @@ App shell (`server.py`, `server_routes.py`, `server_concurrency.py`, `tui.py`,
 - **The opencode catalogue is live, with a static fallback.** `models.py` reads
   `GET /api/model` from the serve instance (which also lists the operator's
   other authenticated providers, all exposed as `providerID/modelID`) and falls
-  back to the eight hand-verified entries when no serve answers; the two
-  are never merged. Cached process-wide: a success for five minutes, a failure
+  back to the hand-verified fallback list when no serve answers; exact ids and
+  current availability live in `providers/opencode/models.py`; the two are
+  never merged. Cached process-wide: a success for five minutes, a failure
   for thirty. When nothing answers at the configured base the read boots the
   managed serve and retries, so the ids do not depend on which process asks;
   both opt-outs (an operator-pinned `DEEPSEAPORT_OPENCODE_BASE`, and
   `DEEPSEAPORT_OPENCODE_MANAGED=0`, which the hermetic tier sets) are honored.
-  `default_model()` is the explicit `opencode/muse-spark-1.3-contributor-free`,
-  NOT the first catalogue key — the live catalogue is in upstream order and
-  turns over weekly. Pin: `models.live_specs` (the read, and its cache),
-  `models.MODELS_SPEC` (the fallback), `models.DEFAULT_MODEL`,
-  `provider.OpencodeProvider.default_model`.
+  A blank model id resolves to the explicit
+  `opencode/muse-spark-1.3-contributor-free` (`models.DEFAULT_MODEL`), NOT
+  the first catalogue key — the live catalogue is in upstream order and
+  turns over weekly. A MENU goes through `provider.models_hint()` instead,
+  which is `models.cached_specs` — the last read this process did — else the
+  static fallback: no I/O, so a row never costs a dead-base timeout and never
+  boots the serve. Pin:
+  `models.live_specs` (the read, and its cache), `models.cached_specs` (the
+  no-I/O menu view), `models.MODELS_SPEC` (the fallback), `models.DEFAULT_MODEL`.
 
 ## Provider lifecycle
 
@@ -138,13 +143,11 @@ is not "unconfigured".
 
 | Method | Purpose |
 |---|---|
-| `models()` | Return `{id: ModelSpec}` catalogue. |
-| `default_model()` | Return default model id (first key, else `""`). |
+| `models()` | Return `{id: ModelSpec}` catalogue. May be a live read that boots a local process (opencode); not for menus. |
+| `models_hint()` | The same catalogue for a MENU row: no I/O, nothing started. Default: `models()`; opencode returns the last read, else the static fallback. |
 | `model_spec(model)` | Case-insensitive spec lookup, else `None`. |
-| `accepts_model(model)` | True when the model is in this catalogue. |
 | `probe_ban(headers, timeout)` | Return `(is_banned, mute_until)`. |
 | `login(email, password, settings)` | Authenticate, return login-result object. |
-| `normalize_token(raw)` | Normalize any pasted token representation. |
 | `warmup(bridge)` | Best-effort startup warmup (default no-op). |
 | `complete(app, pool, prep, first_item, cancel_event=None, on_content=None, on_thinking=None)` | Blocking completion. `cancel_event` is optional and is forwarded as a keyword. **Called by `cli.cmd_chat`** (one-shot chat, which has no cancellation source). |
 | `complete_request(app, pool, prep, item, cancel_event)` | Blocking completion, `cancel_event` required and forwarded positionally. **Called by the non-stream chat route** (`server_routes`). |

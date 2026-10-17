@@ -95,26 +95,15 @@ def drive_retries(
 ) -> None:
     """Run an ordered retry table to fixpoint (one pass per kind, in order).
 
-    Each handler is ``(name, should_retry, recover)``. For each handler in
-    order, while not cancelled and ``should_retry(current_error)`` holds,
-    call ``recover()`` (which must refresh the error via a new attempt), up
-    to ``max_retries`` times. Mirrors the historical five sequential string
-    loops (pow -> invalid-session -> invalid-token -> waf -> overload) with
-    identical ``max_retries``-per-kind semantics; a later handler sees the
-    error left by the earlier one.
-
-    A ``recover()`` that itself raises is contained, not propagated: the
-    recoveries call real work (``DS.solve_pow`` does an HTTP ``fetch_pow``,
-    ``solve_challenge`` raises ``RuntimeError("PoW solver found no answer")``,
-    the WAF refresh warms a browser) and that work failing is NOT the client's
-    actionable error -- the upstream reason is. Letting it escape replaced the
-    real status (503 overload / 502 WAF / 401 token) with an unhandled 500
-    "Exception in ASGI application" on the non-stream path. On failure we
-    log, stop escalating this kind, and hand the *unchanged* error to the next
-    handler, so the terminal ladder still raises the original status. Not
-    swallowed: the request still fails, with the upstream reason.
-    ``HTTPException`` and the cancellation sentinel are exempt -- they are
-    decisions, not malfunctions (see ``_run_recovery``).
+    Each handler is ``(name, should_retry, recover)``: while not cancelled and
+    ``should_retry(current_error)`` holds, call ``recover()`` (which must
+    refresh the error via a new attempt), up to ``max_retries`` times; a later
+    handler sees the error the earlier one left. A raising ``recover()`` is
+    contained by ``_run_recovery`` -- log, stop escalating this kind, hand the
+    unchanged error on -- so a failed recovery cannot replace the decided
+    status (503 overload / 502 WAF / 401 token) with a 500. ``HTTPException``
+    and the cancellation sentinel are exempt: decisions, not malfunctions (see
+    ``_run_recovery`` and core/AGENTS.md).
     """
     try:
         budget = max(0, int(max_retries))
@@ -260,26 +249,21 @@ _SEGMENT_FRAMED_RE = re.compile(
 def scrub_upstream_text(text, limit: int = 800) -> str:
     """Clamp and de-tokenize an upstream body before it leaves the process.
 
-    Upstream error payloads are echoed twice over: into an HTTPException
-    detail (so a third-party API client sees them) and into the server log
-    (so they are written to disk and shipped to any log shipper). Whatever
-    the upstream decided to put in that body travels with them -- an
-    Authorization header it was given, a session id, a captcha token scraped
-    from a login page. The account's own 64-char bearer token is the case
-    that matters: the request that triggered the error is precisely the one
-    carrying it.
+    Runs on every path that can echo an upstream body, always before any
+    truncation (the sink list is core/AGENTS.md's). The body can hold an
+    Authorization header, a session id, a captcha token, or the account's own
+    64-char bearer token -- the failing request is the one carrying it.
 
-    Two redaction shapes, because credentials have two shapes (see
-    ``_SEGMENT_FRAMED_RE``): a long single run of token characters, and a
-    dot-framed token such as a JWT. The framed rule runs FIRST, so a JWT is
-    redacted whole rather than partially (its payload can be long enough to
-    trip the run rule and leak the header next to a ``[redacted]``).
+    Two redaction shapes, one per credential shape (see ``_SEGMENT_FRAMED_RE``
+    and ``_OPAQUE_RUN_RE``); the framed rule runs FIRST so a JWT is redacted
+    whole rather than partially -- its payload can be long enough to trip the
+    run rule and leak the header next to a ``[redacted]``.
 
-    The redaction is otherwise deliberately narrow. Every word an operator
-    diagnoses with survives verbatim (status code, biz_code, the ban/error
-    wording), and the length is hard-clamped so a hostile or broken upstream
-    cannot use the detail as a megabyte of reflected anything. Never raises:
-    this runs on the terminal error path, where raising would replace the real
+    Otherwise the redaction is deliberately narrow: operator-diagnosis words
+    survive verbatim (status code, biz_code, the ban/error wording), the
+    length is hard-clamped so a hostile or broken upstream cannot use the
+    detail as a megabyte of reflected anything, and it never raises -- this
+    runs on the terminal error path, where raising would replace the real
     status with a 500.
     """
     try:
@@ -679,26 +663,22 @@ def complete_with_failover_sync(app, pool, prep: dict, first_item,
     """Run one completion, auto-failing over on ban or broken credentials.
 
     The provider supplies ``run_core(account)`` (its ``_run_completion_core``
-    bound to app/prep/callbacks) and the ban-403 predicate; the engine owns
-    the generic slot lifecycle via ``run_with_failover``: release exactly
-    once per attempt, acquire the next account before retrying, re-raise when
-    no healthy account remains. ``allow_failover=False`` surfaces the first
-    error directly; None reads ``use_multiple_accounts`` from settings.
-    Bans and 401 auth failures are account-specific; other failures belong to
-    the caller/current request.
+    bound to app/prep/callbacks) and the ban-403 predicate; the generic slot
+    lifecycle is ``run_with_failover``'s (see there). ``allow_failover=False``
+    surfaces the first error directly; None reads ``use_multiple_accounts``
+    from settings. Bans and 401 auth failures are account-specific; other
+    failures belong to the caller/current request.
 
-    ``prep``, ``on_content`` and ``on_thinking`` are ACCEPTED AND IGNORED.
-    They are not a live callback seam: the ``run_core`` closure the provider
-    hands in already captured all three (``_run_completion_core(app, account,
-    prep, on_content=..., on_thinking=...)``), and both provider adapters pass
-    them through by keyword. Wiring them up here would apply every delta a
-    second time -- duplicated SSE text and a doubled tool-call JSON payload,
-    which is worse than a crash because the client renders a plausible wrong
-    answer. They are deleted at the top of the body so the next maintainer
-    reads a ``NameError`` risk instead of a plausible-looking dead parameter,
-    and the parameters stay in the signature purely for call compatibility.
-    Do NOT reintroduce a use for them: add a new, explicitly named parameter
-    if the engine ever needs to drive emission itself.
+    ``prep``, ``on_content`` and ``on_thinking`` are ACCEPTED AND IGNORED: the
+    ``run_core`` closure already captured all three (both adapters pass them
+    by keyword), so wiring them up here would apply every delta a second time
+    -- duplicated SSE text and a doubled tool-call JSON payload, which is
+    worse than a crash because the client renders a plausible wrong answer.
+    They are ``del``-ed at the top of the body so the next maintainer reads a
+    ``NameError`` risk instead of a plausible-looking dead parameter; the
+    parameters stay in the signature purely for call compatibility. Do NOT
+    reintroduce a use for them: add a new, explicitly named parameter if the
+    engine ever needs to drive emission itself.
     """
     # Historical call-compatibility only -- see the docstring. Do not use.
     del prep, on_content, on_thinking
@@ -758,12 +738,8 @@ def complete_with_failover_sync(app, pool, prep: dict, first_item,
         except Exception:
             pass
 
-    try:
-        from ..accounts import AccountPool as _Pool
-        _release = _Pool.release
-    except Exception:
-        # unreachable in a working install; release must still be callable.
-        _release = lambda _item: None  # noqa: E731
+    from ..accounts import AccountPool as _Pool
+    _release = _Pool.release
 
     result = run_with_failover(
         pool,
@@ -927,7 +903,8 @@ def generic_terminal_handlers(kind, label: str, *, upstream=None) -> dict:
 
 def dispatch_terminal(classify_fn: Callable[[str | None], object],
                       handlers: dict, app, item, prep: dict,
-                      token: str | None, error: str, *extra) -> None:
+                      token: str | None, error: str,
+                      login_note, ban_until) -> None:
     """Map a terminal completion error to its HTTP status. Always raises.
 
     Single dispatch: ``classify_fn`` (the provider's ``classify_error``)
@@ -937,8 +914,7 @@ def dispatch_terminal(classify_fn: Callable[[str | None], object],
     Uniform terminal contract (all providers): handlers take
     ``(app, item, prep, token, error, login_note, ban_until)``. Providers
     without a browser note pass ``login_note=None``; providers without a
-    ban envelope pass ``ban_until=None``. ``*extra`` keeps old 6-arg
-    callers working during migration, but new code passes both.
+    ban envelope pass ``ban_until=None``.
 
     No fallback handler: every provider's ``_TERMINAL_HANDLERS`` is total
     over its own ``RetryKind``, and this is only reached under ``if error:``
@@ -946,7 +922,8 @@ def dispatch_terminal(classify_fn: Callable[[str | None], object],
     is therefore a provider bug, and ``KeyError`` names it at once instead of
     quietly answering a wrong status.
     """
-    handlers[classify_fn(error)](app, item, prep, token, error, *extra)
+    handlers[classify_fn(error)](app, item, prep, token, error, login_note,
+                                 ban_until)
 
 
 # --- Stream bridge (producer/consumer shared by every provider) -------------
@@ -1080,8 +1057,6 @@ async def parse_stream_calls(prep: dict, content: str,
     ``core.openai._resolve_parse_fn`` soft lookup (server patch wins when
     loaded, else the real parser).
     """
-    _real_parse = None
-    _real_ex = None
     from .openai import _resolve_parse_fn
     parse_fn, _real_parse, _real_ex = _resolve_parse_fn(parse_fn)
     if truncated_fn is None:
@@ -1096,14 +1071,10 @@ async def parse_stream_calls(prep: dict, content: str,
     if limit:
         kwargs["max_args_chars"] = limit
     if parse_fn is _real_parse and _real_ex is not None:
-        try:
-            res = await asyncio.to_thread(
-                _real_ex, content, prep["tools"], **kwargs)
-            calls, remaining = res.calls, res.rest
-            dropped, diagnostics = res.dropped, res.diagnostics
-        except Exception:
-            calls, remaining = await asyncio.to_thread(
-                parse_fn, content, prep["tools"], **kwargs)
+        res = await asyncio.to_thread(
+            _real_ex, content, prep["tools"], **kwargs)
+        calls, remaining = res.calls, res.rest
+        dropped, diagnostics = res.dropped, res.diagnostics
     else:
         calls, remaining = await asyncio.to_thread(
             parse_fn, content, prep["tools"], **kwargs)
@@ -1117,10 +1088,11 @@ async def parse_stream_calls(prep: dict, content: str,
             logger.warning("stream tool call looks truncated model=%s preview=%.200s",
                            prep.get("model"), (content or "")[:200])
         else:
-            # Rich miss log, single home in core.openai._alog_tool_miss: the
+            # Rich miss log, single home in core.openai._log_tool_miss: the
             # diagnostics trail says unknown-name vs oversize vs format drift.
-            from .openai import _alog_tool_miss
-            await _alog_tool_miss(prep, content, diagnostics, where="stream")
+            from .openai import _log_tool_miss
+            await asyncio.to_thread(_log_tool_miss, prep, content,
+                                    diagnostics, where="stream")
     elif dropped:
         from .openai import _log_tool_dropped
         _log_tool_dropped(prep, dropped, where="stream")

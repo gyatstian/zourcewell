@@ -446,8 +446,7 @@ def register_routes(app: FastAPI) -> None:
         _reject_token_shaped_identifier(ident)
         _check_auth(settings, authorization)
         pool = _server()._pool(app)
-        if not ident or ident.lower() in ("none", "all", "auto"):
-
+        if not ident:
             # Only persist an actual change. An empty body used to assign ""
             # and run a full Settings.save (mkstemp + fsync + os.replace) on
             # every call, so a UI polling select turned into a config write
@@ -723,11 +722,7 @@ def _check_auth(settings: Settings, authorization: str) -> None:
 
 
 def _sync_pool_current(pool: AccountPool, settings) -> None:
-    """Single sync path: pool CURRENT <-> settings.active_account + save.
-
-    Replaces the inline sync_current_from_settings + settings.save() copies
-    below. Signatures/persistence unchanged.
-    """
+    """Single sync path: pool CURRENT <-> settings.active_account + save."""
     from .accounts import sync_current_from_settings
     try:
         if sync_current_from_settings(pool, settings):
@@ -812,7 +807,7 @@ def _pool(app: FastAPI) -> AccountPool:
         current = pools.current_for(settings, selected)
         if current and not any(_matches(a, current) for a in accounts):
             current = ""
-        pool = AccountPool(accounts, current=current)
+        pool = AccountPool(accounts, current=current, provider=selected)
         cache[selected] = pool
     elif not pools.is_multi(settings):
         # Single provider follows settings.active_account; multi keeps each
@@ -986,7 +981,7 @@ def _parse_reasoning_effort(body: dict):
         # The resolved local, never body["reasoning_effort"]: the nested
         # ``reasoning.effort`` spelling is what agent harnesses send, and
         # returning the flat key made that form lose the warning entirely
-        # (server_routes.py:932 returned None for it). This is the normalized
+        # (server_routes.py:984-993 returned None for it). This is the normalized
         # value (stripped + lowercased), which is the spelling that was
         # actually compared against the built-in variants above, so the log
         # quotes exactly the token that was rejected.
@@ -994,7 +989,7 @@ def _parse_reasoning_effort(body: dict):
     return reasoning_effort, None
 
 
-# `stream` spellings, mirroring config.py:479-487 (`_bool`): the same
+# `stream` spellings, mirroring config.py:919-922 (`_bool`): the same
 # truthy/falsy token sets the operator's env and config.json already use, so
 # there is one table in the project rather than one per call site.
 _TRUTHY_TOKENS = ("1", "true", "yes", "on")
@@ -1077,14 +1072,6 @@ def _extract_passthrough(body: dict) -> dict:
     if invalid_raw is not None:
         unsupported["reasoning_effort"] = invalid_raw
     return {
-        "temperature": body.get("temperature"),
-        "top_p": body.get("top_p"),
-        "max_tokens": _max_tok,
-        "stop": body.get("stop"),
-        "n": _n,
-        "presence_penalty": body.get("presence_penalty"),
-        "frequency_penalty": body.get("frequency_penalty"),
-        "response_format": _rf,
         "stream_options": stream_options,
         "reasoning_effort": reasoning_effort,
         "unsupported": unsupported,
@@ -1096,7 +1083,7 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
 
     Steps (each in its helper above; dry_run reuses this): validate messages,
     resolve model->provider, gate tools, render prompt + appends, collect
-    OpenAI passthrough/unsupported. Return shape unchanged (21 keys).
+    OpenAI passthrough/unsupported. Return shape unchanged.
     Provider dispatch below (registry.get(prep["provider"])) is the prior
     boundary-wave injection point — kept as-is.
     """
@@ -1135,14 +1122,6 @@ def _prepare(body: dict, settings: Settings | None = None) -> dict:
         "thinking": thinking, "search": search, "model_type": model_type,
         "reasoning_effort": passthrough["reasoning_effort"],
         "provider": provider.id,
-        "temperature": passthrough["temperature"],
-        "top_p": passthrough["top_p"],
-        "max_tokens": passthrough["max_tokens"],
-        "stop": passthrough["stop"],
-        "n": passthrough["n"],
-        "presence_penalty": passthrough["presence_penalty"],
-        "frequency_penalty": passthrough["frequency_penalty"],
-        "response_format": passthrough["response_format"],
         "stream_options": passthrough["stream_options"],
         "unsupported_params": unsupported,
     }

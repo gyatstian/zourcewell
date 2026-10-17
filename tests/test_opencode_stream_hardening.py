@@ -4,13 +4,13 @@ Five defects, each pinned by a test that fails on the pre-change code:
 
 * **The consumer watchdog was one socket read in both stream modes.** In
   ``stream_mode: buffered`` (and in ``live`` *with* tools, where content
-  deltas are deliberately suppressed at completion_service.py:528) the
+  deltas are deliberately suppressed at completion_service.py:475) the
   producer emits nothing while the whole turn runs, so the 190 s watchdog was
   structurally smaller than the producer's own budget
   (create 30 + turn 180 + one overload retry 180) and a valid, fully
   assembled reply was answered ``{"error": {"message": "upstream timed out"}}``
   and thrown away. ``ARCHITECTURE.md`` makes the multiplier a cross-provider
-  contract; DeepSeek honours it (providers/deepseek/completion_service.py:1156)
+  contract; DeepSeek honours it (providers/deepseek/completion_service.py:1157)
   and opencode did not. The budget was also sized off the raw
   ``OC.DEFAULT_TIMEOUT`` while the producer honoured
   ``DEEPSEAPORT_OPENCODE_TIMEOUT``, so a raised knob reopened the same hole.
@@ -32,7 +32,7 @@ Five defects, each pinned by a test that fails on the pre-change code:
   cwd and its per-boot basic-auth password -- for the life of the bridge. The
   reuse probe is a 2 s health GET, so an *unresponsive* serve (not a dead
   one) missed it and booted a replacement on a new port. ``ensure()`` runs
-  from every serve-down error path (completion_service.py:202, 288), so these
+  from every serve-down error path (completion_service.py:145, 226), so these
   accumulated. The not-ready path compounded it: ``terminate()`` with no
   ``wait()``, and ``_proc`` never assigned, so nothing would ever reap that
   child either.
@@ -41,7 +41,10 @@ Five defects, each pinned by a test that fails on the pre-change code:
   took that for death: it killed the recorded pid / replaced the tracked
   child, ending every in-flight turn on a healthy serve and orphaning their
   SSE readers. Both reuse decisions now retry (``managed_serve._probe_alive``)
-  before declaring death.
+  before declaring death -- and the recorded-pid decision narrows to ONE
+  attempt when the OS reports that pid gone, because a process that no longer
+  exists cannot be the busy serve the retries are for. On a host where even a
+  refused connect costs seconds, that narrowing is most of a startup.
 
 No network, no opencode binary, no credentials: the serve is a fake
 ``urlopen()`` and every process is a fake ``Popen``.
@@ -52,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import subprocess
 import time
 import types
@@ -770,10 +774,17 @@ def test_one_missed_probe_is_not_proof_of_death(monkeypatch, tmp_path):
 
 
 def test_a_missed_probe_on_the_port_file_base_is_retried_too(monkeypatch, tmp_path):
-    """The second reuse decision (another worker's recorded base) retries too."""
+    """The second reuse decision (another worker's recorded base) retries too.
+
+    The recorded pid is forced alive because that is the premise of the
+    protection: the retries exist for a serve whose process EXISTS and is too
+    busy to answer. A provably dead one narrows to a single attempt
+    (``test_a_dead_recorded_pid_narrows_the_reuse_probe_to_one_attempt``).
+    """
     monkeypatch.setenv("DEEPSEAPORT_OPENCODE_BASE", "")
     monkeypatch.setenv("DEEPSEAPORT_OPENCODE_MANAGED", "1")
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
+    monkeypatch.setattr(MS, "_pid_alive", lambda pid: True, raising=False)
     (tmp_path / "m").mkdir(parents=True, exist_ok=True)
     old_base = "http://127.0.0.1:41000"
     MS._write_port_file(tmp_path / "m" / "serve.json", old_base, "old-pw",
@@ -797,6 +808,84 @@ def test_a_missed_probe_on_the_port_file_base_is_retried_too(monkeypatch, tmp_pa
         assert MS.ensure(timeout=1.0) == old_base
 
     assert killed == []
+
+
+def test_a_dead_recorded_pid_narrows_the_reuse_probe_to_one_attempt(
+        monkeypatch, tmp_path):
+    """A provably dead recorded serve cannot be the busy one.
+
+    The retry ladder protects a live-but-busy serve, which requires the
+    recorded process to exist; when the OS says it is gone, its single failed
+    probe is decisive. That keeps a restart cheap on a host where even a
+    refused connect costs seconds instead of returning instantly.
+    """
+    attempts: list[str] = []
+    killed: list[int] = []
+    _stub_managed_boot(monkeypatch, tmp_path, healthy_bases={NEW_BASE})
+    (tmp_path / "m").mkdir(parents=True, exist_ok=True)
+    old_base = "http://127.0.0.1:41000"
+    MS._write_port_file(tmp_path / "m" / "serve.json", old_base, "old-pw",
+                        4242, MS._config_hash())
+
+    def _probe(base, pw, timeout=2.0):
+        attempts.append(base)
+        return base == NEW_BASE
+
+    monkeypatch.setattr(MS, "_probe", _probe)
+    monkeypatch.setattr(MS, "_pid_alive", lambda pid: False, raising=False)
+    monkeypatch.setattr(MS, "_kill_pid", lambda pid: killed.append(pid))
+
+    with _managed_state():
+        assert MS.ensure(timeout=1.0) == NEW_BASE
+
+    assert attempts.count(old_base) == 1, attempts
+    assert killed == [4242], killed
+
+
+def test_reuse_upgrades_a_legacy_cleartext_port_file(monkeypatch, tmp_path):
+    """The first reuse re-records a file an older build left cleartext.
+
+    A reused serve is the norm (the file names it while it lives), so without
+    this upgrade the cleartext form -- and the one-shot ACL warning that
+    describes it -- would survive every restart that does not happen to boot
+    fresh. POSIX already writes the form it reads and is left alone, and an
+    already-upgraded file is not rewritten either: a second writer per boot
+    would only widen the last-writer-wins window a concurrent boot has.
+    """
+    old_base = "http://127.0.0.1:41000"
+    calls: list[tuple] = []
+    _stub_managed_boot(monkeypatch, tmp_path, healthy_bases={old_base})
+    (tmp_path / "m").mkdir(parents=True, exist_ok=True)
+    serve_json = tmp_path / "m" / "serve.json"
+    serve_json.write_text(json.dumps(
+        {"base": old_base, "password": "old-pw", "pid": 4242,
+         "config_hash": MS._config_hash()}), encoding="utf-8")
+    monkeypatch.setattr(MS, "_pid_alive", lambda pid: True, raising=False)
+    real_write = MS._write_port_file
+
+    def _write(port_file, base, password, pid, config_hash):
+        calls.append((base, password, pid, config_hash))
+        real_write(port_file, base, password, pid, config_hash)
+
+    monkeypatch.setattr(MS, "_write_port_file", _write)
+
+    with _managed_state():
+        assert MS.ensure(timeout=1.0) == old_base
+
+    if os.name == "nt":
+        assert calls == [(old_base, "old-pw", 4242, MS._config_hash())], calls
+        assert "password_dpapi" in serve_json.read_text(encoding="utf-8")
+    else:
+        assert calls == [], "POSIX already writes the form it reads"
+    assert MS._read_port_file(serve_json) == (
+        old_base, "old-pw", 4242, MS._config_hash())
+
+    # Second reuse: nothing left to upgrade, so nothing is written.
+    calls.clear()
+    with _managed_state():
+        assert MS.ensure(timeout=1.0) == old_base
+
+    assert calls == [], calls
 
 
 def test_confirmed_death_reaps_after_all_probe_attempts(monkeypatch, tmp_path):

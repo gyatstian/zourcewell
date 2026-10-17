@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
 
 from ..common import (
@@ -16,8 +15,6 @@ from ..common import (
     _normalize_dsml_text,
     _strip_spans,
 )
-
-logger = logging.getLogger("deepseaport.tools")
 
 
 def _coerce_dsml_value(value: str, string_attr: str | None):

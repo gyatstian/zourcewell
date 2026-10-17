@@ -373,7 +373,7 @@ def test_parse_tail_content_after_finished_delta_not_lost():
     assert [(e.kind, e.text) for e in _evs(line)] == [
         ("content", "tail"), ("finished", "")]
     # Next line after the finished line is still surfaced (stateless parser).
-    parser = QP.QwenStreamParser()
+    parser = QSP.QwenStreamParser()
     assert [e.kind for e in parser.feed(
         'data: {"choices":[{"delta":{"status":"finished"}}]}')] == ["finished"]
     assert [(e.kind, e.text) for e in parser.feed(
@@ -444,7 +444,7 @@ def test_parse_garbage_no_events():
 
 
 def test_stream_parser_feed_matches_parse():
-    parser = QP.QwenStreamParser()
+    parser = QSP.QwenStreamParser()
     evs = list(parser.feed('data: {"choices":[{"delta":{"phase":"answer","content":"Hi"}}]}'))
     assert [(e.kind, e.text) for e in evs] == [("content", "Hi")]
     assert [e.kind for e in parser.feed('data: {"done":true}')] == ["finished"]
@@ -729,7 +729,7 @@ def test_fetch_models_exception(monkeypatch):
 # provider -------------------------------------------------------------------
 
 
-def test_provider_models_and_default():
+def test_provider_models():
     p = QProv.QwenProvider()
     models = p.models()
     assert set(models) == {"qwen3.7-plus", "qwen3.8-max", "qwen3.8-omni-flash"}
@@ -739,13 +739,6 @@ def test_provider_models_and_default():
     assert models["qwen3.8-max"].search is True
     assert models["qwen3.8-omni-flash"].thinking is True
     assert models["qwen3.8-omni-flash"].search is False
-    assert p.default_model() == "qwen3.7-plus"
-
-
-def test_provider_normalize_token():
-    p = QProv.QwenProvider()
-    assert p.normalize_token('{"value":"tok64"}') == "tok64"
-    assert p.normalize_token("tok64") == "tok64"
 
 
 def test_provider_probe_ban_never_raises(monkeypatch):
@@ -1407,10 +1400,8 @@ def test_token_expired_persisted_and_jwt():
     assert QA.is_expired(now + 3600, now=now) is False
 
 
-def test_unpack_login_result_ex_roundtrip():
-    assert QA.unpack_login_result_ex(("tok", 999.0, False, "")) == ("tok", 999.0, False, "")
+def test_unpack_login_result_drops_expiry_from_4_tuple():
     assert QA.unpack_login_result(("tok", 999.0, False, "")) == ("tok", False, "")
-    assert QA.unpack_login_result_ex(("tok", False, "")) == ("tok", None, False, "")
 
 
 # ban probe: check_ban verdict -------------------------------------------------

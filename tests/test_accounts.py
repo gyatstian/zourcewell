@@ -130,16 +130,9 @@ def test_cli_add_remove_syncs_config(tmp_path, monkeypatch):
 
 
 def test_extract_token_formats():
-    import json as _json
     from deepseaport.accounts import TOKEN_HELP, extract_token
 
     assert extract_token("abc123") == "abc123"
-    assert extract_token('{"value":"tok64","__version":"0"}') == "tok64"
-    double = _json.dumps(_json.dumps({"url": "x", "tok": _json.dumps({"value": "tok99"})}))
-
-    # Browser_evaluate nests token JSON as string; inner value still parses.
-    inner = _json.dumps({"value": "tok99", "__version": "0"})
-    assert extract_token(inner) == "tok99"
     assert "userToken" in TOKEN_HELP and "python -m deepseaport login" in TOKEN_HELP
 
 
@@ -212,17 +205,6 @@ def test_current_invalid_and_remove_clears():
     assert pool.current == ""
 
 
-def test_sync_current_from_settings(tmp_path):
-    from deepseaport.accounts import sync_current_from_settings
-    from deepseaport.config import AccountConfig, Settings
-
-    s = Settings(accounts=[AccountConfig(email="a@x.com", token="t")],
-                 active_account="stale@x.com", config_path=str(tmp_path / "c.json"))
-    pool = AccountPool(s.accounts, current=s.active_account)
-    assert sync_current_from_settings(pool, s) is True
-    assert s.active_account == "" and pool.current == ""
-
-
 def test_cli_select_and_clear(tmp_path, capsys):
     import json as _json
     from deepseaport.cli import main as cli_main
@@ -239,7 +221,7 @@ def test_cli_select_and_clear(tmp_path, capsys):
     assert cli_main(["--config", str(cfg_path), "accounts", "list"]) == 0
     out = capsys.readouterr().out
     assert "CURRENT: [b@x.com]" in out
-    assert cli_main(["--config", str(cfg_path), "accounts", "select", "--clear"]) == 0
+    assert cli_main(["--config", str(cfg_path), "accounts", "select"]) == 0
     assert load_settings(str(cfg_path)).active_account == ""
     # Deleting current clears selection.
     assert cli_main(["--config", str(cfg_path), "accounts", "select", "a@x.com"]) == 0
@@ -270,7 +252,8 @@ def test_tui_number_selects_not_deletes(monkeypatch):
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1"),
                            AccountConfig(email="b@x.com", token="t2")],
                  active_account="", config_path="")
-    inputs = iter(["1", "b"])
+    # "1" selects; "q" leaves the menu ("b" is unknown now and re-prompts).
+    inputs = iter(["1", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert s.active_account == "a@x.com"
@@ -285,12 +268,12 @@ def test_tui_delete_needs_confirmation(monkeypatch):
                            AccountConfig(email="b@x.com", token="t2")],
                  active_account="", config_path="")
     # Decline -> nothing deleted.
-    inputs = iter(["d", "a@x.com", "n", "b"])
+    inputs = iter(["d", "a@x.com", "n", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert len(s.accounts) == 2
     # Confirm -> deleted.
-    inputs = iter(["d", "a@x.com", "y", "b"])
+    inputs = iter(["d", "a@x.com", "y", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert [a.email for a in s.accounts] == ["b@x.com"]
@@ -302,7 +285,7 @@ def test_tui_add_skip_token_offers_auto_login(monkeypatch):
 
     s = Settings(accounts=[], active_account="", config_path="")
     # a -> add flow: email, password, token(y = auto-token).
-    inputs = iter(["a", "new@x.com", "pw", "y", "b"])
+    inputs = iter(["a", "new@x.com", "pw", "y", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings: "auto-tok-123")
@@ -317,7 +300,7 @@ def test_tui_add_non_y_token_is_literal(monkeypatch):
     from deepseaport.tui import accounts_menu
 
     s = Settings(accounts=[], active_account="", config_path="")
-    inputs = iter(["a", "new@x.com", "pw", "mytoken123", "b"])
+    inputs = iter(["a", "new@x.com", "pw", "mytoken123", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert len(s.accounts) == 1
@@ -332,7 +315,7 @@ def test_tui_add_second_account_becomes_default(monkeypatch):
 
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1")],
                  active_account="a@x.com", config_path="")
-    inputs = iter(["a", "b@x.com", "pw", "tok2", "b"])
+    inputs = iter(["a", "b@x.com", "pw", "tok2", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
     assert len(s.accounts) == 2

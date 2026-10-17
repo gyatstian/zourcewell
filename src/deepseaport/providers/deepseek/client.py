@@ -13,10 +13,7 @@ from . import pow as PoW
 from . import protocol as P
 from ...core import engine as _engine
 from ...core import transport as T
-# Backward-compat re-exports: canonical SSE parsing lives in sse_parser.py,
-# header/payload helpers in protocol.py — still importable from client.
-from .protocol import base_headers, bridge_headers, completion_payload, parse_json  # noqa: F401
-from .sse_parser import StreamEvent, StreamParser, parse_sse_line  # noqa: F401
+from .sse_parser import StreamParser
 
 logger = logging.getLogger("deepseaport.client")
 

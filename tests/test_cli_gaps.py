@@ -1,8 +1,9 @@
 """Offline gap tests for deepseaport.cli (no network, no browser, no server).
 
-Covers cmd_login / cmd_chat / cmd_waf / cmd_models / cmd_accounts,
-_scan_free_ports / _next_free_port / _ensure_free_port / _run_server /
-_watch_stop_keys, and main() dispatch. All config goes to tmp_path.
+Covers cmd_login / cmd_chat / cmd_waf / cmd_models / cmd_accounts, the port
+helpers (_next_free_port / _ensure_free_port / _run_server, plus the
+server_runner._scan_free_ports they build on), and main() dispatch. All config
+goes to tmp_path.
 """
 
 from __future__ import annotations
@@ -21,11 +22,10 @@ from deepseaport.cli import (
     _ensure_free_port,
     _next_free_port,
     _run_server,
-    _scan_free_ports,
-    _watch_stop_keys,
     cmd_accounts,
     main as cli_main,
 )
+from deepseaport.server_runner import _scan_free_ports
 
 
 def _load(path):
@@ -58,7 +58,8 @@ def test_login_banned_with_token_returns_3_and_persists_banned(tmp_path, monkeyp
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda email, password, settings: ("tok-banned", True, "suspended"))
-    monkeypatch.setattr(acc_mod, "check_ban_for_token", lambda token, timeout=12: (True, None))
+    monkeypatch.setattr(acc_mod, "check_ban_for_token",
+                        lambda token, timeout=12, provider="deepseek": (True, None))
     rc = cli_main(["--config", cfg, "login", "--email", "b@x.com", "--password", "pw"])
     assert rc == 3
     s = _load(cfg)
@@ -116,7 +117,7 @@ def _patch_banned_login(monkeypatch, expires_at: float):
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda email, password, settings: ("tok-banned", True, "suspended"))
     monkeypatch.setattr(acc_mod, "check_ban_for_token",
-                        lambda token, timeout=12: (True, expires_at))
+                        lambda token, timeout=12, provider="deepseek": (True, expires_at))
 
 
 def test_login_expiry_line_omitted_when_formatter_returns_empty(
@@ -594,7 +595,7 @@ def test_accounts_select_clear(tmp_path):
     cfg = write_config(tmp_path, {"keys": [], "accounts": [
         {"email": "a@x.com", "token": "t1"},
     ], "active_account": "a@x.com"})
-    assert cli_main(["--config", cfg, "accounts", "select", "--clear"]) == 0
+    assert cli_main(["--config", cfg, "accounts", "select"]) == 0
     assert _load(cfg).active_account == ""
 
 
@@ -713,27 +714,12 @@ def test_run_server_single_worker_uses_uvicorn_run(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_mod, "_ensure_free_port", lambda s, h, p: p)
 
     s = Settings(port=5001, log_level="INFO", config_path=str(tmp_path / "c.json"))
-    args = argparse.Namespace(host="", port=0, workers=1)
+    args = argparse.Namespace(host="", port=0)
     assert _run_server(s, args) == 0
     assert captured.get("ran") is True
     assert captured.get("port") == 5001
     assert captured.get("host") == "127.0.0.1"
     assert "run_called" not in captured  # the multi-worker uvicorn.run path is gone
-
-
-def test_watch_stop_keys_never_raises_with_exited_server():
-    srv = types.SimpleNamespace(should_exit=True)
-    _watch_stop_keys(srv)  # must not raise
-    assert srv.should_exit is True
-
-
-def test_watch_stop_keys_broken_server_never_raises():
-    class _Boom:
-        @property
-        def should_exit(self):
-            raise RuntimeError("boom")
-
-    _watch_stop_keys(_Boom())  # must not raise
 
 
 # main dispatch -------------------------------------------------------------------
@@ -789,20 +775,6 @@ def test_main_waf_models_accounts_dispatch(tmp_path, monkeypatch):
     assert cli_mod.main(["--config", cfg, "models"]) == 12
     monkeypatch.setattr(cli_mod, "cmd_accounts", lambda args: 13)
     assert cli_mod.main(["--config", cfg, "accounts", "list"]) == 13
-
-
-def test_ensure_free_port_free_returns_same(tmp_path):
-    import deepseaport.cli as cli_mod
-    from deepseaport.config import Settings
-
-    s = Settings(port=5010, config_path=str(tmp_path / "c.json"))
-    # Loopback high ports are almost always free; but stub to be deterministic.
-    orig = cli_mod._is_port_free
-    try:
-        cli_mod._is_port_free = lambda host, port: True
-        assert _ensure_free_port(s, "127.0.0.1", 5010) == 5010
-    finally:
-        cli_mod._is_port_free = orig
 
 
 def test_scan_free_ports_negative_start_clamped():
@@ -885,7 +857,7 @@ def test_run_server_garbage_settings_port_uses_default(tmp_path, monkeypatch):
 
     s = Settings(port="not-a-port", log_level="INFO",
                  config_path=str(tmp_path / "c.json"))
-    args = argparse.Namespace(host="", port=0, workers=1)
+    args = argparse.Namespace(host="", port=0)
     assert _run_server(s, args) == 0
     assert captured.get("ran") is True
     assert captured.get("port") == 5001
@@ -1013,7 +985,7 @@ def test_cmd_serve_survives_missing_stdin(monkeypatch, tmp_path):
         return 0
 
     monkeypatch.setattr(cli_mod, "_run_server", _serve)
-    args = argparse.Namespace(config=cfg, host="", port=0, workers=1,
+    args = argparse.Namespace(config=cfg, host="", port=0,
                               no_tui=False, cmd="serve",
                               provider=None, providers=None)
     assert cli_mod.cmd_serve(args) == 0
@@ -1037,7 +1009,7 @@ def test_cmd_serve_still_opens_tui_on_a_real_tty(monkeypatch, tmp_path):
     monkeypatch.setattr(_sys, "stdin", _Tty())
     monkeypatch.setattr(tui_mod, "provider_menu", lambda s: None)
     monkeypatch.setattr(tui_mod, "main_menu", lambda *a, **k: 0)
-    args = argparse.Namespace(config=cfg, host="", port=0, workers=1,
+    args = argparse.Namespace(config=cfg, host="", port=0,
                               no_tui=False, cmd="serve",
                               provider=None, providers=None)
     assert cli_mod.cmd_serve(args) == 0

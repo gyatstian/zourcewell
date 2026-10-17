@@ -1,7 +1,7 @@
 """Cursor-aware multiline editor for the TUI (extracted from tui.py).
 
 Stdlib-only, no Settings/config imports so provider/settings menus stay
-readable in tui.py. tui.py re-exports every name for backward
+readable in tui.py. tui.py re-exports _read_interactive for backward
 compatibility (tests do tui._read_interactive).
 """
 
@@ -30,8 +30,9 @@ def _stdin_is_tty() -> bool:
 
     The lowest-level terminal helper in the package (this module imports
     nothing from deepseaport), so tui and cli reuse it instead of each spelling
-    their own probe. getattr-style because sys.stdin is None under pythonw.exe
-    and some frozen launchers, where a bare sys.stdin.isatty() raises.
+    their own probe; cli imports it from here. getattr-style because
+    sys.stdin is None under pythonw.exe and some frozen launchers, where a
+    bare sys.stdin.isatty() raises.
     """
     _stdin = getattr(sys, "stdin", None)
     try:
@@ -443,7 +444,6 @@ def _decode_posix_special(seq: str) -> str:
         if final in ("F",):
             return "end"
         if final == "~":
-            num = "".join(c for c in body[:-1] if c.isdigit() or c == ";")
             first = (body[:-1].split(";")[0] or "")
             if first in ("3",):
                 return "delete"
@@ -451,7 +451,6 @@ def _decode_posix_special(seq: str) -> str:
                 return "home"
             if first in ("4", "8"):
                 return "end"
-            _ = num
             return "unknown"
         return "unknown"
     if seq.startswith("O"):

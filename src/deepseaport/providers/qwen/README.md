@@ -21,7 +21,6 @@ All on `https://chat.qwen.ai` unless noted. `BASE` overridable via
 | `/api/v2/chats/new` | POST | yes | `{chatId:"", models:[m], project_id, timestamp, chat_type, chat_mode:"normal"}` → `{success:true, data:{id}}`; WAF-gated |
 | `/api/v2/chats/{id}` | DELETE | yes | delete chat (JS-grep); WAF-gated |
 | `/api/v2/chat/completions?chat_id=<chat_id>` | POST | yes | `?chat_id=` query param REQUIRED (missing → `RequestValidationError: Field 'query -> chat_id': Field required`); needs `X-Accel-Buffering: no`; WAF-gated |
-| `/api/v2/chat/completions/stop` | POST | yes | `{chat_id,...}` (JS-grep); endpoint constant `protocol.CHAT_COMPLETIONS_STOP_URL` is kept as documented protocol surface, but the `client.stop_completion` helper that called it is **gone** (zero callers in `src/`) — so nothing in deepseaport stops a completion upstream today |
 | `/api/v2/chat/completions?chat_id=..&message_id=..` | GET | yes | stream resume (`responseType:"stream"`) — **NOT implemented**, `# TODO(unverified)` |
 
 ## Login (live-verified)

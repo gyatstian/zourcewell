@@ -8,7 +8,7 @@ name = "deepseaport"
 # __version__ from this file, deepseaport.spec stamps it into the frozen exe,
 # and every bump happens here and only here.
 version = "0.28"
-description = "Unofficial DeepSeek web2api: OpenAI-compatible API over chat.deepseek.com, WAF handled via Obscura headless browser, stable tool_calls for agentic harnesses."
+description = "Unofficial web2api bridge: OpenAI-compatible API over the DeepSeek, Qwen and opencode chat backends, with stable tool_calls for agentic harnesses. Research/educational use only."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
@@ -49,12 +49,6 @@ Source = "https://github.com/gyatstian/deepseaport"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-# Nothing at runtime reads these; they ride along so the wheel is the same tree
-# as the checkout (cosmetic — the repo root temple.png cannot be package data,
-# it is not inside any package).
-"deepseaport.providers.qwen" = ["*.txt"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Import the package from this checkout, never from an installed copy
@@ -64,8 +58,7 @@ pythonpath = ["src"]
 markers = [
   "live: needs real network / real browser / real upstream account (opt in with `pytest -m live`)",
 ]
-# (Deliberately NOT in addopts: see README "Development" - a `-m` there cannot
-# be overridden by a command-line `-m`, which would silently break `-m live`.)
+# Never express the live tier as addopts - why: tests/AGENTS.md.
 filterwarnings = [
   # fastapi's TestClient is built on starlette's httpx shim, which warns about
   # the upcoming httpx2 switch on import. Not actionable from this project.

@@ -11,7 +11,7 @@ override all three and delegate to its own ``completion_service``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -23,7 +23,6 @@ class ModelSpec:
     search: bool = False
     model_type: str = "default"
     owned_by: str = ""
-    capabilities: dict = field(default_factory=dict)
 
 
 class Provider(ABC):
@@ -54,12 +53,17 @@ class Provider(ABC):
         """Return this provider's model catalogue keyed by model id."""
         raise NotImplementedError
 
-    def default_model(self) -> str:
-        """Return the default model id (first catalogue key, else empty)."""
-        models = self.models()
-        for mid in models:
-            return mid
-        return ""
+    def models_hint(self) -> dict[str, ModelSpec]:
+        """Catalogue for a menu row: no I/O, nothing started, nothing waited on.
+
+        ``models()`` may be a LIVE read that boots a local process to answer
+        (opencode's managed serve), and a menu has no business starting one --
+        nor paying a read whose failure costs a socket timeout -- for a list.
+        Defaults to ``models()``, an in-process read for every provider that
+        does not override it, so a hint may be older than ``models()`` -- that
+        is the trade it makes.
+        """
+        return self.models()
 
     def model_spec(self, model: str) -> ModelSpec | None:
         """Case-insensitive lookup of a model spec; None when unknown."""
@@ -71,20 +75,12 @@ class Provider(ABC):
                 return spec
         return None
 
-    def accepts_model(self, model: str) -> bool:
-        """True when the model is present in this provider's catalogue."""
-        return self.model_spec(model) is not None
-
     def probe_ban(self, headers: dict, timeout: int = 20) -> tuple[bool, float | None]:
         """Return (is_banned, mute_until) for the given auth headers."""
         raise NotImplementedError
 
     def login(self, email: str, password: str, settings) -> object:
         """Authenticate and return a LoginResult-like object for an account."""
-        raise NotImplementedError
-
-    def normalize_token(self, raw) -> str:
-        """Return a usable raw token from any pasted representation."""
         raise NotImplementedError
 
     def warmup(self, bridge) -> None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 
 from ..common import (
@@ -12,8 +11,6 @@ from ..common import (
     _loads_json_lenient,
     _strip_spans,
 )
-
-logger = logging.getLogger("deepseaport.tools")
 
 # Open/close literals in one alternation. The old lazy-body regex retried at
 # every later position when an open had no close (quadratic: 176KB of bare

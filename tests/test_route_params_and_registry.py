@@ -3,7 +3,7 @@
 Five defects, one file each section:
 
 * **R1** ``_parse_reasoning_effort`` returned ``body["reasoning_effort"]`` on
-  the invalid path (server_routes.py:932). The nested ``{"reasoning":
+  the invalid path (server_routes.py:984-993). The nested ``{"reasoning":
   {"effort": ...}}`` spelling that agent harnesses send therefore warned
   about nothing: ``unsupported["reasoning_effort"]`` stayed unset, so the
   per-request "ignoring unsupported OpenAI params" line never mentioned it.
@@ -251,10 +251,15 @@ def test_tool_choice_forcing_a_call_is_reported(choice):
 # --- R5: hostile n / stream_options -------------------------------------------
 
 
-@pytest.mark.parametrize("value", ["many", {}, [], 2.7, None, "2", 0, True])
-def test_hostile_n_is_coerced_not_raised(value):
+@pytest.mark.parametrize("value,reported", [
+    # The coerced int itself has no reader in prep; what a caller can observe
+    # is the warn-and-drop accounting: a value that reads as something other
+    # than 1 is named there, everything else is silently read as 1.
+    ("many", False), ({}, False), ([], False), (2.7, True), (None, False),
+    ("2", True), (0, False), (True, False)])
+def test_hostile_n_is_coerced_not_raised(value, reported):
     prep = _prepare(_body(n=value), _settings())
-    assert isinstance(prep["n"], int)
+    assert ("n" in prep["unsupported_params"]) is reported
 
 
 @pytest.mark.parametrize("value", ["x", [], 5, 0, "", {"include_usage": True}])
@@ -277,7 +282,7 @@ def test_hostile_n_and_stream_options_answer_over_http(n, opts, monkeypatch):
     assert resp.json()["choices"][0]["message"]["content"] == "P"
     # A numeric n is truncated (2.7 -> 2) and warned about, as it always was;
     # what matters here is that nothing raised out of _prepare as a 500.
-    assert isinstance(provider.preps[0]["n"], int)
+    assert ("n" in provider.preps[0]["unsupported_params"]) is (n == 2.7)
     assert provider.preps[0]["stream_options"] == {}
 
 

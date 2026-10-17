@@ -191,17 +191,16 @@ def health(timeout: float = 10) -> bool:
         return False
 
 
-def create_session(timeout: float = 20,
-                    directory: str | None = None) -> str:
+def create_session(timeout: float = 20) -> str:
     """POST /api/session -> session id (raises RuntimeError on failure).
 
-    ``directory`` pins the session worktree (native tools run here) as
-    ``location.directory``; None resolves via
-    ``protocol.session_directory()`` (WORKDIR env > cwd). The model, variant
+    The create body pins the session worktree (native tools run here) as
+    ``location.directory``, resolved by ``protocol.session_directory()``
+    (WORKDIR env > cwd). The model, variant
     and agent are NOT set here -- v2 can only be born with a model, and
     :func:`send_message` sets all three per turn (see :func:`_select`).
     """
-    resolved = directory if directory is not None else P.session_directory()
+    resolved = P.session_directory()
     body: dict = {"location": {"directory": resolved}} if resolved else {}
     status, data = _request("POST", "/api/session", body, timeout=timeout)
     if status != 200:
@@ -218,8 +217,7 @@ def create_session(timeout: float = 20,
     return sid
 
 
-def delete_session(session_id: str | None, timeout: float = 10,
-                   directory: str | None = None) -> None:
+def delete_session(session_id: str | None, timeout: float = 10) -> None:
     """Best-effort DELETE /api/session/:id (204); never raises."""
     if not session_id:
         return
@@ -230,8 +228,7 @@ def delete_session(session_id: str | None, timeout: float = 10,
         pass
 
 
-def abort_session(session_id: str | None,
-                  directory: str | None = None) -> None:
+def abort_session(session_id: str | None) -> None:
     """Best-effort POST /api/session/:id/interrupt; never raises."""
     if not session_id:
         return
@@ -243,16 +240,13 @@ def abort_session(session_id: str | None,
 
 
 def get_session_messages(session_id: str, timeout: float = 20,
-                         directory: str | None = None,
                          limit: int = _POLL_LIMIT) -> list:
     """Session timeline, OLDEST FIRST; [] on failure, never raises.
 
     v2 answers ``{"data": [items], "cursor": {...}}``. ``order=desc`` plus a
     limit keeps the newest window (the current turn) in view on a long
     session, so the list is reversed back into chronological order here.
-    ``directory`` is accepted and ignored: v2 has no ``?directory=`` query.
     """
-    del directory
     try:
         status, data = _request(
             "GET", f"/api/session/{session_id}/message"

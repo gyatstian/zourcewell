@@ -174,7 +174,7 @@ def test_stop_key_watcher_dies_when_the_serve_call_ends(monkeypatch, tmp_path, m
     monkeypatch.setattr(FakeUvicornServer, "run", _run)
 
     settings = _settings(tmp_path, port=5001, log_level="INFO")
-    args = argparse.Namespace(host="127.0.0.1", port=0, workers=1)
+    args = argparse.Namespace(host="127.0.0.1", port=0)
     if mode == "sys_exit":
         with pytest.raises(SystemExit):
             server_runner._run_server(settings, args, ensure_free=lambda s, h, p: p)
@@ -387,7 +387,7 @@ def _run_plain_serve(monkeypatch, settings) -> int:
     monkeypatch.setattr("deepseaport.server.create_app", lambda s=None: object())
     monkeypatch.setattr("deepseaport.server.apply_log_level", lambda *a, **k: None)
     return server_runner._run_server(
-        settings, argparse.Namespace(host="", port=0, workers=1),
+        settings, argparse.Namespace(host="", port=0),
         ensure_free=lambda s, h, p: p)
 
 
@@ -658,7 +658,7 @@ def test_chat_server_reports_a_dead_background_server(monkeypatch, tmp_path, cap
 
 def _banned_cfg(tmp_path) -> str:
     # banned_until must be in the future: config.AccountConfig clears a ban
-    # whose expiry has already passed at load time (config.py:127).
+    # whose expiry has already passed at load time (config.py:126-129).
     until = time.time() + 3600
     return write_config(tmp_path, {"keys": [], "accounts": [
         {"email": "a@x.com", "token": "t1", "banned": True, "banned_until": until},

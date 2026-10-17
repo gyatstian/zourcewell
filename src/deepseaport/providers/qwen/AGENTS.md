@@ -14,13 +14,13 @@ OpenAI-style SSE. No browser, no captcha, no proof of work.
 - `auth.py`: direct-API signin.
 - `models.py`: the catalogue as `ModelSpec` entries.
 - `provider.py`: the `Provider` implementation, delegating to `completion_service`.
-- `README.md`: the long-form live-verified protocol notes. `qwen-api-recon.txt` holds the raw recon.
+- `README.md`: the long-form live-verified protocol notes.
 
 ## Local Contracts
 
 - One completion: `POST /api/v2/chats/new`, then `POST /api/v2/chat/completions?chat_id=<id>`, then a best-effort `DELETE /api/v2/chats/{id}`. The `?chat_id=` query parameter is required; omitting it changes the response.
 - Auth is a direct `POST /api/v1/auths/signin` with a SHA-256-hex password. No browser, no captcha. It returns a flat user object with a JWT plus `expires_at`.
-- The JWT rides `Cookie: token=<jwt>` on every hot-path request, and `Authorization: Bearer` is kept too. `auth.py` returns plain tuples: `login` gives `(token, banned, detail)`, `login_with_expiry` adds the expiry, and `unpack_login_result` / `unpack_login_result_ex` normalize a legacy tuple or string. It does not import deepseek.
+- The JWT rides `Cookie: token=<jwt>` on every hot-path request, and `Authorization: Bearer` is kept too. `auth.py` returns plain tuples: `login` gives `(token, banned, detail)`, `login_with_expiry` adds the expiry, and `unpack_login_result` normalizes a legacy tuple or string. It does not import deepseek.
 - The WAF is Aliyun and answers with HTTP 200 plus a `text/html` challenge body (`WAF_CHALLENGE`, detected in `protocol.py`), never with 403. Pass `forbidden={}` to `core.transport.http_error_code` so a real 403 keeps meaning a suspension: 403, cooldown, failover. Sharing DeepSeek's mapping collapsed the two once, and a suspended account was classified WAF, re-primed, answered 502, and never cooled down.
 - [PERM] `needs_waf_jar = False` and the shared bridge supplies its User-Agent only: that jar is the DeepSeek-host WAF session (`warmup()` fetches `CHAT_HOME`) and must never ride a qwen request.
 - Qwen cookies are its own qwen-host harvest in `client._QWEN_WAF_CACHE` (`acw_tc` plus `x-ap`/`sca`/`cna`/`tfstk`/`isg`), merged into `Cookie` by `_merged_waf_cookies`. The startup warmup is skipped for a qwen-only active set; `provider.warmup()` still primes the qwen host.

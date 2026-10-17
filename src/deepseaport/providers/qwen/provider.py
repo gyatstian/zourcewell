@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 
 from ...core.provider import ModelSpec, Provider
-from .models import DEFAULT_MODEL, MODELS_SPEC
+from .models import MODELS_SPEC
 
 logger = logging.getLogger("deepseaport.providers")
 
@@ -35,10 +35,6 @@ class QwenProvider(Provider):
         """Return a copy of the Qwen model catalogue."""
         return dict(MODELS_SPEC)
 
-    def default_model(self) -> str:
-        """Return the canonical Qwen default model id."""
-        return DEFAULT_MODEL
-
     def probe_ban(self, headers: dict, timeout: int = 20) -> tuple[bool, float | None]:
         """Delegate to the Qwen client's auths/ probe (best-effort, never raises)."""
         try:
@@ -57,11 +53,6 @@ class QwenProvider(Provider):
         """
         from . import auth
         return auth.login(email, password, settings)
-
-    def normalize_token(self, raw) -> str:
-        """Normalize a pasted token via the shared extractor."""
-        from ...core.tokens import extract_token
-        return extract_token(raw)
 
     def warmup(self, bridge) -> None:
         """Best-effort qwen edge priming: solved-jar + open GET models/.
@@ -100,7 +91,6 @@ class QwenProvider(Provider):
             except OSError as exc:
                 if QC._is_winerror5(exc):
                     logger.warning("qwen warmup WinError5, continuing")
-                pass
         except Exception:
             pass
         return None

@@ -3,29 +3,8 @@
 import json
 
 from deepseaport.providers.deepseek import protocol as P
+from deepseaport.providers.deepseek.sse_parser import StreamParser, parse_sse_line
 from deepseaport.core import tools as T
-from deepseaport.server import MODELS
-
-
-def test_model_table():
-    assert MODELS["deepseek-flash"] == (False, False, "default")
-    assert MODELS["deepseek-flash-reasoner"][0] is True
-    assert MODELS["deepseek-flash-search"][1] is True
-    assert MODELS["deepseek-flash-reasoner-search"] == (True, True, "default")
-    assert len(MODELS) == 4
-
-
-def test_render_prompt_roles_and_markers():
-    msgs = [
-        {"role": "system", "content": "sys"},
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": "hello"},
-        {"role": "user", "content": "again"},
-    ]
-    prompt = T.render_prompt(msgs)
-    assert prompt.startswith("<System>sys")
-    assert "<User>hi" in prompt
-    assert "<Assistant>hello<endofsentence>" in prompt
 
 
 def test_render_prompt_tool_cycle():
@@ -91,21 +70,21 @@ def test_sse_parser_content_and_thinking():
     ]
     kinds = []
     for line in lines:
-        kinds += [(e.kind, e.text) for e in P.parse_sse_line(line)]
+        kinds += [(e.kind, e.text) for e in parse_sse_line(line)]
     assert kinds[0] == ("thinking", "hmm")
     assert kinds[1] == ("content", "hi")
     assert kinds[2][0] == "finished"
 
 
 def test_sse_parser_list_finish_and_done():
-    assert list(P.parse_sse_line('data: {"p": "x", "v": [{"p": "status", "v": "FINISHED"}]}'))[0].kind == "finished"
-    assert list(P.parse_sse_line("data: [DONE]"))[0].kind == "finished"
-    assert list(P.parse_sse_line("data: not-json")) == []
-    assert list(P.parse_sse_line(": keep-alive")) == []
+    assert list(parse_sse_line('data: {"p": "x", "v": [{"p": "status", "v": "FINISHED"}]}'))[0].kind == "finished"
+    assert list(parse_sse_line("data: [DONE]"))[0].kind == "finished"
+    assert list(parse_sse_line("data: not-json")) == []
+    assert list(parse_sse_line(": keep-alive")) == []
 
 
 def test_stream_parser_bare_continuation_and_usage():
-    parser = P.StreamParser()
+    parser = StreamParser()
     events = []
     for line in ['data: {"p":"response/content","o":"APPEND","v":"web"}',
                  'data: {"v":"2"}',
@@ -267,7 +246,7 @@ def test_biz_error_includes_ban_expiry():
 def test_sse_parser_surfaces_ban():
     line = ('data: {"code":0,"msg":"","data":{"biz_code":5,"biz_msg":"user is muted",'
             '"biz_data":{"is_muted":1,"mute_until":1789555791.11}}}')
-    evs = list(P.parse_sse_line(line))
+    evs = list(parse_sse_line(line))
     assert evs and evs[0].kind == "error"
     assert "16 September" in evs[0].message
 
@@ -279,16 +258,6 @@ def test_ban_check_skips_short_tokens_no_network():
     assert check_ban_for_token("t1") == (False, None)
     assert check_ban_for_token("") == (False, None)
     assert collect_ban_labels([AccountConfig(email="a@x.com", token="t1")]) == {}
-
-
-def test_extract_token_normalizes_json_shapes():
-    from deepseaport.core.tokens import extract_token
-
-    assert extract_token('{"value":null,"__version":"0"}') == ""
-    assert extract_token('{"value":"tok64","__version":"0"}') == "tok64"
-    assert extract_token('"tok64"') == "tok64"
-    double = json.dumps(json.dumps({"value": "tok99", "__version": "0"}))
-    assert extract_token(double) == "tok99"
 
 
 def test_account_config_normalizes_token_at_boundary():

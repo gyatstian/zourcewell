@@ -1,7 +1,6 @@
 """Gaps for chat_ui: helpers + multi/single server REPL (all faked, offline)."""
 
 import json
-import logging
 import types
 
 import pytest
@@ -342,21 +341,6 @@ def test_run_multi_repl_roundrobin_commands(monkeypatch, capsys):
 
 # run_chat_server
 
-def test_run_chat_workers_note_and_ensure_called(monkeypatch, capsys):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
-    s = Settings(accounts=[_mk_acc("a@x.com", "t1")], port=5001, config_path="", log_level="INFO")
-    called = {}
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port",
-                        lambda st, host, port: called.setdefault("port", port) or 5099)
-    _install_single_fakes(monkeypatch, chat_ui, wait_ret=True, post_ret="hi")
-    monkeypatch.setattr("builtins.input", lambda *a, **k: "/quit")
-    rc = chat_ui.run_chat_server(s, types.SimpleNamespace(workers=2))
-    assert rc == 0
-    assert called.get("port") == 5001
-    assert "1 worker" in capsys.readouterr().out
-    assert s.log_level == "INFO"
-
 
 def test_run_chat_server_fail_dead(monkeypatch):
     from deepseaport import chat_ui
@@ -386,44 +370,33 @@ def test_run_chat_repl_unknown_history_pop_quit_logs(monkeypatch, capsys):
     from deepseaport import chat_ui
     from deepseaport.config import Settings
     s = Settings(port=5001, config_path="", log_level="INFO")
-    lg = logging.getLogger("deepseaport.obscura")
-    root = logging.getLogger()
-    old_lg, old_root = lg.level, root.level
-    lg.setLevel(logging.INFO)
-    root.setLevel(logging.INFO)
-    try:
-        monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5098)
-        monkeypatch.setattr("uvicorn.Config", FakeUvicornConfig)
-        monkeypatch.setattr("uvicorn.Server", FakeUvicornServer)
-        monkeypatch.setattr("threading.Thread", AliveThread)
-        monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
-        monkeypatch.setattr(chat_ui, "_wait_for_server", lambda *a, **k: True)
-        hists = []
-        n = {"c": 0}
+    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5098)
+    monkeypatch.setattr("uvicorn.Config", FakeUvicornConfig)
+    monkeypatch.setattr("uvicorn.Server", FakeUvicornServer)
+    monkeypatch.setattr("threading.Thread", AliveThread)
+    monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
+    monkeypatch.setattr(chat_ui, "_wait_for_server", lambda *a, **k: True)
+    hists = []
+    n = {"c": 0}
 
-        def _post(base, key, model, hist):
-            hists.append([dict(m) for m in hist])
-            n["c"] += 1
-            if n["c"] == 1:
-                raise RuntimeError("boom-fail")
-            return "ok-reply"
+    def _post(base, key, model, hist):
+        hists.append([dict(m) for m in hist])
+        n["c"] += 1
+        if n["c"] == 1:
+            raise RuntimeError("boom-fail")
+        return "ok-reply"
 
-        monkeypatch.setattr(chat_ui, "_post_completion", _post)
-        seq = iter(["/model nope-xyz", "hello-fail", "hello-ok", "/quit"])
-        monkeypatch.setattr("builtins.input", lambda *a, **k: next(seq))
-        assert chat_ui.run_chat_server(s) == 0
-        assert n["c"] == 2
-        assert hists[0] == [{"role": "user", "content": "hello-fail"}]
-        assert hists[1] == [{"role": "user", "content": "hello-ok"}]
-        out = capsys.readouterr().out
-        assert "unknown model" in out
-        assert "boom-fail" in out
-        assert s.log_level == "INFO"
-        assert logging.getLogger("deepseaport.obscura").level == logging.INFO
-        assert logging.getLogger().level == logging.INFO
-    finally:
-        lg.setLevel(old_lg)
-        root.setLevel(old_root)
+    monkeypatch.setattr(chat_ui, "_post_completion", _post)
+    seq = iter(["/model nope-xyz", "hello-fail", "hello-ok", "/quit"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(seq))
+    assert chat_ui.run_chat_server(s) == 0
+    assert n["c"] == 2
+    assert hists[0] == [{"role": "user", "content": "hello-fail"}]
+    assert hists[1] == [{"role": "user", "content": "hello-ok"}]
+    out = capsys.readouterr().out
+    assert "unknown model" in out
+    assert "boom-fail" in out
+    assert s.log_level == "INFO"
 
 
 # chat log override: runtime-only, never the saved log_level field
@@ -440,8 +413,6 @@ def test_run_chat_model_pick_keeps_config_log_level(tmp_path, monkeypatch):
     monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5097)
     _install_single_fakes(monkeypatch, chat_ui, wait_ret=True, post_ret="hi")
     monkeypatch.setattr(chat_ui, "resolve_chat_models", lambda st, instances=None: (
-        {"deepseek-flash": (False, False, "default"),
-         "deepseek-flash-search": (True, False, "default")},
         ["deepseek-flash", "deepseek-flash-search"], "deepseek-flash"))
     seen = {}
 

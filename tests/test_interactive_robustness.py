@@ -213,7 +213,7 @@ def test_delete_row_two_keeps_the_same_email_other_provider(monkeypatch, capsys)
         accounts=[AccountConfig(email="a@x.com", token="t1", provider="deepseek"),
                   AccountConfig(email="a@x.com", token="t2", provider="qwen")],
         active_account="", provider="deepseek", providers=["deepseek", "qwen"])
-    prompts = _answers(monkeypatch, ["d", "2", "y", "b"])
+    prompts = _answers(monkeypatch, ["d", "2", "y", "q"])
     accounts_menu(s)
 
     # The confirmation must name the provider: "a@x.com" alone cannot.
@@ -229,7 +229,7 @@ def test_delete_by_identifier_still_works(monkeypatch):
 
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1"),
                          AccountConfig(email="b@x.com", token="t2")])
-    _answers(monkeypatch, ["d", "b@x.com", "y", "b"])
+    _answers(monkeypatch, ["d", "b@x.com", "y", "q"])
     accounts_menu(s)
     assert [a.email for a in s.accounts] == ["a@x.com"]
 
@@ -242,7 +242,7 @@ def test_delete_shared_email_keeps_active_selection_valid(monkeypatch):
         accounts=[AccountConfig(email="a@x.com", token="t1", provider="deepseek"),
                   AccountConfig(email="a@x.com", token="t2", provider="qwen")],
         active_account="a@x.com", provider="deepseek", providers=["deepseek", "qwen"])
-    _answers(monkeypatch, ["d", "1", "y", "b"])
+    _answers(monkeypatch, ["d", "1", "y", "q"])
     accounts_menu(s)
     assert len(s.accounts) == 1
     # The surviving qwen account still satisfies the selection by identifier.
@@ -257,7 +257,7 @@ def test_set_token_row_two_targets_that_provider(monkeypatch):
         accounts=[AccountConfig(email="a@x.com", token="t1", provider="deepseek"),
                   AccountConfig(email="a@x.com", token="t2", provider="qwen")],
         active_account="", provider="deepseek", providers=["deepseek", "qwen"])
-    _answers(monkeypatch, ["t", "2", "fresh-token-2", "b"])
+    _answers(monkeypatch, ["t", "2", "fresh-token-2", "q"])
     accounts_menu(s)
     assert [a.token for a in s.accounts] == ["t1", "fresh-token-2"]
 
@@ -276,7 +276,8 @@ def test_main_menu_survives_systemexit_from_serve(monkeypatch, capsys):
     def _serve(_s):
         raise SystemExit(3)  # uvicorn STARTUP_FAILURE
 
-    _answers(monkeypatch, ["1", "q"])
+    # Quit lives in the provider chooser: "q. Go back" opens it, "q. Quit" quits.
+    _answers(monkeypatch, ["1", "q", "q"])
     assert main_menu(s, _serve) == 0
     out = capsys.readouterr().out
     assert "code 3" in out
@@ -293,7 +294,7 @@ def test_main_menu_clean_systemexit_is_not_an_error(monkeypatch, capsys):
     def _serve(_s):
         raise SystemExit(0)
 
-    _answers(monkeypatch, ["1", "q"])
+    _answers(monkeypatch, ["1", "q", "q"])
     assert main_menu(s, _serve) == 0
     out = capsys.readouterr().out
     assert "back to menu" in out
@@ -314,8 +315,9 @@ def test_main_menu_systemexit_from_chat_multi_and_dry(monkeypatch, capsys):
 
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")],
                provider="deepseek", providers=[])
-    # Menu with chat: 1 serve, 2 chat, 3 multi, 4 settings, 5 accounts, 6 dry.
-    _answers(monkeypatch, ["2", "3", "6", "q"])
+    # Menu with chat: 1 serve, 2 chat, 3 accounts, 4 settings, 5 multi, 6 dry.
+    # Quit lives in the provider chooser: q ("Go back"), then q ("Quit").
+    _answers(monkeypatch, ["2", "5", "6", "q", "q"])
     assert main_menu(s, _mk(1), _mk(2), _mk(3), _mk(4)) == 0
     out = capsys.readouterr().out
     assert "Chat server exited with code 2" in out
@@ -372,7 +374,7 @@ def test_add_account_persists_ban_reported_by_auto_login(monkeypatch, capsys):
                         lambda email, password, settings:
                         ("banned-tok-123", True, "suspended until 16 September 2030"))
     s = _fresh(accounts=[], active_account="", provider="deepseek", providers=[])
-    _answers(monkeypatch, ["a", "new@x.com", "pw", "y", "b"])
+    _answers(monkeypatch, ["a", "new@x.com", "pw", "y", "q"])
     accounts_menu(s)
 
     out = capsys.readouterr().out
@@ -394,7 +396,7 @@ def test_add_account_ban_survives_a_save_reload(tmp_path, monkeypatch):
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({"keys": [], "accounts": []}), encoding="utf-8")
     s = load_settings(str(cfg))
-    _answers(monkeypatch, ["a", "new@x.com", "pw", "y", "b"])
+    _answers(monkeypatch, ["a", "new@x.com", "pw", "y", "q"])
     accounts_menu(s)
 
     on_disk = json.loads(cfg.read_text(encoding="utf-8"))["accounts"]

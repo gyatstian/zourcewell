@@ -1,9 +1,9 @@
 """Opencode local-CLI protocol: base URL, payloads, model splitting.
 
 Talks to a locally running ``opencode serve`` instance (default
-``http://127.0.0.1:4096``). The v2 HttpApi (opencode 2.x) serves everything
-under ``/api`` and no longer has a blocking message endpoint; the subset the
-provider needs is:
+``http://127.0.0.1:4096``); the v2 HttpApi (opencode 2.x) serves everything
+under ``/api`` and has no blocking message endpoint. The subset the provider
+needs is:
 
   GET    /api/info                                   -> alive
   POST   /api/session  {location?}                   -> {data:{id}}
@@ -16,27 +16,20 @@ provider needs is:
   GET    /api/event                                  -> SSE deltas
   GET    /api/model                                  -> dynamic catalogue
 
-Success is enveloped as ``{"data": ...}``; failures are a flat
-``{"_tag": "...", "message": "..."}`` object (no envelope). Since opencode
-v2 a serve instance always requires HTTP basic auth: it generates a password at
-boot and prints it, unless ``OPENCODE_SERVER_PASSWORD`` pins one. The managed
-instance sets that env and passes the same value here; for your own serve,
-mirror its password in ``DEEPSEAPORT_OPENCODE_PASSWORD``.
+Success is enveloped ``{"data": ...}``; failures are a flat
+``{"_tag": "...", "message": "..."}`` object. Basic auth is always required on
+v2, with a per-boot password unless ``OPENCODE_SERVER_PASSWORD`` pins one (see
+``opencode/AGENTS.md``); the managed instance sets it and passes the same
+value to this client.
 
-Env overrides (no Settings fields):
-  DEEPSEAPORT_OPENCODE_BASE      base URL (default: managed isolated serve;
-                                 set this to use your own `opencode serve`)
-  DEEPSEAPORT_OPENCODE_AGENT     agent name (default deepseaport-passthrough)
-  DEEPSEAPORT_OPENCODE_TIMEOUT   per-turn seconds (default 180)
-  DEEPSEAPORT_OPENCODE_USERNAME  basic-auth username (default opencode)
-  DEEPSEAPORT_OPENCODE_PASSWORD  basic-auth password (default "")
-  DEEPSEAPORT_OPENCODE_MANAGED   0/false/no/off disables the managed serve
-  DEEPSEAPORT_OPENCODE_CLIENT    client identity header (default cli)
-  DEEPSEAPORT_OPENCODE_PROJECT   project identity header (default global)
-  DEEPSEAPORT_OPENCODE_USER_AGENT  User-Agent header (default opencode/<cli version>)
-  DEEPSEAPORT_OPENCODE_WORKDIR   session working directory for tool execution
-                                 (default: deepseaport process cwd; sent as
-                                 `location.directory` on session create)
+Env overrides (no Settings fields), all ``DEEPSEAPORT_OPENCODE_*`` and
+defaulting to the module constant of the same name: BASE (own serve URL; unset
+-> the managed isolated serve), AGENT, TIMEOUT (per-turn seconds; callers pass
+``client.DEFAULT_TIMEOUT`` as the fallback), USERNAME /
+PASSWORD (basic auth), MANAGED=0/false/no/off (disable the managed serve),
+CLIENT / PROJECT / USER_AGENT (identity headers; default
+``opencode/<cli version>``), WORKDIR (session working directory for tool
+execution, sent as ``location.directory`` on session create).
 """
 
 from __future__ import annotations
@@ -44,10 +37,10 @@ from __future__ import annotations
 import os
 
 from .managed_serve import MANAGED_AGENT
+from .models import DEFAULT_MODEL
 
 DEFAULT_BASE = "http://127.0.0.1:4096"
 DEFAULT_AGENT = MANAGED_AGENT
-DEFAULT_TIMEOUT = 180
 DEFAULT_USERNAME = "opencode"
 
 
@@ -62,7 +55,7 @@ def agent_name() -> str:
     return (os.environ.get("DEEPSEAPORT_OPENCODE_AGENT", "") or "").strip() or DEFAULT_AGENT
 
 
-def opencode_timeout(default: int = DEFAULT_TIMEOUT) -> float:
+def opencode_timeout(default: int) -> float:
     """Per-request timeout in seconds (env-overridable)."""
     try:
         return max(1.0, float(os.environ.get("DEEPSEAPORT_OPENCODE_TIMEOUT", default) or default))
@@ -133,15 +126,15 @@ def client_headers(session_id: str | None = None) -> dict[str, str]:
     return headers
 
 
-def split_model(model: str, default: str = "opencode/muse-spark-1.3-contributor-free") -> tuple[str, str]:
+def split_model(model: str) -> tuple[str, str]:
     """Split a deepseaport model id into (providerID, modelID).
 
     ``provider/model`` splits at the first slash (the model part may itself
     contain slashes, e.g. ``openrouter/anthropic/claude...``). A bare id
     without a slash maps to provider ``opencode``. Empty/blank falls back
-    to the default model's split.
+    to :data:`models.DEFAULT_MODEL`.
     """
-    raw = str(model or "").strip() or default
+    raw = str(model or "").strip() or DEFAULT_MODEL
     if "/" in raw:
         provider_id, _, model_id = raw.partition("/")
         provider_id = provider_id.strip() or "opencode"
@@ -212,20 +205,14 @@ def is_session_error(error: str | None) -> bool:
     ))
 
 
-def session_directory(explicit: str | None = None) -> str:
+def session_directory() -> str:
     """Working directory for new sessions (native tools run here).
 
-    Resolution: explicit arg > DEEPSEAPORT_OPENCODE_WORKDIR env > process
-    cwd. Returns "" when nothing usable (the caller omits
-    ``location.directory`` and the serve falls back to its own cwd). Never
-    raises.
+    Resolution: DEEPSEAPORT_OPENCODE_WORKDIR env > process cwd. Returns ""
+    when nothing usable (the caller omits ``location.directory`` and the
+    serve falls back to its own cwd). Never raises.
     """
     candidates: list[str] = []
-    try:
-        if explicit:
-            candidates.append(str(explicit))
-    except Exception:
-        pass
     try:
         candidates.append((os.environ.get("DEEPSEAPORT_OPENCODE_WORKDIR", "") or "").strip())
     except Exception:
@@ -245,16 +232,4 @@ def session_directory(explicit: str | None = None) -> str:
                 return str(p.resolve())
         except Exception:
             continue
-    return ""
-
-
-def session_query(directory: str | None = None) -> str:
-    """Always "" — v2 has no ``?directory=`` query parameter.
-
-    Kept for callers that still thread a directory through: the working
-    directory now travels as ``location.directory`` in the ``POST
-    /api/session`` body (see :func:`session_directory`) and the session id
-    alone addresses every other route, so no query string is built and no
-    unknown parameter is sent.
-    """
     return ""

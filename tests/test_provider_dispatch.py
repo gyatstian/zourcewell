@@ -95,7 +95,22 @@ def test_default_deepseek_honors_engine_monkeypatch(monkeypatch):
     assert resp.json()["choices"][0]["message"]["content"] == "hi"
 
 
-def test_unknown_provider_fallback():
+def test_pool_never_borrows_accounts_for_an_unregistered_provider():
+    """Defense-in-depth pin, kept though ``load_settings`` makes it unreachable.
+
+    Model resolution still falls back to deepseek (above); the pool must NOT.
+    The rule the account routes and ``accounts.usable_provider`` already
+    follow: an unregistered provider id never BORROWS another provider's
+    accounts. That lend handed provider X a pool of provider Y's credentials
+    -- a Qwen ES256 JWT replayed to chat.deepseek.com as a userToken. No
+    bound accounts means no pool, not a cross-provider borrow.
+
+    Reaching this state needs a hand-built Settings: ``load_settings`` names
+    the bad id and substitutes deepseek at load time
+    (tests/test_config_integrity.py). The pin stays because the pool
+    construction itself must never re-open the borrow for a caller that skips
+    that normalization.
+    """
     from deepseaport.server import MODELS
     from deepseaport.server_routes import _pool_for, _prepare
 
@@ -108,17 +123,6 @@ def test_unknown_provider_fallback():
                      "messages": [{"role": "user", "content": "hi"}]}, s)
     assert prep["provider"] == "deepseek"
     pool = _pool_for(app, "deepseek")
-    # Model resolution still falls back to deepseek (above), but the pool must
-    # NOT. The rule the account routes and accounts.usable_provider already
-    # follow: an unregistered provider id never BORROWS another provider's
-    # accounts. That lend handed provider X a pool of provider Y's credentials
-    # -- a Qwen ES256 JWT replayed to chat.deepseek.com as a userToken. No
-    # bound accounts means no pool, not a cross-provider borrow.
-    #
-    # Reaching here needs a hand-built Settings, which load_settings now makes
-    # unreachable: it names the bad id and substitutes deepseek at load time
-    # (tests/test_config_integrity.py). What matters here is that nothing
-    # downstream re-opens the borrow.
     assert [r["identifier"] for r in pool.status()] == [], (
         "an unregistered selected provider still borrowed the deepseek account")
 

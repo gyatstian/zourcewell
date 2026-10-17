@@ -149,7 +149,7 @@ def test_ensure_token_normalizes_json_wrapper():
     raw = '{"value":"' + ("y" * 32) + '","__version":"0"}'
     object.__setattr__(item.cfg, "token", raw)
     assert item.cfg.token == raw
-    assert _ensure_token(app, item) == "y" * 32
+    assert _ensure_token(item) == "y" * 32
     assert item.cfg.token == "y" * 32
 
 
@@ -157,7 +157,7 @@ def test_ensure_token_missing_raises_401():
     app = create_app(_settings())
     item = PooledAccount(cfg=AccountConfig(email="a@x.com"))
     with pytest.raises(HTTPException) as ei:
-        _ensure_token(app, item)
+        _ensure_token(item)
     assert ei.value.status_code == 401
 
 

@@ -39,7 +39,7 @@ from .login_policy import (
     REACT_COMMIT_DELAY,
     SIGN_IN_URL,
     classify_page_state,
-    collapse_text as _collapse,
+    clean_text as _collapse,
     parse_ban_until,
 )
 from ...core.obscura_bridge import ObscuraBridge, profile_lock
@@ -265,18 +265,18 @@ class BrowserLogin:
                 ban_streak += 1
                 if ban_streak >= 2:
                     detail = (f"login page shows suspension ({phrase}) "
-                              f"url={last_url}: {_collapse(body, 300)}")
+                              f"url={last_url}: {_collapse(body)[:300]}")
                     return LoginResult(banned=True, detail=detail)
                 continue
             ban_streak = 0
             if kind == "captcha":
                 detail = (f"login captcha for {email} (phrase={phrase!r} "
-                          f"url={last_url}): {_collapse(body, 300)}")
+                          f"url={last_url}): {_collapse(body)[:300]}")
                 logger.info(scrub_upstream_text(detail, 500))
                 return LoginResult(detail=detail)
             if kind == "credential":
                 detail = (f"login credential error for {email} (phrase={phrase!r} "
-                          f"url={last_url}): {_collapse(body, 300)}")
+                          f"url={last_url}): {_collapse(body)[:300]}")
                 logger.info(scrub_upstream_text(detail, 500))
                 return LoginResult(detail=detail)
             token = extract_token(page.get("tok"))
@@ -286,7 +286,7 @@ class BrowserLogin:
                 return LoginResult(token=token)
 
         diag = (f"no token; last_url={last_url}; "
-                f"last_error={last_error or 'none'}; body={_collapse(last_body, 800)}")
+                f"last_error={last_error or 'none'}; body={_collapse(last_body)[:800]}")
         logger.info("login failed for %s: %s", email, scrub_upstream_text(diag, 800))
         return LoginResult(detail=diag)
 

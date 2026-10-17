@@ -8,6 +8,7 @@ import json
 import pytest
 
 from deepseaport.providers.deepseek import protocol as P
+from deepseaport.providers.deepseek.sse_parser import StreamParser
 from deepseaport.providers.deepseek import pow as PoW
 
 
@@ -411,7 +412,7 @@ def test_stream_completion_error_closes(monkeypatch):
     assert resp.closed is True
 
 
-# protocol._BAN_RE -----------------------------------------------------------
+# protocol ban-word helpers --------------------------------------------------
 
 
 def test_ban_word_commute_transmute_no_match():
@@ -521,7 +522,7 @@ def test_bridge_headers_uses_bridge(monkeypatch):
 
 
 def test_stream_parser_toast_error():
-    evs = list(P.StreamParser().feed(
+    evs = list(StreamParser().feed(
         'data: {"type":"error","content":"oops","finish_reason":"rate_limit_reached"}'))
     assert len(evs) == 1 and evs[0].kind == "error"
     assert evs[0].code == "rate_limit_reached"
@@ -529,7 +530,7 @@ def test_stream_parser_toast_error():
 
 
 def test_stream_parser_search_status_ignored():
-    assert list(P.StreamParser().feed(
+    assert list(StreamParser().feed(
         'data: {"p":"response/search_status","v":"searching"}')) == []
 
 
@@ -539,7 +540,7 @@ def test_stream_parser_batched():
             '{"p":"response/thinking_content","v":"hmm"},'
             '{"p":"response/accumulated_token_usage","v":123},'
             '{"p":"response/status","v":"FINISHED"}]}')
-    evs = list(P.StreamParser().feed(line))
+    evs = list(StreamParser().feed(line))
     by_kind = [(e.kind, e.text) for e in evs]
     assert ("content", "hi") in by_kind
     assert ("thinking", "hmm") in by_kind
@@ -548,14 +549,14 @@ def test_stream_parser_batched():
 
 
 def test_stream_parser_non_string_v_ignored():
-    parser = P.StreamParser()
+    parser = StreamParser()
     assert list(parser.feed('data: {"p":"response/content","v":123}')) == []
     assert list(parser.feed('data: {"p":"response/content","v":null}')) == []
     assert list(parser.feed('data: {"p":"response/content","v":""}')) == []
 
 
 def test_stream_parser_continuation_reset_after_finished():
-    parser = P.StreamParser()
+    parser = StreamParser()
     assert list(parser.feed('data: {"p":"response/content","v":"a"}'))[0].text == "a"
     assert list(parser.feed('data: {"v":"b"}'))[0].text == "b"
     assert list(parser.feed('data: {"p":"response/status","v":"FINISHED"}'))[0].kind == "finished"

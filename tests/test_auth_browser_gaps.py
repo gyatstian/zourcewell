@@ -3,6 +3,7 @@
 Fully offline: fake subprocess/ws/browser. Never launches a real browser.
 """
 
+import functools
 import json
 import queue
 import subprocess
@@ -23,19 +24,15 @@ from deepseaport.providers.deepseek.auth import (
     classify_page_state,
     unpack_login_result,
 )
-from deepseaport.config import Settings
 
 
 # Default kwargs differ per file; the shared base dict lives in
 # support.py. Every list here is rebuilt per call on purpose.
 
 
-def _settings(**kw) -> Settings:
-    kw.setdefault("obscura_bin", "dummy-obscura")
-    kw.setdefault("obscura_profile", "dummy-profile")
-    kw.setdefault("log_level", "INFO")
-    kw.setdefault("warmup_on_startup", True)
-    return settings(**kw)
+_settings = functools.partial(settings, obscura_bin="dummy-obscura",
+                              obscura_profile="dummy-profile",
+                              log_level="INFO", warmup_on_startup=True)
 
 
 def _text_result(text):
@@ -136,8 +133,9 @@ def test_json_eval_double_encoded_invalid_returns_none():
 
 def test_collapse_whitespace_and_truncation():
     assert _collapse("  a\n\t b   c  ") == "a b c"
-    assert _collapse("x" * 600, 500) == "x" * 500
-    assert _collapse("", 10) == ""
+    # Truncation is the caller's slice, applied after the collapse.
+    assert _collapse("x" * 600)[:500] == "x" * 500
+    assert _collapse("") == ""
 
 
 # --- classify_page_state ---
@@ -165,11 +163,6 @@ def test_classify_priority_credential_over_ban():
 
 def test_classify_empty():
     assert classify_page_state("") == ("", "")
-    assert classify_page_state("healthy home page", False) == ("", "")
-
-
-def test_classify_captcha_visible_flag():
-    assert classify_page_state("healthy page", True) == ("captcha", "visible challenge overlay")
 
 
 # --- parse_ban_until ---
@@ -869,8 +862,6 @@ def _mcp_client_new(**over):
     import queue as _q
     import threading as _t
 
-    c.binary = "fake"
-    c.profile = "prof"
     c.timeout = 5.0
     c._id = 0
     c._closed = False

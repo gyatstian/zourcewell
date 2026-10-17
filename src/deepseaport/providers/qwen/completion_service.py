@@ -31,9 +31,6 @@ from ...core.engine import (
     slot_releaser as _slot_releaser,
 )
 from ...core.obscura_bridge import ObscuraBridge
-# Shared implementation: _openai_response lives in core.openai so every
-# web2api provider reuses one response shim (re-exported here for compat).
-from ...core.openai import _openai_response  # noqa: F401
 from ...core.tools import (
     looks_truncated_tool_attempt,
     parse_tool_calls as _parse_tool_calls_local,
@@ -73,21 +70,18 @@ _error_text = _engine.error_text
 def classify_error(error: str | None) -> RetryKind | None:
     """Map an attempt error string to its retry/terminal kind.
 
-    String families map per the Qwen recon (see README error table):
-    ban/suspension wording -> BAN; WAF/challenge -> WAF; 401/unauthorized ->
-    INVALID_TOKEN; rate limits -> RATE_LIMIT; 422/400 -> UPSTREAM_INVALID;
-    overload/busy/timeout/502 -> OVERLOAD; anything else -> UPSTREAM. The
-    retry table additionally guards EVERY kind with the "partial live emit"
-    flag.
+    Families per the Qwen recon (see README error table): ban/suspension ->
+    BAN; WAF/challenge -> WAF; 401/unauthorized -> INVALID_TOKEN; rate limits
+    -> RATE_LIMIT; 422/400 -> UPSTREAM_INVALID; overload/busy/timeout/502 ->
+    OVERLOAD; anything else -> UPSTREAM. Every kind also carries the
+    partial-live-emit guard (see providers/AGENTS.md).
 
-    BAN is checked FIRST, before any status-code family. Qwen's WAF answers
-    200 + text/html (never 403), so a 403 here is a real upstream status and
-    its body may be a suspension ("your account has been suspended ...").
-    Matching the WAF branch on the "403" substring first swallowed that body:
-    the account was never cooled down or failed over and the terminal handler
-    returned a pointless 502 after re-primes. No Qwen WAF string carries a
-    ban-family word (WAF_CHALLENGE / aliyun_waf / AliyunCaptcha /
-    nc-container), so ban-first cannot steal a real WAF verdict.
+    BAN is checked FIRST: Qwen's WAF answers 200 + text/html, never 403, so a
+    403 is a real upstream status whose body may be a suspension -- and no
+    Qwen WAF string carries a ban-family word (WAF_CHALLENGE / aliyun_waf /
+    AliyunCaptcha / nc-container), so ban-first cannot steal a WAF verdict.
+    Matching the WAF branch on the "403" substring first swallowed one such
+    body: no cooldown, no failover, a pointless 502 after re-primes.
     """
     if not error:
         return None
@@ -113,16 +107,6 @@ def classify_error(error: str | None) -> RetryKind | None:
         # OVERLOAD anyway; the retry recover checks the guard.
         return RetryKind.OVERLOAD
     return RetryKind.UPSTREAM
-
-
-def _log_cookies(where: str, headers: dict) -> None:
-    """Cookie-names-only diagnostic (never values/secrets)."""
-    try:
-        desc = P.describe_cookies(headers)
-        logger.warning("qwen %s cookie_names=%s has_token=%s has_acw_tc=%s",
-                       where, desc["names"], desc["has_token"], desc["has_acw_tc"])
-    except Exception:
-        pass
 
 
 def _headers(app: FastAPI, token: str) -> dict:
@@ -172,7 +156,7 @@ def _headers(app: FastAPI, token: str) -> dict:
         return P.base_headers(bearer=token)
 
 
-def _ensure_token(app: FastAPI, item: PooledAccount) -> str:
+def _ensure_token(item: PooledAccount) -> str:
     """Return the account token, or a fast 401 that callers can fail over on.
 
     A missing token is a provisioning state; paste ``localStorage.token`` from
@@ -276,7 +260,7 @@ def _try_relogin(app: FastAPI, item: PooledAccount) -> str | None:
         # /api/v1/auths/signin body, and this log line is written to disk (and
         # shipped to any log shipper). Same reasoning as DeepSeek's
         # ``login_note`` in ``_refresh_token_via_obscura``
-        # (providers/deepseek/completion_service.py:373-375).
+        # (providers/deepseek/completion_service.py:388-394).
         logger.warning("qwen re-signin failed for %s: %s",
                        item.cfg.identifier,
                        _engine.scrub_upstream_text(detail, 200))
@@ -388,10 +372,6 @@ def _refresh_waf_without_account_lock(app: FastAPI, item: PooledAccount,
                     # invented endpoints). Skips DeepSeek warmup entirely.
                     QC.prime_qwen_bridge(bridge)
                 except OSError as exc:
-                    try:
-                        _log_cookies("refresh_qwen_bridge_winerror", {})
-                    except Exception:
-                        pass
                     if QC._is_winerror5(exc):
                         logger.warning("qwen bridge WinError5 "
                                        "(profile dir locked), priming qwen host")
@@ -425,7 +405,6 @@ def _refresh_waf_without_account_lock(app: FastAPI, item: PooledAccount,
             except OSError as exc:
                 if QC._is_winerror5(exc):
                     logger.warning("qwen prime WinError5, continuing")
-                pass
             except Exception:
                 pass
         except Exception as exc:
@@ -474,7 +453,7 @@ def _terminal_invalid_token(app: FastAPI, item: PooledAccount, prep: dict,
     # framed segments are individually too short for a run-length redactor.
     # Same reason and same helper as DeepSeek's
     # ``_invalid_token_401_detail`` (providers/deepseek/completion_service.py:
-    # 674-676); the codes and ban wording an operator diagnoses with survive.
+    # 676-686); the codes and ban wording an operator diagnoses with survive.
     err = _engine.scrub_upstream_text(error, 200)
     raise HTTPException(
         status_code=401,
@@ -499,22 +478,17 @@ def _terminal_ban(app: FastAPI, item: PooledAccount, prep: dict,
     raise _ban_403_for_item(app, item, ban_until, error)
 
 
-def _terminal_upstream(app: FastAPI, item: PooledAccount, prep: dict,
-                       token: str | None, error: str, login_note: str | None,
-                       stream_ban_until: float | None) -> None:
-    _engine.raise_upstream("Qwen", error)
-
-
 #: Terminal dispatch table: one RetryKind (from the shared classifier) per
 #: HTTP outcome. RATE_LIMIT/OVERLOAD/UPSTREAM_INVALID/UPSTREAM are the
 #: label-only handlers every provider shares (core.engine); only
 #: INVALID_TOKEN and BAN are Qwen-specific. WAF is a retryable kind that only
-#: reaches here after exhausting the retry budget -> generic bad-gateway.
+#: reaches here after exhausting the retry budget -> the generic upstream 502.
 _TERMINAL_HANDLERS: dict[RetryKind, Callable[..., None]] = {
     **_engine.generic_terminal_handlers(RetryKind, "Qwen"),
     RetryKind.INVALID_TOKEN: _terminal_invalid_token,
     RetryKind.BAN: _terminal_ban,
-    RetryKind.WAF: _terminal_upstream,
+    RetryKind.WAF: _engine.generic_terminal_handlers(
+        RetryKind, "Qwen")[RetryKind.UPSTREAM],
 }
 
 
@@ -553,7 +527,7 @@ def _run_completion_core(
     settings = _app_settings(app)
     max_retries = max(0, int(getattr(settings, "max_retries", 1)))
     auto_delete = bool(getattr(settings, "auto_delete_session", True))
-    token = _ensure_token(app, item)
+    token = _ensure_token(item)
     token_refreshed = False
     try:
         # Proactive: a known-expired token + stored password re-signs in
@@ -616,7 +590,7 @@ def _run_completion_core(
                     if token and "token" not in [
                             n.lower() for n in P.cookie_names(
                                 str(hdrs.get("Cookie") or ""))]:
-                        _log_cookies("prepare_chat_missing_token", hdrs)
+                        QC._log_waf_headers("prepare_chat_missing_token", hdrs)
                 except Exception:
                     pass
                 sid = QC.create_chat(hdrs, prep["model"])
@@ -626,8 +600,9 @@ def _run_completion_core(
                 error = _error_text("", str(exc))
                 try:
                     if classify_error(error) == RetryKind.WAF:
-                        _log_cookies("prepare_chat_waf",
-                                     hdrs if "hdrs" in dir() else headers)
+                        QC._log_waf_headers(
+                            "prepare_chat_waf",
+                            hdrs if "hdrs" in dir() else headers)
                 except Exception:
                     pass
                 return False
@@ -648,7 +623,7 @@ def _run_completion_core(
             that ``auto_delete_session`` can never reach again.
 
             Ordering mirrors DeepSeek's ``_recreate_and_attempt``
-            (providers/deepseek/completion_service.py:1015-1045): the OLD id
+            (providers/deepseek/completion_service.py:1001-1043): the OLD id
             and the headers it was created with are captured BEFORE the create
             (a refreshed token would 401 the delete), the create assigns
             ``chat_id`` only on success (so a failed create leaves the old id
@@ -667,7 +642,7 @@ def _run_completion_core(
             logger.info("possible WAF block, refreshing cookies (retries left %s)",
                         max_retries)
             try:
-                _log_cookies("recover_waf_before", headers)
+                QC._log_waf_headers("recover_waf_before", headers)
             except Exception:
                 pass
             _refresh_waf_without_account_lock(app, item, cancel_event=cancel_event)
@@ -691,6 +666,9 @@ def _run_completion_core(
                 banned, ban_until = False, None
             if banned:
                 raise _ban_403_for_item(app, item, ban_until, error or "")
+            # Single log for "no fresh token obtained this pass" (relogin
+            # failed, or already refreshed): recreating the chat is the retry.
+            new = None
             if not token_refreshed:
                 try:
                     new = _try_relogin(app, item)
@@ -703,10 +681,7 @@ def _run_completion_core(
                 if new:
                     token = new
                     token_refreshed = True
-                else:
-                    logger.info("token invalid, recreating chat (retries left %s)",
-                                max_retries)
-            else:
+            if not new:
                 logger.info("token invalid, recreating chat (retries left %s)",
                             max_retries)
             if _recreate_chat():
@@ -794,12 +769,6 @@ def _attempt(headers: dict, payload: dict, on_content=None, on_thinking=None,
                                  cancel_event=cancel_event)
 
 
-def _run_completion(app: FastAPI, item: PooledAccount, prep: dict,
-                    cancel_event: threading.Event | None = None) -> dict:
-    """Blocking full completion with retries per failure class."""
-    return _run_completion_core(app, item, prep, cancel_event=cancel_event)
-
-
 async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccount, prep: dict):
     """Async generator: buffered (default) or live deltas, tools parsed at end.
 
@@ -822,7 +791,7 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
     # loop that reads as "the tool stopped working". Live keeps the
     # single-read budget because every delta resets the clock.
     # Same call DeepSeek makes at providers/deepseek/completion_service.py:
-    # 1154-1156.
+    # 1155-1157.
     (cid, created, out, cancel_event, consumer_timeout, model,
      _emit, _put) = _engine.new_producer_context(
         prep, QC.DEFAULT_TIMEOUT, _CONSUMER_GRACE_SECONDS, buffered=not live)

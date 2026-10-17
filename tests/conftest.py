@@ -19,9 +19,8 @@ What this module does, and why it is safe:
 * ``pytest_configure`` runs BEFORE collection, which is the only point where
   the import-time constants above can still be steered.
 * Live tests opt in explicitly: mark them ``@pytest.mark.live`` and run
-  ``pytest -m live``. Do NOT express the default as ``addopts = "-m 'not
-  live'"`` — a command-line ``-m`` does not override ``addopts``, so
-  ``pytest -m live`` would silently deselect everything.
+  ``pytest -m live``. The default tier never goes into ``addopts`` - why:
+  ``tests/AGENTS.md``.
 * **Non-loopback outbound connections raise instead of leaving the machine.**
 
   Scope, stated precisely because this is an ACCIDENT GUARD, NOT A SANDBOX.

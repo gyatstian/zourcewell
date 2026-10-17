@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 
 from ...core.provider import ModelSpec, Provider
-from .models import DEFAULT_MODEL, MODELS_SPEC
+from .models import MODELS_SPEC
 
 logger = logging.getLogger("deepseaport.providers")
 
@@ -29,10 +29,6 @@ class DeepSeekProvider(Provider):
         """Return a copy of the DeepSeek model catalogue."""
         return dict(MODELS_SPEC)
 
-    def default_model(self) -> str:
-        """Return the canonical DeepSeek default model id."""
-        return DEFAULT_MODEL
-
     def probe_ban(self, headers: dict, timeout: int = 20) -> tuple[bool, float | None]:
         """Delegate to the DeepSeek client's users/current ban probe."""
         try:
@@ -46,11 +42,6 @@ class DeepSeekProvider(Provider):
         """Delegate to the DeepSeek browser login flow."""
         from ...providers.deepseek import auth
         return auth.browser_login(email, password, settings)
-
-    def normalize_token(self, raw) -> str:
-        """Normalize a pasted token via the shared extractor."""
-        from ...core.tokens import extract_token
-        return extract_token(raw)
 
     def warmup(self, bridge) -> None:
         """Fetch/prewarm the DeepSeek PoW wasm; best-effort, never raises."""

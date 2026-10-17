@@ -9,7 +9,11 @@ Seven fixes, each pinned here by a test that fails on the pre-change code:
 * K3 -- the ban-failover CURRENT switch saved the SETTINGS FALLBACK, i.e. a
   Settings bound to the operator's real ``config.json``.
 * K4 -- the managed-serve reaper signalled a pid read from a plain JSON file
-  whose only gate was a probe against that same file.
+  whose only gate was a probe against that same file. A DEAD recorded pid
+  (the normal state of serve.json -- the atexit kill retires the process, not
+  the file) also cannot be told from an unreadable one by the command-line
+  reader, so it was reported as "the stale serve is left running" after a
+  ~0.5 s PowerShell spawn; the OS liveness probe now decides first.
 * K5 -- ``config.json`` claims 0600 protection that is a no-op on Windows.
 * K6 -- upstream error bodies were reflected verbatim into client 4xx/5xx
   bodies and into the server log.
@@ -29,6 +33,8 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -86,11 +92,17 @@ def _settings(**kw) -> Settings:
 # --- K1: cancelled create_session must not leak the session -------------------
 
 
-def test_cancel_during_create_session_deletes_the_session_exactly_once(monkeypatch):
+def test_cancel_during_create_session_aborts_and_deletes_once(monkeypatch):
     """Pre-change: ``fut.cancel()`` returns False for a running callable, so
     ``_session_and_challenge`` raised ``_StreamCancelled`` with no session id
     in hand, the ``finally`` in ``_run_completion_core`` had nothing to delete
-    and the session created a moment later stayed alive upstream forever."""
+    and the session created a moment later stayed alive upstream forever.
+
+    One scaffold, two contracts: the raise must not WAIT for the in-flight
+    ``create_session`` (what the old ``_time.time() - t0 < 1.0`` was
+    approximating), and the session that call still returns afterwards must be
+    deleted exactly once.
+    """
     from deepseaport.server_concurrency import _StreamCancelled
     from deepseaport.providers.deepseek.completion_service import _session_and_challenge
 
@@ -129,9 +141,14 @@ def test_cancel_during_create_session_deletes_the_session_exactly_once(monkeypat
     monkeypatch.setattr("deepseaport.providers.deepseek.client.delete_session", _record_delete)
 
     cancel = threading.Event()
+    watcher_errors: list[str] = []
 
     def _flip():
-        assert started.wait(_PARK_TIMEOUT), "create_session never started"
+        if not started.wait(_PARK_TIMEOUT):
+            watcher_errors.append("create_session never started")
+        # Unconditional, including on the failure path: a caller left parked in
+        # `_await_cancelable`'s poll loop would hang the suite rather than
+        # failing this test.
         cancel.set()
 
     threading.Thread(target=_flip, daemon=True).start()
@@ -139,11 +156,24 @@ def test_cancel_during_create_session_deletes_the_session_exactly_once(monkeypat
     with pytest.raises(_StreamCancelled):
         _session_and_challenge({"h": "1"}, parallel=True, cancel_event=cancel)
 
+    assert not watcher_errors, watcher_errors
+    # Snapshot taken the instant the caller returned, BEFORE we release the
+    # worker: it can only leave its park once `release` is set (we set it after
+    # this snapshot) or the park times out, and the park is 200x the 50ms
+    # cancel poll. "Not finished yet" here can therefore only mean the caller
+    # raised without waiting for the future; a caller that blocked on it would
+    # have sat out the whole park and finished before returning.
+    still_in_flight = not finished.is_set()
+    # The cancel landed while the setup was parked, so no session id exists
+    # yet and nothing may have been deleted.
     assert not second_delete.is_set(), "cancelled setup deleted before it ran"
-    # Only now: `sess-inflight` does not exist until the parked callable
-    # returns, and the cleanup callback fires off that return.
     release.set()
     assert finished.wait(_PARK_TIMEOUT), "create_session never returned"
+    assert still_in_flight, (
+        "_session_and_challenge waited for the in-flight create_session "
+        "instead of aborting on cancel_event")
+    # Only now: `sess-inflight` does not exist until the parked callable
+    # returns, and the cleanup callback fires off that return.
     assert deleted_once.wait(_PARK_TIMEOUT), (
         "the session created by the in-flight create_session was never "
         "deleted: it lingers upstream with no id anyone kept")
@@ -294,7 +324,8 @@ def _two_account_settings(config_path: str) -> Settings:
 
 def _install_ban_failover(monkeypatch, settings: Settings) -> AccountPool:
     """Failover from the banned a@x.com onto b@x.com; returns the pool."""
-    pool = AccountPool(settings.accounts, current=settings.active_account)
+    pool = AccountPool(settings.accounts, current=settings.active_account,
+                       provider="deepseek")
     used: list[str] = []
 
     def _core(app_, item_, prep_, **kw):
@@ -403,43 +434,28 @@ def _no_signals(monkeypatch) -> list:
 def _claim_cmdline(monkeypatch, cmdline) -> None:
     """Pin the command line the reaper should see.
 
-    ``raising=False`` on purpose: on pre-change code (no reader at all) the
-    fake is simply never consulted, the pid gets signalled anyway, and the
-    test fails on the signal assertion -- which is the regression.
+    ``raising=False`` on purpose: code without a reader has no such attribute,
+    so the fake is simply never consulted, and a caller can install a raising
+    probe the same way.
     """
     monkeypatch.setattr(MS, "_process_command_line", lambda pid: cmdline,
                         raising=False)
 
 
-def test_reaper_refuses_a_pid_that_is_not_opencode_serve(monkeypatch):
-    """Pre-change: the only gate on the SIGTERM was a probe against a base URL
-    stored in the SAME serve.json the pid came from, so any writer of that
-    file could aim the signal at an arbitrary same-user process."""
-    signalled = _no_signals(monkeypatch)
-    _claim_cmdline(monkeypatch, r"C:\Windows\notepad.exe somefile.txt")
+def _force_alive(monkeypatch) -> None:
+    """Pin the OS liveness probe to "running" for the reap tests.
 
-    MS._kill_pid(4242)
-
-    assert signalled == [], \
-        "a process that is not 'opencode serve' was signalled"
-
-
-def test_reaper_signals_a_matching_opencode_serve(monkeypatch):
-    """The other half: the real target must still be reaped."""
-    signalled = _no_signals(monkeypatch)
-    _claim_cmdline(
-        monkeypatch,
-        '"/c/Users/op/.bun/bin/opencode" serve --port 45999 '
-        "--hostname 127.0.0.1")
-
-    MS._kill_pid(4242)
-
-    assert [pid for _channel, pid in signalled] == [4242], \
-        "the stale managed serve was not signalled"
+    Their subject is the command-line identity gate, and the fake pid 4242 is
+    dead on every runner: without this the dead-pid fast path (owned by
+    ``test_reaper_skips_a_dead_recorded_pid_...`` below) returns before the
+    gate is ever consulted.
+    """
+    monkeypatch.setattr(MS, "_pid_alive", lambda pid: True, raising=False)
 
 
 def test_reaper_skips_unreadable_command_line_and_never_raises(monkeypatch):
     signalled = _no_signals(monkeypatch)
+    _force_alive(monkeypatch)
     _claim_cmdline(monkeypatch, "")
     MS._kill_pid(4242)  # no /proc, no wmic, no PowerShell: must not guess
     assert signalled == [], "an unreadable command line must skip the signal"
@@ -469,6 +485,7 @@ def test_reaper_never_signals_its_own_process_group(monkeypatch):
     is tested through the seam, never against the real process.
     """
     signalled = _no_signals(monkeypatch)
+    _force_alive(monkeypatch)
     seen: list[int] = []
     matching = ('"/c/Users/op/.bun/bin/opencode" serve --port 45999 '
                 "--hostname 127.0.0.1")
@@ -490,6 +507,87 @@ def test_reaper_never_signals_its_own_process_group(monkeypatch):
     assert seen == [4242], seen
     assert [pid for _channel, pid in signalled] == [4242], \
         "a real opencode serve pid must still be reaped, not swallowed"
+
+
+def test_reaper_skips_a_dead_recorded_pid_without_reading_its_command_line(
+        monkeypatch, caplog):
+    """A dead pid is the NORM: ``serve.json`` outlives the process it names.
+
+    The atexit kill retires the process, never the file, so every clean
+    restart paid a ~0.5 s PowerShell spawn to fail reading a command line that
+    no longer exists -- and then logged "the stale serve is left running"
+    about a process that is gone.
+    """
+    signalled = _no_signals(monkeypatch)
+    probed: list[int] = []
+    monkeypatch.setattr(MS, "_pid_alive", lambda pid: False, raising=False)
+    monkeypatch.setattr(MS, "_process_command_line",
+                        lambda pid: (probed.append(pid)
+                                     or "opencode serve --port 45999"),
+                        raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="deepseaport.server"):
+        MS._kill_pid(4242)
+
+    assert signalled == [], "a dead pid was signalled"
+    assert probed == [], "a dead pid must not cost a command-line probe"
+    assert "not signalling" not in caplog.text, \
+        "a dead pid was reported as a stale serve left running"
+
+
+def test_reaper_still_gates_when_liveness_is_unknown(monkeypatch):
+    """``None`` = "the OS will not say", and that keeps the conservative path.
+
+    Only a proven-dead pid is skipped; an unanswered probe falls through to
+    the identity gate, which is where the refusal belongs.
+    """
+    signalled = _no_signals(monkeypatch)
+    probed: list[int] = []
+    monkeypatch.setattr(MS, "_pid_alive", lambda pid: None, raising=False)
+    monkeypatch.setattr(MS, "_process_command_line",
+                        lambda pid: probed.append(pid) or "", raising=False)
+
+    MS._kill_pid(4242)
+
+    assert probed == [4242], "an unanswered liveness probe must fall through"
+    assert signalled == [], "an unidentifiable pid was signalled"
+
+
+def test_pid_alive_answers_for_a_running_and_a_gone_pid():
+    """The liveness probe against the REAL OS, on whichever platform runs it.
+
+    The dead-pid fast path is only correct if this answers False for a gone
+    pid: the command-line reader cannot tell "gone" from "unreadable", so a
+    False that never comes would bring back the 0.5 s probe and the false
+    warning.
+    """
+    assert MS._pid_alive(os.getpid()) is True
+    # Beyond pid_max on every mainstream OS, so it can never name a process.
+    assert MS._pid_alive(2**31 - 1) is False
+
+
+def test_pid_alive_refuses_to_guess_about_a_junk_pid():
+    """Non-positive and unparsable pids stay "unanswered" (None).
+
+    That leaves the reader's own ``pid <= 0`` guard owning those cases, and
+    keeps pid 0 -- POSIX's "every process in the group" -- from ever being
+    probed as if it named one process.
+    """
+    for bad in (0, -1, "x", None):
+        assert MS._pid_alive(bad) is None
+
+
+def test_pid_alive_reports_an_exited_child_dead():
+    """A just-reaped child, which is the state the wait branch exists for.
+
+    On Windows the process object may still be held open by the ``Popen``
+    handle after ``wait()`` returns -- "gone, but the OS still knows it" --
+    and the probe must read either that or the pid's release as dead.
+    """
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=30)
+
+    assert MS._pid_alive(proc.pid) is False
 
 
 @pytest.mark.parametrize("pid", [-1, 0])
@@ -793,7 +891,7 @@ def test_serve_config_keeps_the_access_log_off(monkeypatch, tmp_path):
 
     settings = _settings(port=5001, config_path=str(tmp_path / "c.json"))
     assert server_runner._run_server(
-        settings, argparse.Namespace(host="127.0.0.1", port=0, workers=1),
+        settings, argparse.Namespace(host="127.0.0.1", port=0),
         ensure_free=lambda s, h, p: p) == 0
 
     assert seen.get("access_log", "<missing>") is False, \
@@ -823,7 +921,8 @@ def test_accounts_route_rejects_a_full_token_identifier(monkeypatch):
                          keys=["sk-test"])
     app = create_app(settings)
     monkeypatch.setattr(srv_mod, "_pool",
-                        lambda app_: AccountPool(settings.accounts, current=""))
+                        lambda app_: AccountPool(settings.accounts, current="",
+                                                 provider="deepseek"))
 
     with TestClient(app) as client:
         listed = client.get("/v1/accounts",
@@ -873,7 +972,8 @@ def _crashing_stream(monkeypatch, mod, seam, provider, model) -> str:
     st = settings(provider=provider,
                   accounts=[AccountConfig(email="a@x.com", token="tok")])
     app = create_app(st)
-    pool = AccountPool(st.accounts, current=st.active_account)
+    pool = AccountPool(st.accounts, current=st.active_account,
+                       provider="deepseek")
     prep = _prepare({"model": model, "stream": True,
                      "messages": [{"role": "user", "content": "hi"}]})
     return sse_text(asyncio.run(collect_sse(mod, app, pool, None, prep)))

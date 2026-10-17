@@ -1,29 +1,27 @@
 """Managed isolated ``opencode serve`` for deepseaport-only minimal system prompt.
 
-First-time users get zero-config startup: on the first completion the
-provider boots its own dedicated ``opencode serve`` subprocess tuned for raw
-API passthrough (minimal agent + deny-all permissions + system-strip
-plugin). The user's own opencode setup is never touched:
+Boots a dedicated ``opencode serve`` child on the first completion (minimal
+agent + deny-all permissions + system-strip plugin). Its env is child-only
+(``XDG_CONFIG_HOME`` -> empty dir, ``OPENCODE_CONFIG_DIR`` -> generated dir,
+``OPENCODE_CONFIG_CONTENT`` -> generated JSON,
+``OPENCODE_DISABLE_PROJECT_CONFIG``/``OPENCODE_DISABLE_CLAUDE_CODE``), and
+drops the parent's ``OPENCODE_CONFIG`` path plus every well-known third-party
+provider key (``_CHILD_ENV_DENY_NAMES``): config merges additively, so either
+would leak user instructions or credentials into the managed instance. The
+parent env, ``~/.config/opencode`` and project files stay intact.
 
-- child-only env (``XDG_CONFIG_HOME`` -> empty dir, ``OPENCODE_CONFIG_DIR``
-  -> generated dir, ``OPENCODE_CONFIG_CONTENT`` -> generated JSON,
-  ``OPENCODE_DISABLE_PROJECT_CONFIG``/``OPENCODE_DISABLE_CLAUDE_CODE``);
-  the parent process env, ``~/.config/opencode``, and any project files are
-  left intact, so plain ``opencode`` runs exactly as before;
-- the parent's ``OPENCODE_CONFIG`` file path is dropped from the child env
-  (config merges additively, so it would otherwise leak user instructions
-  into the managed instance), as is every well-known third-party provider key
-  (see ``_CHILD_ENV_DENY_NAMES``);
-- an ephemeral basic-auth password is generated per boot and only shared
-  between the child and this process (the port file and every managed dir are
-  created owner-only 0700 on POSIX, with a one-shot Windows ACL warning, so
-  extra deepseaport workers can reuse the same instance without publishing
-  the password to other local users);
-- an explicitly user-configured ``DEEPSEAPORT_OPENCODE_BASE`` is respected:
-  managed boot is skipped entirely and the user's serve is used as-is.
+The basic-auth password is ephemeral per boot and shared only between the
+child and this process. The port file and managed dirs are owner-only 0700 on
+POSIX; on Windows the password inside ``serve.json`` is DPAPI-wrapped for the
+current user, so the one-shot ACL warning only fires while a cleartext
+``password`` is still on disk (an older file, or a machine without DPAPI).
+Extra deepseaport workers of the same user reuse the instance without the
+password reaching other local users. A user-configured
+``DEEPSEAPORT_OPENCODE_BASE`` skips managed boot entirely and uses the user's
+serve as-is.
 
-Never raises: every failure returns ``None`` and the caller falls back to
-the historical serve-down 502 with a hint.
+Never raises: every failure returns ``None`` and the caller falls back to the
+historical serve-down 502 with a hint.
 """
 
 from __future__ import annotations
@@ -205,12 +203,14 @@ def write_isolated_files(base: Path) -> dict[str, Path]:
     Pure file work; never touches the real HOME. Never raises.
 
     ``base`` and every subdir are created 0700 on POSIX: ``serve.json`` holds
-    the live basic-auth password in cleartext and mkdir()'s umask default is
-    0755, which left it world-readable. Same helper the obscura cookie-jar
-    dir uses (``core.obscura_bridge.secure_dir``), plus the one-shot Windows
-    ACL warning, because chmod is a no-op there.
+    the live basic-auth password and mkdir()'s umask default is 0755, which
+    left it world-readable. Same helper the obscura cookie-jar dir uses
+    (``core.obscura_bridge.secure_dir``). The Windows half is
+    :func:`_warn_plaintext_port_file`: it fires only while the file ON DISK
+    still carries a cleartext ``password`` (chmod is a no-op there, and fresh
+    writes store the password DPAPI-wrapped).
     """
-    from ...core.obscura_bridge import secure_dir, warn_inherited_acl_once
+    from ...core.obscura_bridge import secure_dir
 
     paths = {
         "work": base / "work",
@@ -225,14 +225,7 @@ def write_isolated_files(base: Path) -> dict[str, Path]:
             secure_dir(target, "managed opencode dir")
     except Exception:
         return paths
-    try:
-        warn_inherited_acl_once(
-            paths["port_file"],
-            secret="the per-boot opencode basic-auth password it stores in "
-                   "cleartext (and the base URL any local process can then use)",
-            label="managed opencode port file")
-    except Exception:
-        pass
+    _warn_plaintext_port_file(paths["port_file"])
     try:
         plugin = paths["cfg"] / "plugins" / "strip-system.js"
         if (not plugin.exists()
@@ -279,7 +272,11 @@ def _probe(base: str, password: str, timeout: float = 2.0) -> bool:
 # A single 2 s probe is not proof of death: a busy serve (loaded box, a wedged
 # agent loop) can miss it while answering another request. Both preserve
 # decisions in ensure() run under _lock, so retrying the probe adds at most a
-# few seconds once on the genuinely-dead path and never on the hot path.
+# few seconds once on the genuinely-dead path and never on the hot path. The
+# port-file decision narrows to ONE attempt when the OS reports the recorded
+# pid gone (see ensure()): that is the only shape in which the busy-serve
+# protection applies, and it is what keeps a restart cheap on a host where
+# even a refused connect costs seconds.
 _PROBE_ATTEMPTS = 3
 _PROBE_PAUSE = 1.0
 
@@ -302,6 +299,103 @@ def _probe_alive(base: str, password: str, attempts: int = _PROBE_ATTEMPTS,
     return False
 
 
+# The port-file password is DPAPI-wrapped on Windows. serve.json sits in a
+# directory that inherits the checkout's ACL, and on a default install that
+# grants BUILTIN\Users read, so a cleartext password was readable by every
+# other local user (the one-shot ACL warning below describes exactly that).
+# DPAPI ties the value to the current account -- which is the precise set of
+# processes allowed to reuse the serve -- and leaves the file's location, the
+# operator's call, alone. POSIX keeps plaintext: 0600 inside a 0700 dir is the
+# real control there. Both helpers never raise and return "" when the OS
+# refuses (a foreign user's file, a profile-less service account); the caller
+# then falls back to a cleartext write plus the warning, never to a failure.
+_DPAPI_FIELD = "password_dpapi"
+
+
+def _dpapi_call(proc_name: str, payload: bytes) -> bytes:
+    """``CryptProtectData``/``CryptUnprotectData`` over ``payload``; b"" on failure."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    if not payload:
+        return b""
+    buf = ctypes.create_string_buffer(payload, len(payload))
+    blob_in = _Blob(len(payload),
+                    ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = _Blob()
+    if not getattr(crypt32, proc_name)(
+            ctypes.byref(blob_in), None, None, None, None, 0,
+            ctypes.byref(blob_out)):
+        return b""
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        kernel32.LocalFree(blob_out.pbData)
+
+
+def _dpapi_protect(secret: str) -> str:
+    """DPAPI-wrap ``secret`` for the current Windows user; "" when unavailable."""
+    if os.name != "nt" or not secret:
+        return ""
+    try:
+        raw = _dpapi_call("CryptProtectData", secret.encode("utf-8"))
+    except Exception:
+        return ""
+    return base64.b64encode(raw).decode("ascii") if raw else ""
+
+
+def _dpapi_unprotect(token: str) -> str:
+    """Inverse of :func:`_dpapi_protect`; "" when it is not ours to open."""
+    if os.name != "nt" or not token:
+        return ""
+    try:
+        raw = _dpapi_call("CryptUnprotectData", base64.b64decode(token))
+    except Exception:
+        return ""
+    return raw.decode("utf-8", "replace") if raw else ""
+
+
+def _port_file_has_cleartext_password(port_file: Path) -> bool:
+    """True when serve.json carries the legacy cleartext ``password`` field."""
+    try:
+        data = json.loads(port_file.read_text(encoding="utf-8"))
+        return bool(isinstance(data, dict) and str(data.get("password") or ""))
+    except Exception:
+        return False
+
+
+def _warn_plaintext_port_file(port_file: Path) -> None:
+    """One-shot Windows ACL warning while serve.json holds a cleartext password.
+
+    The warning describes a real exposure, but it used to fire on every boot
+    because cleartext was the only storage there was. With DPAPI-wrapped
+    storage the exposure exists only while the file ON DISK still carries a
+    plaintext ``password``: written by an older deepseaport, by a foreign user,
+    or by a machine where the DPAPI calls failed. Whether the platform warns
+    at all stays :func:`warn_inherited_acl_once`'s call (POSIX no-ops there).
+    """
+    if not _port_file_has_cleartext_password(port_file):
+        return
+    try:
+        from ...core.obscura_bridge import warn_inherited_acl_once
+
+        warn_inherited_acl_once(
+            port_file,
+            secret="the per-boot opencode basic-auth password it stores in "
+                   "cleartext (and the base URL any local process can then use)",
+            label="managed opencode port file")
+    except Exception:
+        pass
+
+
 def _read_port_file(port_file: Path) -> tuple[str, str, int, str]:
     """(base, password, serve_pid, config_hash); blanks when unreadable."""
     try:
@@ -312,8 +406,13 @@ def _read_port_file(port_file: Path) -> tuple[str, str, int, str]:
                 pid = int(data.get("pid") or 0)
             except (TypeError, ValueError):
                 pid = 0
+            password = str(data.get("password") or "")
+            if not password:
+                # DPAPI-wrapped at rest (Windows); "" when the file is not
+                # this user's to open, which reads as "no usable password".
+                password = _dpapi_unprotect(str(data.get(_DPAPI_FIELD) or ""))
             return (str(data.get("base") or "").strip().rstrip("/"),
-                    str(data.get("password") or ""), pid,
+                    password, pid,
                     str(data.get("config_hash") or ""))
     except Exception:
         pass
@@ -322,20 +421,26 @@ def _read_port_file(port_file: Path) -> tuple[str, str, int, str]:
 
 def _write_port_file(port_file: Path, base: str, password: str,
                      pid: int, config_hash: str) -> None:
-    # 0600 is real on POSIX only; on Windows os.chmod merely toggles the
-    # read-only attribute and the file keeps its directory's DACL, which is
-    # why write_isolated_files also emits the one-shot ACL warning for this
-    # file. The parent dir is 0700 on POSIX, so the mode here is belt-and-braces.
+    # On Windows the password is DPAPI-wrapped for the current user (see
+    # _DPAPI_FIELD); the cleartext branch is the fallback when DPAPI is
+    # unavailable, and it is what the ACL warning exists for. POSIX keeps the
+    # plaintext: the parent dir is 0700 and the 0600 below is real there,
+    # so the mode here is belt-and-braces.
     try:
-        port_file.write_text(json.dumps(
-            {"base": base, "password": password, "pid": pid,
-             "config_hash": config_hash}), encoding="utf-8")
+        record = {"base": base, "pid": pid, "config_hash": config_hash}
+        wrapped = _dpapi_protect(password)
+        if wrapped:
+            record[_DPAPI_FIELD] = wrapped
+        else:
+            record["password"] = password
+        port_file.write_text(json.dumps(record), encoding="utf-8")
         try:
             os.chmod(port_file, 0o600)
         except OSError:
             pass
     except Exception:
         pass
+    _warn_plaintext_port_file(port_file)
 
 
 # Subprocess probe timeout for the command-line read in _process_command_line.
@@ -536,36 +641,28 @@ def _base_port(base: str) -> int:
 def _looks_like_managed_serve(cmdline: str, expected_base: str = "") -> bool:
     """True only when a command line IS the managed ``opencode serve``.
 
-    An identity check, not a resemblance check, because the pid this gates
-    comes from an ordinary JSON file in the data dir:
+    An identity check, not a resemblance check: the pid this gates comes from
+    an ordinary JSON file in the data dir, and signalling a stranger is not
+    recoverable while refusing only costs a stale process (``ensure()`` boots
+    a fresh instance on a new free port anyway). The launcher must BE opencode
+    -- case-folded and suffix-insensitive (``opencode.exe``, ``opencode.CMD``
+    and a bare ``opencode`` are one stem), with ``shutil.which`` consulted so
+    a renamed install still matches; a file named ``serve.exe`` is a stranger
+    -- or exactly the Windows shell wrapper ``Popen([opencode.CMD, ...])``
+    records, ``cmd.exe /c <path>\\opencode.CMD serve ...``, whose pid is the
+    WRAPPER's, with the serve as its child; only that three-token prefix is
+    accepted (``cmd`` ``/c`` ``<opencode>``), so ``cmd.exe /c start opencode
+    serve`` fails on the ``start``. ``serve`` must be a real argv element of
+    the launcher, not a word in the line (the line is split into argv first:
+    POSIX quoting on POSIX, CommandLineToArgvW-style on Windows), and
+    ``--port N`` must agree with the base URL recorded alongside the pid
+    whenever that base carries a port: every managed boot passes ``--port``,
+    so a line without one -- an ``opencode serve --service`` background
+    process, say -- is not this reaper's target.
 
-    * The launcher must BE opencode, case-folded and suffix-insensitive
-      (Windows: ``opencode.exe``, ``opencode.CMD`` and a bare ``opencode`` are
-      the same stem). ``shutil.which`` is consulted when it resolves, so an
-      install whose binary carries a different name still matches. Anything
-      else is a stranger: notepad, powershell, calc, a file named
-      ``serve.exe``.
-    * OR the Windows shell wrapper that launches it: CPython hands a batch
-      file to the OS shell, so ``Popen([opencode.CMD, ...])`` records
-      ``cmd.exe /c <path>\\opencode.CMD serve ...`` and the pid in the port
-      file is the WRAPPER's, with the serve as its child. Only that exact
-      three-token prefix is accepted (``cmd`` ``/c`` ``<opencode>``), so
-      ``cmd.exe /c start opencode serve`` still fails on the ``start`` in
-      argv[2] -- a wrapper that merely mentions opencode later in the line is
-      not the launcher we spawned.
-    * ``serve`` must be a real argv element of the launcher, not a word
-      somewhere in the line. The line is split into argv first (POSIX quoting
-      on POSIX, CommandLineToArgvW-style quoting on Windows) so a quoted path
-      and a path-less invocation both parse.
-    * ``--port N``, when present, must agree with the base URL recorded
-      alongside the pid. A serve on another port is not the instance whose
-      pid was recorded.
-
-    Returns False on ANY failure to read or parse: an unreadable command
-    line, an unbalanced quote, an empty argv. The caller then skips the
-    signal (see :func:`_kill_pid`), so the cost is a stale process and a busy
-    port -- ``ensure()`` boots a fresh instance on a new free port anyway --
-    while signalling a stranger is not recoverable. Never raises.
+    False on ANY failure to read or parse -- unreadable command line,
+    unbalanced quote, empty argv; the caller then skips the signal (see
+    :func:`_kill_pid`). Never raises.
     """
     try:
         argv = _split_argv(cmdline)
@@ -582,18 +679,97 @@ def _looks_like_managed_serve(cmdline: str, expected_base: str = "") -> bool:
             return False
         if not any(tok.lower() == _SERVE_SUBCOMMAND for tok in rest):
             return False
-        port = _argv_port(argv)
-        if port and expected_base:
+        if expected_base:
             want = _base_port(expected_base)
-            if want and want != port:
+            port = _argv_port(argv)
+            if want and port != want:
                 logger.warning(
                     "managed serve reaper: recorded base %s is port %d but the "
-                    "pid's command line says --port %d; not signalling it.",
-                    expected_base, want, port)
+                    "pid's command line says %s; not signalling it.",
+                    expected_base, want,
+                    f"--port {port}" if port else "no --port")
                 return False
         return True
     except Exception:  # pragma: no cover - defensive, contract is "never raises"
         return False
+
+
+def _windows_pid_alive(pid: int) -> bool | None:
+    """True/False for a Windows pid, None when the OS will not say.
+
+    ``os.kill(pid, 0)`` is NOT usable here: on Windows a non-Ctrl signal to
+    ``os.kill`` goes through ``TerminateProcess``, so a liveness check would
+    BE the kill. ``OpenProcess(SYNCHRONIZE)`` plus a zero-wait on the handle
+    answers the same question without touching the target: a gone pid fails
+    with ERROR_INVALID_PARAMETER (87), a just-exited-but-unreaped one still
+    hands out a handle whose wait reports exit, and ERROR_ACCESS_DENIED (5)
+    means the pid EXISTS but is not ours to open -- "cannot tell", never
+    "dead", because the caller then falls through to the command-line
+    identity gate and its conservative refusal.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL,
+                                     wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x00100000, False, int(pid))  # SYNCHRONIZE
+    if not handle:
+        return False if ctypes.get_last_error() == 87 else None
+    try:
+        wait = kernel32.WaitForSingleObject(handle, 0)
+        if wait == 0x00000000:                     # WAIT_OBJECT_0: exited
+            return False
+        return True if wait == 0x00000102 else None  # WAIT_TIMEOUT: running
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _posix_pid_alive(pid: int) -> bool | None:
+    """True/False for a POSIX pid, None when the OS will not say.
+
+    Signal 0 is a pure existence/permission probe there. EPERM means the
+    process exists (just not ours to signal), so it reads as alive and the
+    identity gate keeps owning the decision.
+    """
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+
+
+def _pid_alive(pid: int) -> bool | None:
+    """Is ``pid`` a live process? None = the OS will not say (never raises).
+
+    The command-line reader cannot tell "gone" from "unreadable" -- both come
+    back empty -- so a DEAD recorded pid used to be reported as "the stale
+    serve is left running", after a PowerShell spawn spent half a second
+    proving nothing. A dead recorded pid is the normal state of serve.json
+    (the atexit kill retires the process, not the file), so this decides from
+    the OS first. Non-positive pids stay "unanswered" on purpose: the
+    reader's own ``pid <= 0`` guard keeps owning that case.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        return (_windows_pid_alive(pid) if os.name == "nt"
+                else _posix_pid_alive(pid))
+    except Exception:
+        return None
 
 
 def _kill_pid(pid: int) -> None:
@@ -615,9 +791,19 @@ def _kill_pid(pid: int) -> None:
     line -- is skipped, and the reap simply does not happen: ``ensure()`` boots
     a fresh instance on a new free port anyway, so the cost is a stale process
     and a busy port, never a stranger's process.
+
+    A pid that no longer EXISTS is skipped silently before any command-line
+    probe (:func:`_pid_alive`): nothing is left running to reap, and the
+    warning below -- which claims exactly that -- is only for a process that
+    is there and cannot be identified.
     """
     if not pid or pid == os.getpid():
         return
+    try:
+        if _pid_alive(pid) is False:
+            return
+    except Exception:
+        pass
     try:
         cmdline = _process_command_line(pid)
     except Exception:
@@ -757,7 +943,7 @@ def _reap_previous_child(recorded_pid: int = 0) -> None:
     password for the life of the bridge, serving an instance (with the
     managed agent's ``bash: "deny"`` map) that nothing can reach or shut down
     again -- and ``ensure()`` runs from every serve-down error path
-    (completion_service.py:202, 288), so they accumulated.
+    (completion_service.py:145, 226), so they accumulated.
 
     The tracked ``_proc`` is reaped by handle: we spawned it, so it cannot be
     a stranger and the identity gate is not needed. Only when the handle is
@@ -864,12 +1050,42 @@ def ensure(timeout: float = 30.0) -> str | None:
             # would fail the identity gate on a now-dead process and log a
             # misleading "not signalling it" warning).
             old_pid_reaped = False
-            if old_base and old_password and _probe_alive(old_base, old_password):
+            # The retries exist so a live-but-busy serve is not mistaken for a
+            # dead one; a pid the OS reports GONE cannot be that serve, so its
+            # single failed probe is decisive. On a host where even a refused
+            # connect costs seconds (a local filter driver) that is the
+            # difference between a snappy boot and one that looks hung.
+            # shortcut: a Windows wrapper that died while its serve child
+            # outlived it AND is busy enough to miss this one probe boots a
+            # duplicate, and the orphan is unreapable afterwards (the recorded
+            # pid is the dead wrapper, so the reap skips it); upgrade if that
+            # is ever observed live.
+            old_attempts = _PROBE_ATTEMPTS
+            try:
+                if old_pid and _pid_alive(old_pid) is False:
+                    old_attempts = 1
+            except Exception:
+                pass
+            if (old_base and old_password
+                    and _probe_alive(old_base, old_password,
+                                     attempts=old_attempts)):
                 if not wanted_hash or old_hash == wanted_hash:
                     _managed_base, _managed_password = old_base, old_password
                     os.environ[_BASE_ENV] = old_base
                     os.environ[_PASSWORD_ENV] = old_password
                     os.environ[_MANAGED_BASE_SENTINEL] = old_base
+                    # Upgrade a file an older build (or a DPAPI-less machine)
+                    # left cleartext, right here: a reused serve means the
+                    # next fresh boot -- and with it the wrapped form -- may
+                    # never come. Never rewritten once it is in the form this
+                    # build writes; a second writer per boot would only widen
+                    # the last-writer-wins window a concurrent boot already
+                    # has.
+                    if (os.name == "nt"
+                            and _port_file_has_cleartext_password(
+                                paths["port_file"])):
+                        _write_port_file(paths["port_file"], old_base,
+                                         old_password, old_pid, old_hash)
                     return old_base
                 logger.info("managed serve config changed, restarting it")
                 _kill_pid(old_pid)

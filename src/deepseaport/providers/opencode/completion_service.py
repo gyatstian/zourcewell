@@ -26,8 +26,6 @@ from . import client as OC
 from . import protocol as P
 from ...core import engine as _engine
 from ...core.engine import drive_retries
-# Shared shim re-export for compat (non-stream route uses server's copy).
-from ...core.openai import _openai_response  # noqa: F401
 from ...core.tools import (
     looks_truncated_tool_attempt,
     parse_tool_calls as _parse_tool_calls_local,
@@ -71,7 +69,7 @@ def classify_error(error: str | None) -> RetryKind | None:
     if not error:
         return None
     low = error.lower()
-    if P.is_serve_down_error(error) or "opencode_serve_down" in low:
+    if P.is_serve_down_error(error):
         return RetryKind.UPSTREAM
     if any(k in low for k in ("rate_limit", "rate limit", "429", "too many",
                               "quota", "freeusagelimit", "free_usage")):
@@ -118,6 +116,55 @@ def _raise_for_terminal_error(app, item, prep, token, error, login_note, stream_
                               error, login_note, stream_ban_until)
 
 
+def _create_session(timeout: float) -> tuple[str | None, str | None]:
+    """Create a session, booting the managed serve once when it is down.
+
+    Returns ``(session_id, None)`` or ``(None, error)``; transport failures
+    become the ``error`` string the retry table classifies. ``_StreamCancelled``
+    propagates.
+    """
+    try:
+        return OC.create_session(timeout=min(30.0, timeout)), None
+    except _StreamCancelled:
+        raise
+    except Exception as exc:
+        err = _error_text("", str(exc))
+        if not (P.is_serve_down_error(err) and _ensure_managed_serve()):
+            return None, err
+        try:
+            return OC.create_session(timeout=min(30.0, timeout)), None
+        except _StreamCancelled:
+            raise
+        except Exception as exc2:
+            return None, _error_text("", str(exc2))
+
+
+def _send_with_variant_fallback(send, variant: str | None):
+    """Call ``send(variant)``; an unknown-variant refusal resends once without.
+
+    ``send`` is ``OC.send_message`` / ``OC.stream_message`` bound with this
+    turn's arguments. Returns ``(result, None, False)`` on success and
+    ``(None, error, resent)`` otherwise; ``resent`` is True when the error came
+    from the variant-less resend, so the live path knows its SSE fallback does
+    not apply. ``_StreamCancelled`` propagates.
+    """
+    try:
+        return send(variant), None, False
+    except _StreamCancelled:
+        raise
+    except Exception as exc:
+        err = _error_text("", str(exc))
+        if not (variant and "variant" in err.lower()):
+            return None, err, False
+        logger.info("opencode variant %r rejected, retrying without", variant)
+        try:
+            return send(None), None, True
+        except _StreamCancelled:
+            raise
+        except Exception as exc2:
+            return None, _error_text("", str(exc2)), True
+
+
 def _attempt(prompt: str, model: str, timeout: float,
              on_content=None, on_thinking=None,
              cancel_event: threading.Event | None = None,
@@ -136,46 +183,18 @@ def _attempt(prompt: str, model: str, timeout: float,
     try:
         if cancel_event is not None and cancel_event.is_set():
             return "", "", _error_text("CANCELLED", "client disconnected"), 0
-        try:
-            session_id = OC.create_session(timeout=min(30.0, timeout))
-        except _StreamCancelled:
-            raise
-        except Exception as exc:
-            err = _error_text("", str(exc))
-            if P.is_serve_down_error(err) and _ensure_managed_serve():
-                try:
-                    session_id = OC.create_session(timeout=min(30.0, timeout))
-                except _StreamCancelled:
-                    raise
-                except Exception as exc2:
-                    return "", "", _error_text("", str(exc2)), 0
-            else:
-                return "", "", err, 0
+        session_id, err = _create_session(timeout)
+        if err is not None:
+            return "", "", err, 0
         if cancel_event is not None and cancel_event.is_set():
             return "", "", _error_text("CANCELLED", "client disconnected"), 0
-        try:
-            result = OC.send_message(session_id, provider_id, model_id,
-                                     agent, prompt, timeout=timeout,
-                                     variant=variant,
-                                     cancel_event=cancel_event)
-        except _StreamCancelled:
-            raise
-        except Exception as exc:
-            err = _error_text("", str(exc))
-            if variant and "variant" in err.lower():
-                logger.info("opencode variant %r rejected, retrying without",
-                            variant)
-                try:
-                    result = OC.send_message(
-                        session_id, provider_id, model_id,
-                        agent, prompt, timeout=timeout,
-                        cancel_event=cancel_event)
-                except _StreamCancelled:
-                    raise
-                except Exception as exc2:
-                    return "", "", _error_text("", str(exc2)), 0
-            else:
-                return "", "", err, 0
+        result, err, _resent = _send_with_variant_fallback(
+            lambda v: OC.send_message(
+                session_id, provider_id, model_id, agent, prompt,
+                timeout=timeout, variant=v, cancel_event=cancel_event),
+            variant)
+        if err is not None:
+            return "", "", err, 0
         content = result.get("content") or ""
         thinking = result.get("thinking") or ""
         if on_content is not None and content:
@@ -217,21 +236,9 @@ def _attempt_live(prompt: str, model: str, timeout: float,
     try:
         if cancel_event is not None and cancel_event.is_set():
             return "", "", _error_text("CANCELLED", "client disconnected"), 0
-        try:
-            session_id = OC.create_session(timeout=min(30.0, timeout))
-        except _StreamCancelled:
-            raise
-        except Exception as exc:
-            err = _error_text("", str(exc))
-            if P.is_serve_down_error(err) and _ensure_managed_serve():
-                try:
-                    session_id = OC.create_session(timeout=min(30.0, timeout))
-                except _StreamCancelled:
-                    raise
-                except Exception as exc2:
-                    return "", "", _error_text("", str(exc2)), 0
-            else:
-                return "", "", err, 0
+        session_id, err = _create_session(timeout)
+        if err is not None:
+            return "", "", err, 0
         if cancel_event is not None and cancel_event.is_set():
             return "", "", _error_text("CANCELLED", "client disconnected"), 0
         emitted = {"content": False, "thinking": False}
@@ -254,52 +261,34 @@ def _attempt_live(prompt: str, model: str, timeout: float,
                 except Exception:
                     pass
 
-        try:
-            result = OC.stream_message(
+        result, err, _resent = _send_with_variant_fallback(
+            lambda v: OC.stream_message(
                 session_id, provider_id, model_id, agent, prompt,
-                timeout=timeout, variant=variant,
+                timeout=timeout, variant=v,
                 on_content=(_track_content if on_content is not None else None),
                 on_thinking=(_track_thinking if on_thinking is not None else None),
-                cancel_event=cancel_event)
-        except _StreamCancelled:
-            raise
-        except Exception as exc:
-            err = _error_text("", str(exc))
-            # Variant rejection: resend once without it (live path).
-            if variant and "variant" in err.lower():
-                logger.info("opencode variant %r rejected, retrying without",
-                            variant)
-                try:
-                    result = OC.stream_message(
-                        session_id, provider_id, model_id, agent, prompt,
-                        timeout=timeout,
-                        on_content=(_track_content if on_content is not None else None),
-                        on_thinking=(_track_thinking if on_thinking is not None else None),
-                        cancel_event=cancel_event)
-                except _StreamCancelled:
-                    raise
-                except Exception as exc2:
-                    return "", "", _error_text("", str(exc2)), 0
-            elif not emitted["content"] and not emitted["thinking"]:
-                # Live tail never started (SSE/connect failure): fall back to
-                # the blocking POST on a fresh session so the request still
-                # succeeds with buffered (chunked) SSE downstream.
-                # Scrubbed before the 100-char slice: a slice is not a redactor,
-                # and `err` is a raw upstream message. serve is localhost with
-                # no account credential, but it is still a process whose prose
-                # reaches the log file and any shipper reading it.
-                logger.info("opencode live tail failed (%s), falling back to "
-                            "blocking", _engine.scrub_upstream_text(err, 100))
-                try:
-                    OC.delete_session(session_id)
-                except Exception:
-                    pass
-                session_id = None
-                return _attempt(prompt, model, timeout,
-                                on_content=on_content, on_thinking=on_thinking,
-                                cancel_event=cancel_event, variant=variant)
-            else:
+                cancel_event=cancel_event),
+            variant)
+        if err is not None:
+            if _resent or emitted["content"] or emitted["thinking"]:
                 return "", "", err, 0
+            # Live tail never started (SSE/connect failure): fall back to
+            # the blocking POST on a fresh session so the request still
+            # succeeds with buffered (chunked) SSE downstream.
+            # Scrubbed before the 100-char slice: a slice is not a redactor,
+            # and `err` is a raw upstream message. serve is localhost with
+            # no account credential, but it is still a process whose prose
+            # reaches the log file and any shipper reading it.
+            logger.info("opencode live tail failed (%s), falling back to "
+                        "blocking", _engine.scrub_upstream_text(err, 100))
+            try:
+                OC.delete_session(session_id)
+            except Exception:
+                pass
+            session_id = None
+            return _attempt(prompt, model, timeout,
+                            on_content=on_content, on_thinking=on_thinking,
+                            cancel_event=cancel_event, variant=variant)
         content = result.get("content") or ""
         thinking = result.get("thinking") or ""
         # Live deltas already rode the callbacks; do not re-emit the full
@@ -421,12 +410,6 @@ def _run_completion_core(
     return {"content": content, "thinking": think, "usage_total": usage_total}
 
 
-def _run_completion(app: FastAPI, item, prep: dict,
-                    cancel_event: threading.Event | None = None) -> dict:
-    """Blocking full completion (no failover: no accounts to fail over to)."""
-    return _run_completion_core(app, item, prep, cancel_event=cancel_event)
-
-
 def _complete_with_failover_sync(app: FastAPI, pool, prep: dict,
                                  first_item,
                                  cancel_event: threading.Event | None = None,
@@ -458,21 +441,16 @@ async def _stream_completion(app: FastAPI, pool, item, prep: dict):
         live = str(getattr(settings, "stream_mode", "live")).lower() == "live"
     except Exception:
         live = True
-    # `buffered=not live` is the cross-provider contract, not a detail
-    # (ARCHITECTURE.md, "Provider architecture": "stream_mode: buffered must
-    # call new_stream_context(..., buffered=True) so the consumer watchdog
-    # covers the whole producer budget, not one read"); DeepSeek passes the
-    # same argument at providers/deepseek/completion_service.py:1156.
-    #
-    # The watchdog must be sized from the SAME timeout the producer runs with:
-    # `_run_completion_core` reads DEEPSEAPORT_OPENCODE_TIMEOUT
-    # (P.opencode_timeout), so passing the raw OC.DEFAULT_TIMEOUT here left a
-    # raised knob (600) with a 180 + 10 s consumer while the producer's
-    # deadline was create(30) + turn(600) + one overload retry(600) -- a
-    # healthy-but-slow serve was answered {"error": {"message": "upstream
-    # timed out"}} and a fully assembled reply was thrown away. Live mode
-    # keeps the single-read budget exactly: every delta resets the per-get
-    # clock.
+    # `buffered=not live` is the cross-provider contract, not a detail (see
+    # ARCHITECTURE.md, "Provider architecture"); DeepSeek passes the same
+    # argument. The watchdog must be sized from the SAME timeout the producer
+    # runs with: `_run_completion_core` reads DEEPSEAPORT_OPENCODE_TIMEOUT
+    # (P.opencode_timeout): a raw OC.DEFAULT_TIMEOUT here leaves a 180 + 10 s
+    # consumer against a create(30) + turn(600) + overload retry(600)
+    # producer deadline -- a healthy-but-slow serve is answered
+    # {"error": {"message": "upstream timed out"}} and a fully assembled reply
+    # is thrown away. Live mode keeps the single-read budget exactly: every
+    # delta resets the per-get clock.
     timeout = P.opencode_timeout(OC.DEFAULT_TIMEOUT)
     (cid, created, out, cancel_event, consumer_timeout, model,
      _emit, _put) = _engine.new_producer_context(

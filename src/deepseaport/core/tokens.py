@@ -37,12 +37,6 @@ def extract_token(raw: object) -> str:
             data = json.loads(text)
         except Exception:
             return ""
-        if isinstance(data, str):
-            # Double-encoded: {"...": "{\"value\":\"...\"}"} after one parse.
-            try:
-                data = json.loads(data)
-            except Exception:
-                return data.strip()
         if isinstance(data, dict):
             value = data.get("value")
             if value is None:
