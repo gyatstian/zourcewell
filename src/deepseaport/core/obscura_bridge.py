@@ -16,7 +16,6 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 import threading
 import time
 from collections.abc import Iterable
@@ -34,10 +33,15 @@ CHAT_HOME = os.environ.get("DEEPSEAPORT_CHAT_HOME", "https://chat.deepseek.com/"
 
 
 def _repo_root() -> Path:
-    # Frozen exe: exe location; source: repo root (matches config._app_dir()).
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parents[3]
+    # Same base as config.json: repo root in a checkout, per-user dir for an
+    # installed wheel, exe location when frozen -- see config._app_dir(), which
+    # this used to duplicate as Path(__file__).parents[3] (the interpreter's
+    # Lib/ for a wheel). Imported inside the function because this module is
+    # imported from config's neighbourhood: config imports only core.tokens
+    # (stdlib-only) and core/__init__.py is empty, so there is no cycle.
+    from ..config import _app_dir
+
+    return _app_dir()
 
 
 REPO_ROOT = _repo_root()

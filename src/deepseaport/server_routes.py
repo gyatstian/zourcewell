@@ -14,13 +14,18 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import re
 import threading
 import time
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.utils import is_body_allowed_for_status_code
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from .accounts import AccountPool, provider_label, usable_provider as _usable_provider
@@ -107,7 +112,7 @@ def _too_large_detail(length: int) -> str:
 
 def _too_large(length: int) -> JSONResponse:
     return JSONResponse(status_code=413,
-                        content={"detail": _too_large_detail(length)})
+                        content=error_envelope(413, _too_large_detail(length)))
 
 
 def _redact_path(path: str) -> str:
@@ -249,8 +254,115 @@ def install_body_limit(app: FastAPI) -> None:
     app.add_middleware(BodyLimitMiddleware)
 
 
+# OpenAI error-type vocabulary (api.openai.com slugs). Only the statuses this
+# surface can actually raise are listed; everything else -- every 5xx -- is
+# api_error, which is also the bucket OpenAI uses for "the server broke".
+_ERROR_TYPE_BY_STATUS = {
+    400: "invalid_request_error", 409: "invalid_request_error",
+    413: "invalid_request_error", 422: "invalid_request_error",
+    401: "authentication_error", 403: "permission_error",
+    404: "not_found_error", 429: "rate_limit_error",
+}
+
+
+def _error_message(detail) -> str:
+    """``detail`` as the string ``error.message`` must stay (never null).
+
+    Same rule as the SSE error frame (core.engine.sse_error_frame): strict
+    OpenAI SDKs type ``error.message`` as a string, and FastAPI's own 422
+    detail is a LIST of objects, so the raw value would land as a nested JSON
+    array. Non-str details are JSON-encoded rather than ``str()``-ed, which
+    would print a Python repr.
+    """
+    if isinstance(detail, str):
+        return detail
+    if detail is None:
+        return ""
+    try:
+        return json.dumps(detail, ensure_ascii=False, default=str)
+    except Exception:
+        return str(detail)
+
+
+def error_envelope(status_code: int, detail) -> dict:
+    """OpenAI-shaped error body: the pinned ``detail`` PLUS an ``error`` object.
+
+    Additive by contract: ``detail`` keeps the exact value every existing
+    client and test reads, while ``error`` ({message, type, param, code}) is
+    what OpenAI SDKs and LiteLLM-style retry classifiers consume. ``param``
+    and ``code`` stay null: this bridge has no per-field or error-code
+    namespace of its own, and a fabricated value is worse than an absent one.
+
+    ``_too_large`` (the middleware-side 413) builds the same body through this
+    function: the body-limit middleware sits OUTSIDE the exception handlers, so
+    it cannot rely on them.
+    """
+    return {"detail": detail,
+            "error": {"message": _error_message(detail),
+                      "type": _ERROR_TYPE_BY_STATUS.get(int(status_code), "api_error"),
+                      "param": None, "code": None}}
+
+
+async def _http_exception_response(request: Request,
+                                   exc: StarletteHTTPException) -> Response:
+    """HTTPException -> envelope, with the status and headers preserved.
+
+    Registered on Starlette's ``HTTPException`` so it also covers FastAPI's
+    subclass (the one every route raises) and the router's own 404/405.
+    ``exc.headers`` must survive: Retry-After and friends are already attached
+    by the raiser, and dropping them silently un-does that decision.
+    """
+    headers = getattr(exc, "headers", None)
+    if not is_body_allowed_for_status_code(exc.status_code):
+        # 204/304/1xx: FastAPI's own handler sends no body here, and a JSON
+        # body would be a protocol error.
+        return Response(status_code=exc.status_code, headers=headers)
+    return JSONResponse(status_code=exc.status_code,
+                        content=error_envelope(exc.status_code, exc.detail),
+                        headers=headers)
+
+
+async def _validation_error_response(request: Request,
+                                     exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's own 422 detail (byte-identical), plus the envelope."""
+    return JSONResponse(
+        status_code=422,
+        content=error_envelope(422, jsonable_encoder(exc.errors())))
+
+
+async def _unhandled_error_response(request: Request, exc: Exception) -> JSONResponse:
+    """500 envelope for an unhandled exception; its text is never echoed.
+
+    Deliberately does not log: Starlette's ServerErrorMiddleware re-raises after
+    the response is on the wire, so uvicorn still prints the traceback exactly
+    as before. Adding an ``exc_info`` line here would be a second, unscrubbed
+    copy of a message that can carry an upstream body (core scrub contract).
+    """
+    return JSONResponse(status_code=500,
+                        content=error_envelope(500, "internal server error"))
+
+
+def install_error_envelope(app: FastAPI) -> None:
+    """Install the JSON error envelope on ``app`` (idempotent per app).
+
+    Every error response keeps its existing ``detail`` byte-for-byte and gains
+    the OpenAI-shaped ``error`` object: FastAPI's HTTPException (every 4xx this
+    surface raises, plus the router's own 404/405), RequestValidationError
+    (422), and the unhandled-exception 500. Module-level for the same reason as
+    install_body_limit: create_dry_app builds its own FastAPI and never calls
+    register_routes.
+    """
+    if getattr(app.state, "deepseaport_error_envelope", False):
+        return
+    app.state.deepseaport_error_envelope = True
+    app.add_exception_handler(StarletteHTTPException, _http_exception_response)
+    app.add_exception_handler(RequestValidationError, _validation_error_response)
+    app.add_exception_handler(Exception, _unhandled_error_response)
+
+
 def register_routes(app: FastAPI) -> None:
     install_body_limit(app)
+    install_error_envelope(app)
 
     @app.get("/health")
     async def health():
@@ -273,6 +385,23 @@ def register_routes(app: FastAPI) -> None:
             banned = sum(1 for a in accs if getattr(a, "banned", False))
         except Exception:
             total = with_token = banned = 0
+        # Per-provider readiness (additive): a multi-provider orchestrator needs
+        # to know WHICH pool is empty, not just the total. Counted from
+        # settings.accounts alone so /health stays pool-free and side-effect
+        # free; the provider default mirrors core.pools._provider_of.
+        by_provider: dict = {}
+        try:
+            for a in accs:
+                pid = (getattr(a, "provider", "") or "deepseek").strip().lower()
+                row = by_provider.setdefault(
+                    pid, {"accounts": 0, "accounts_with_token": 0, "banned": 0})
+                row["accounts"] += 1
+                if (getattr(a, "token", "") or "").strip():
+                    row["accounts_with_token"] += 1
+                if getattr(a, "banned", False):
+                    row["banned"] += 1
+        except Exception:
+            by_provider = {}
         try:
             pool = getattr(app.state, "pool", None)
             if pool is None:
@@ -304,7 +433,8 @@ def register_routes(app: FastAPI) -> None:
         # identity; /v1/accounts serves the identity behind the API key.
         return {"ok": True, "ready": ready, "waf": waf, "version": __version__,
                 "accounts": total, "accounts_with_token": with_token,
-                "banned": banned, "pool": pool_size, "current": bool(current)}
+                "banned": banned, "pool": pool_size, "current": bool(current),
+                "providers": by_provider}
 
     @app.get("/v1/waf/status")
     async def waf_status(authorization: str = Header(default="")):
@@ -329,15 +459,22 @@ def register_routes(app: FastAPI) -> None:
         # openapi_url is None, so before this the running server exposed no
         # version at all: a user genuinely could not ask what they were talking
         # to. Same single source as server.py/dry_run.py's FastAPI(version=...).
+        # Off the event loop: the opencode catalogue read is a blocking socket
+        # (2s live, up to 30s while a managed serve boots), and a cold-cache
+        # request here froze /health and every disconnect watcher for the read.
         return {"object": "list", "version": __version__,
-                "data": build_models_list(settings)}
+                "data": await asyncio.to_thread(build_models_list, settings)}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: dict, request: Request,
                                authorization: str = Header(default="")):
         settings: Settings = app.state.settings
         _check_auth(settings, authorization)
-        prep = _prepare(body, settings)  # raises 400/404 fast, before touching accounts
+        # Still raises 400/404 fast, before touching accounts; off the event
+        # loop because the render (and, for opencode, the catalogue read) is
+        # blocking work -- inline it froze /health and every disconnect watcher
+        # for the whole read.
+        prep = await asyncio.to_thread(_prepare, body, settings)
         from .core import registry as _registry
         provider = _registry.get(prep.get("provider")) or _registry.default()
         # Local providers (opencode CLI) need no account slot: skip the pool
@@ -852,6 +989,12 @@ def build_models_list(settings, now: int | None = None) -> list[dict]:
     data: list[dict] = []
     for mid in catalogue:
         owner = None
+        # Capability flags ride along as extra TOP-LEVEL keys: SDKs ignore
+        # unknown keys, and they are the only way a client learns whether
+        # /v1/chat/completions will honor the thinking/search toggles for this
+        # model (the tuple the live catalogue computes them from is dropped
+        # otherwise). False/False when the spec could not be resolved.
+        flags = {"thinking": False, "search": False}
         try:
             found = _registry.resolve_model(mid, provider_ids=resolved)
         except Exception:
@@ -860,10 +1003,12 @@ def build_models_list(settings, now: int | None = None) -> list[dict]:
             try:
                 provider, spec = found
                 owner = spec.owned_by or provider.id
+                flags = {"thinking": bool(spec.thinking),
+                         "search": bool(spec.search)}
             except Exception:
                 owner = None
         data.append({"id": mid, "object": "model", "created": now,
-                     "owned_by": owner or "deepseek"})
+                     "owned_by": owner or "deepseek", **flags})
     return data
 
 
@@ -880,6 +1025,15 @@ def _validate_messages(body: dict) -> list:
             raise HTTPException(
                 status_code=400,
                 detail=f"messages[{idx}] must be an object with a 'role' field")
+        # Container shape only: render_prompt iterates tool_calls, so a scalar
+        # or an object there raised TypeError inside the prompt render and
+        # surfaced as an opaque 500 (dry_run reached it through _prepare too).
+        # Non-dict ELEMENTS stay accepted: the renderer skips those.
+        tool_calls = msg.get("tool_calls")
+        if tool_calls is not None and not isinstance(tool_calls, list):
+            raise HTTPException(
+                status_code=400,
+                detail=f"messages[{idx}].tool_calls must be a list")
     return messages
 
 
@@ -1034,7 +1188,11 @@ def _extract_passthrough(body: dict) -> dict:
     # through when present. The web upstreams have no native tool calling:
     # tools are serialized into the prompt and parsed back out, so there is
     # nothing for parallel_tool_calls to switch off. Warn and drop, never echo.
-    for _k in ("temperature", "top_p", "parallel_tool_calls"):
+    # logprobs / top_logprobs / seed / logit_bias are in the same bucket: the
+    # upstream payload carries prompt/thinking/search only, so a caller asking
+    # for token logprobs or a reproducible sample used to get a silent drop.
+    for _k in ("temperature", "top_p", "parallel_tool_calls",
+               "logprobs", "top_logprobs", "seed", "logit_bias"):
         if body.get(_k) is not None:
             unsupported[_k] = body[_k]
     _max_tok = body.get("max_tokens", body.get("max_completion_tokens", None))

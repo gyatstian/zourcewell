@@ -173,8 +173,9 @@ def _raise_turn_error(detail: str, provider_id: str, model_id: str) -> None:
     if P.is_free_tier_error(detail):
         raise RuntimeError(
             "OPENCODE_FREE_TIER_DENIED: opencode free tier refused the "
-            "request (upstream client-fingerprint check). Upgrade the "
-            "`opencode` CLI and retry; key-gated models need "
+            "request. This can also happen when the selected agent denies "
+            "core tools (`read` or `bash`/`shell`); check its permission "
+            "map before retrying. Key-gated models need "
             "`opencode auth login`. "
             f"Upstream: {detail[:300]}")
     raise RuntimeError(
@@ -403,6 +404,110 @@ def _raise_cancelled() -> None:
     raise _Cancelled()
 
 
+def _permission_request_id(payload: dict, session_id: str) -> str:
+    """Return a pending permission id for this session, or ``""``."""
+    try:
+        if str(payload.get("type") or "") not in (
+                "permission.asked", "permission.v2.asked"):
+            return ""
+        props = payload.get("data")
+        if not isinstance(props, dict):
+            props = payload.get("properties")
+        if not isinstance(props, dict):
+            return ""
+        owner = str(props.get("sessionID") or props.get("sessionId") or "")
+        if owner != session_id:
+            return ""
+        return str(props.get("requestID") or props.get("id")
+                   or props.get("permissionID") or "").strip()
+    except Exception:
+        return ""
+
+
+def _reject_permission(session_id: str, request_id: str) -> None:
+    """Reject one managed permission request without surfacing an error."""
+    if not session_id or not request_id:
+        return
+    try:
+        status, _data = _request(
+            "POST",
+            f"/api/session/{session_id}/permission/{request_id}/reply",
+            {"decision": "reject"},
+            timeout=10,
+            session_id=session_id,
+        )
+        if status >= 300:
+            logger.debug("opencode permission reject returned HTTP %s", status)
+    except Exception as exc:
+        logger.debug("opencode permission reject failed: %s", exc)
+
+
+def _reject_permission_event(payload: dict, session_id: str) -> None:
+    request_id = _permission_request_id(payload, session_id)
+    if request_id:
+        _reject_permission(session_id, request_id)
+
+
+def _read_sse_events(session_id: str, stop_event: threading.Event,
+                     connected: threading.Event, on_event,
+                     sse_error: list[str] | None = None,
+                     idle: threading.Event | None = None,
+                     cancel_event=None) -> None:
+    """Read the local event bus and dispatch decoded JSON frames."""
+    try:
+        url = P.base_url() + "/api/event"
+        headers = {"Accept": "text/event-stream"}
+        headers.update(_auth_header())
+        headers.update(P.client_headers(session_id))
+        req = urllib.request.Request(url, method="GET", headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            connected.set()
+            buf = b""
+            data_lines: list[str] = []
+            while not stop_event.is_set() and not (idle and idle.is_set()):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                try:
+                    chunk = resp.read(1)
+                except TimeoutError:
+                    continue
+                except Exception as exc:
+                    if sse_error is not None:
+                        sse_error.append(f"SSE_READ: {exc}"[:300])
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                if not buf.endswith(b"\n"):
+                    continue
+                try:
+                    line = buf.decode("utf-8", "replace").rstrip("\r\n")
+                except Exception:
+                    line = ""
+                buf = b""
+                if not line:
+                    if data_lines:
+                        raw = "\n".join(data_lines)
+                        data_lines = []
+                        if raw.startswith("data:"):
+                            raw = raw[5:].strip()
+                        try:
+                            payload = json.loads(raw)
+                            if isinstance(payload, dict):
+                                on_event(payload)
+                        except Exception:
+                            pass
+                elif line.startswith("data:"):
+                    data_lines.append(line)
+                elif line.startswith(":"):
+                    continue
+    except Exception as exc:
+        if not connected.is_set() and sse_error is not None:
+            sse_error.append(f"SSE_CONNECT: {exc}"[:300])
+    finally:
+        connected.set()
+
+
 def _await_turn(session_id: str, user_id: str, provider_id: str,
                 model_id: str, timeout: float,
                 cancel_event=None) -> dict:
@@ -450,12 +555,30 @@ def send_message(session_id: str, provider_id: str, model_id: str,
     retries once on a fresh session. ``cancel_event`` aborts the session and
     raises the shared cancellation sentinel (see :func:`_raise_cancelled`).
     """
-    user_id = prompt_async(
-        session_id, provider_id, model_id, agent, prompt,
-        timeout=min(30.0, max(5.0, float(timeout))),
-        variant=variant)
-    return _await_turn(session_id, user_id, provider_id, model_id, timeout,
-                       cancel_event=cancel_event)
+    stop_permissions = threading.Event()
+    permissions_connected = threading.Event()
+    permission_reader = threading.Thread(
+        target=_read_sse_events,
+        args=(session_id, stop_permissions, permissions_connected,
+              lambda event: _reject_permission_event(event, session_id)),
+        kwargs={"cancel_event": cancel_event},
+        daemon=True,
+    )
+    permission_reader.start()
+    permissions_connected.wait(timeout=10.0)
+    try:
+        user_id = prompt_async(
+            session_id, provider_id, model_id, agent, prompt,
+            timeout=min(30.0, max(5.0, float(timeout))),
+            variant=variant)
+        return _await_turn(session_id, user_id, provider_id, model_id, timeout,
+                           cancel_event=cancel_event)
+    finally:
+        stop_permissions.set()
+        try:
+            permission_reader.join(timeout=5.0)
+        except Exception:
+            pass
 
 
 def stream_message(session_id: str, provider_id: str, model_id: str,
@@ -508,8 +631,11 @@ def stream_message(session_id: str, provider_id: str, model_id: str,
     def _handle_event(payload: dict) -> None:
         """One ``data: {...}`` frame; payload fields live under ``data``."""
         try:
+            _reject_permission_event(payload, session_id)
             etype = str(payload.get("type") or "")
             props = payload.get("data")
+            if not isinstance(props, dict):
+                props = payload.get("properties")
             if not isinstance(props, dict):
                 return
             if str(props.get("sessionID") or "") != session_id:
@@ -530,66 +656,8 @@ def stream_message(session_id: str, provider_id: str, model_id: str,
             pass
 
     def _read_sse() -> None:
-        try:
-            url = P.base_url() + "/api/event"
-            headers = {"Accept": "text/event-stream"}
-            headers.update(_auth_header())
-            headers.update(P.client_headers(session_id))
-            req = urllib.request.Request(url, method="GET", headers=headers)
-            # Short socket timeout so cancel/idle checks stay responsive;
-            # the serve sends ": heartbeat" comments, so silence is expected.
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                _connected.set()
-                buf = b""
-                data_lines: list[str] = []
-                while not _stop_reader.is_set() and not _idle.is_set():
-                    if _cancelled():
-                        break
-                    try:
-                        chunk = resp.read(1)
-                    except TimeoutError:
-                        # Socket timeout: re-check stop conditions, keep going.
-                        # (Since 3.10 socket.timeout IS TimeoutError; anything
-                        # else is a real mid-stream failure, below.)
-                        continue
-                    except Exception as exc:
-                        # A reset/EOF mid-stream is not a timeout: swallowing
-                        # it here spun this loop at 100% CPU and left the wait
-                        # below blind until its deadline. Surface it instead;
-                        # the final timeline read still wins if the turn
-                        # actually completed.
-                        _sse_error.append(f"SSE_READ: {exc}"[:300])
-                        break
-                    if not chunk:
-                        break
-                    buf += chunk
-                    if buf.endswith(b"\n"):
-                        try:
-                            line = buf.decode("utf-8", "replace").rstrip("\r\n")
-                        except Exception:
-                            line = ""
-                        buf = b""
-                        if not line:
-                            if data_lines:
-                                raw = "\n".join(data_lines)
-                                data_lines = []
-                                # Frames are `data: {...}`; ignore comments.
-                                if raw.startswith("data:"):
-                                    raw = raw[5:].strip()
-                                try:
-                                    _handle_event(json.loads(raw))
-                                except Exception:
-                                    pass
-                        elif line.startswith("data:"):
-                            data_lines.append(line)
-                        elif line.startswith(":"):
-                            continue
-                        # `event:` lines carry no payload; ignore.
-        except Exception as exc:
-            if not _connected.is_set():
-                _sse_error.append(f"SSE_CONNECT: {exc}"[:300])
-        finally:
-            _connected.set()
+        _read_sse_events(session_id, _stop_reader, _connected, _handle_event,
+                         _sse_error, _idle, cancel_event)
 
     reader = threading.Thread(target=_read_sse, daemon=True)
     reader.start()

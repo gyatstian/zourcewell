@@ -30,7 +30,14 @@ from fastapi.responses import StreamingResponse
 
 from . import __version__
 from .config import Settings
-from .server_routes import _check_auth, _prepare, build_models_list, install_body_limit
+from .core import engine as _engine
+from .server_routes import (
+    _check_auth,
+    _prepare,
+    build_models_list,
+    install_body_limit,
+    install_error_envelope,
+)
 
 # Serializes the multi-line request dumps so concurrent requests never
 # interleave mid-block. Counter stays monotonic across requests.
@@ -120,32 +127,26 @@ def _openai_dry_response(cid: str, created: int, prep: dict, content: str) -> di
 
 def _openai_dry_sse(cid: str, created: int, model: str, content: str,
                     prep: dict | None = None):
-    """SSE chunk stream carrying the same content for stream:true clients."""
-    def _chunk(delta: dict, finish: str | None = None) -> bytes:
-        return ("data: " + json.dumps(
-            {"id": cid, "object": "chat.completion.chunk", "created": created,
-             "model": model, "dry_run": True,
-             "choices": [{"index": 0, "delta": delta,
-                          "finish_reason": finish}]},
-            ensure_ascii=False) + "\n\n").encode("utf-8")
+    """SSE chunk stream carrying the same content for stream:true clients.
 
+    Frames come from the shared ``core.engine`` builders, so the dry surface
+    cannot drift from the live one; the dry-run marker rides in as ``extra``.
+    The usage chunk is the engine's too: its internal fallback replaces the
+    silent skip this used to carry, matching the live path, which never
+    silently drops the usage chunk.
+    """
     def _gen():
-        yield _chunk({"role": "assistant"})
+        yield _engine.stream_chunk(cid, created, model, {"role": "assistant"},
+                                   extra={"dry_run": True})
         for i in range(0, len(content), 2000):
-            yield _chunk({"content": content[i:i + 2000]})
-        yield _chunk({}, "stop")
-        try:
-            opts = ((prep or {}).get("stream_options") or {})
-            if isinstance(opts, dict) and opts.get("include_usage"):
-                from .core.openai import build_usage as _build_usage
-                usage = _build_usage(prep or {}, content, "", None)
-                yield ("data: " + json.dumps(
-                    {"id": cid, "object": "chat.completion.chunk",
-                     "created": created, "model": model, "dry_run": True,
-                     "choices": [], "usage": usage},
-                    ensure_ascii=False) + "\n\n").encode("utf-8")
-        except Exception:
-            pass
+            yield _engine.stream_chunk(cid, created, model,
+                                       {"content": content[i:i + 2000]},
+                                       extra={"dry_run": True})
+        yield _engine.stream_chunk(cid, created, model, {}, "stop",
+                                   extra={"dry_run": True})
+        if _engine.wants_usage(prep or {}):
+            yield _engine.usage_chunk(cid, created, model, prep or {}, content,
+                                      "", None, extra={"dry_run": True})
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(_gen(), media_type="text/event-stream",
@@ -165,6 +166,8 @@ def create_dry_app(settings: Settings | None = None) -> FastAPI:
     # and without the guard it echoed and printed an unbounded body to the
     # terminal (dry run exists to print the body).
     install_body_limit(app)
+    # Same JSON error envelope as the live app (detail + error object).
+    install_error_envelope(app)
 
     @app.get("/health")
     async def health():
@@ -176,17 +179,22 @@ def create_dry_app(settings: Settings | None = None) -> FastAPI:
         # the dry surface cannot be enumerated by an unauthenticated client.
         settings_ = app.state.settings
         _check_auth(settings_, authorization)
-        # Central listing shared with the live route: catalogue + owned_by in
-        # server_routes.build_models_list.
-        return {"object": "list", "data": build_models_list(settings_)}
+        # Catalogue + owned_by come from the shared build_models_list, and the
+        # listing carries the same "version" key as the live route (see
+        # server_routes.list_models). Off the event loop like the live route
+        # (opencode's catalogue read is a blocking socket; see there).
+        return {"object": "list", "version": __version__,
+                "data": await asyncio.to_thread(build_models_list, settings_)}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: dict, request: Request,
                                authorization: str = Header(default="")):
         settings_: Settings = app.state.settings
         _check_auth(settings_, authorization)
-        # _prepare raises 400/404 fast on bad model/messages (same as live).
-        prep = _prepare(body, settings_)
+        # _prepare raises 400/404 fast on bad model/messages (same as live),
+        # and off the event loop for the same reason as the live route: the
+        # prompt render must not block /health or a concurrent SSE stream.
+        prep = await asyncio.to_thread(_prepare, body, settings_)
         num = next(_REQUEST_IDS)
         # Terminal always gets the full dump; the flag only gates how much
         # of it is sent back to the requesting client. Off the event loop:

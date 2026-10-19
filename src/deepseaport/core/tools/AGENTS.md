@@ -22,6 +22,7 @@ reply is parsed back into OpenAI `tool_calls`.
 - Parsing is first match wins, in the order above. Add a new format at the end of the chain; inserting earlier shadows the formats above it and silently changes which replies parse.
 - DSML raw-value blocks are preferred for large or file arguments; the JSON forms are accepted for short calls.
 - `MAX_ARGS_CHARS` / `DEEPSEAPORT_MAX_ARGS_CHARS` (default 200000) caps the arguments of a single call.
+- DSML value semantics: a close-tag-shaped fragment inside a value (`</>`, `</parameter>`) no longer truncates it -- a parameter's bounded range prefers its specific close over a generic one, which may be value text. A parameter the schema declares `string` keeps its raw text verbatim, like one the model marked `string="true"`: no scalar coercion, so a zero-padded id stays a string and a trailing newline survives. Declared int/number/bool and schema-less parameters keep the historical coercion, in the strict and forgiving scans alike. Declared names canonicalize through `lower_map` in sorted order, so two names differing only in case resolve the same way in every process (`PYTHONHASHSEED`).
 - `MAX_BARE_OBJECTS` / `DEEPSEAPORT_MAX_BARE_OBJECTS` (default 40) bounds how many JSON objects the bare name+arguments scan inspects, and the forgiving bucket's total-call scan reuses the same number.
 - `DEEPSEAPORT_FORGIVING_TOOLCALLS` (default off) enables the markup-repair bucket.
 - Import limits from `common.py`. Never redefine a bound inside a parser module; two copies drift and one of them stops being enforced.
@@ -38,5 +39,5 @@ reply is parsed back into OpenAI `tool_calls`.
 ## Verification
 
 - The hermetic gate is owned by the root AGENTS.md; run it before any change here.
-- `tests/test_tools_gaps.py`, `tests/test_tool_and_provider_gaps.py`, `tests/test_tool_role_and_allowlist.py` and `tests/test_stream_protocol_index.py` cover this folder.
+- `tests/test_tools_gaps.py`, `tests/test_tool_and_provider_gaps.py`, `tests/test_tool_role_and_allowlist.py`, `tests/test_dsml_raw_values.py` and `tests/test_stream_protocol_index.py` cover this folder.
 - Run `python -m pytest -m live -q` after changing a prompt or parser bound. The live suite asserts a reply contains the end of the prompt, which is the check that catches a parser silently truncating output.

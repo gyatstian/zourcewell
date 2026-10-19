@@ -70,10 +70,15 @@ serve's own words (including "Variant") are kept in the error text:
 `completion_service` keys its one variant-less resend off that word. Unknown
 variants therefore cost one resend, not a failed request.
 
-The free-tier gatekeeper itself is only a terminal classification now
-(`protocol.is_free_tier_error` -> `OPENCODE_FREE_TIER_DENIED`, no retry, with
-an upgrade hint). The message-level tool declaration that used to satisfy it
-is gone with the rest of the message body.
+The free-tier gatekeeper remains a terminal classification
+(`protocol.is_free_tier_error` -> `OPENCODE_FREE_TIER_DENIED`, no retry). The
+upstream error is misleading: permission maps that deny `read` or `bash`/`shell`
+can also trigger it. The managed config keeps both available with approval
+required. The client subscribes to `permission.asked` before each turn and
+immediately replies `{"decision":"reject"}` for the matching session, so
+headless turns never wait for a human approval. The message-level tool
+declaration that used to satisfy the gate is gone with the rest of the message
+body.
 
 ## Native tools
 
@@ -81,16 +86,18 @@ v2 has **no message-level tool map at all** — the prompt body carries
 `{"text": ...}` and nothing else, and the declare-14-native-keys / grant-one-
 `read` machinery that used to ride it is gone with the rest of the body. What
 bounds tool access is the managed agent's permission map in
-`managed_serve.managed_config_content`: `read` / `glob` / `grep` / `subagent`
-/ `edit` / `bash` / `webfetch` / `external_directory` all deny, at both the
-global and the agent level. `read` (and `grep`, which prints matching file
-content) is denied because sessions are rooted at the caller's directory,
-where `config.json` — plaintext passwords and bearer tokens — can sit; on v2
-write/patch normalize to `edit` and `task` to `subagent`, so those aliases are
-covered by the same keys. That map is now the ONLY layer, so it is where any
-future grant must be made deliberately. v2 normalizes the keys we send
-(`agent` -> `agents`, `prompt` -> `system`, `bash` -> `shell`); the serve
-accepts the un-normalized spellings.
+`managed_serve.managed_config_content`: `read` and `bash` are `ask`; `glob`,
+`grep`, `subagent`, `edit`, `webfetch`, and `external_directory` are `deny` at
+both global and agent level. The free-tier gateway rejects requests when
+`read` or `bash` are absent from the tool list, so they remain approval-gated;
+the client immediately rejects any resulting request. `read` is still
+restricted because sessions are rooted at the caller's directory, where
+`config.json` may hold plaintext credentials; `subagent` stays denied because
+a spawned agent carries its own permission set. On v2 write/patch
+normalize to `edit`, bash to `shell`, and task to `subagent`. That map is the
+ONLY layer, so permission changes must be deliberate. v2 normalizes the keys
+we send (`agent` -> `agents`, `prompt` -> `system`, `bash` -> `shell`); the
+serve accepts the un-normalized spellings.
 
 DSML harness tools are unaffected: pi's tools arrive as DSML text in the
 prompt and the reply comes back as DSML `tool_calls`, parsed by

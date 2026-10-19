@@ -26,6 +26,19 @@ for _pkg in ('curl_cffi', 'wasmtime', 'deepseaport', 'websocket'):
     binaries += _tmp_ret[1]
     hiddenimports += _tmp_ret[2]
 
+# The same collect_all call also bundles the BUILD machine's dist-info for
+# deepseaport, so inside the exe `importlib.metadata.version('deepseaport')`
+# reports whatever the last `pip install -e .` wrote -- not VERSION. A bundled
+# text file is the one source that cannot disagree with the exe's own version
+# resource; src/deepseaport/__init__.py reads it first. Written under build/
+# (gitignored; PyInstaller's --clean wipes only build/<specnm>/, not its
+# parent), never under dist/: that directory is the frozen app's live
+# credential store.
+_version_file = Path(SPECPATH) / "build" / "_version.txt"
+_version_file.parent.mkdir(parents=True, exist_ok=True)
+_version_file.write_text(VERSION, encoding="utf-8")
+datas.append((str(_version_file), "deepseaport"))
+
 
 a = Analysis(
     ['entry.py'],

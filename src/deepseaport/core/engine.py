@@ -31,7 +31,7 @@ from contextlib import contextmanager
 
 from fastapi import HTTPException
 
-from ..server_concurrency import _StreamCancelled
+from ..server_concurrency import _STREAM_EXECUTOR, _StreamCancelled
 
 logger = logging.getLogger("deepseaport.core.engine")
 
@@ -145,22 +145,34 @@ def run_with_failover(
 ) -> object:
     """Run ``run_once(item)`` on ``first_item``, failing over on retryable errors.
 
-    Owns each attempt's slot: releases exactly once per attempt (success,
-    retryable, or fatal), acquires the next account before retrying, and
-    re-raises the first error when no healthy account remains. ``run_once``
-    performs one attempt (including any per-kind retries); the engine only
-    handles cross-account failover, cancellation, and slot lifecycle.
+    Owns each attempt's slot: releases it exactly once per attempt (success,
+    retryable, or fatal) unless ``slot_releaser`` already gave it up inside
+    that attempt -- the give-up is published thread-locally and the release is
+    then skipped, because the lock belongs to whichever request acquired the
+    account meanwhile (see ``slot_releaser``). Acquires the next account
+    before retrying, and re-raises the first error when no healthy account
+    remains. ``run_once`` performs one attempt (including any per-kind
+    retries); the engine only handles cross-account failover, cancellation,
+    and slot lifecycle.
 
     ``acquire`` and ``release`` are both required: the only caller binds the
     pool's own ``acquire`` and ``AccountPool.release``, so a default could only
     duplicate the former or shadow the latter.
     """
+    def _release_slot(item) -> None:
+        # Not ``release(item)``: see the docstring. Consuming the give-up
+        # always runs, so it cannot leak into the next attempt on this thread.
+        # The skip also drops ``AccountPool.release``'s ``uses`` bump and its
+        # waiter wake -- stats-only counter, and acquire() re-polls anyway.
+        if not consume_slot_abandoned(item):
+            release(item)
+
     if not allow_failover:
         try:
             return run_once(first_item)
         finally:
             try:
-                release(first_item)
+                _release_slot(first_item)
             except Exception:
                 pass
 
@@ -176,7 +188,7 @@ def run_with_failover(
             result = run_once(cur)
         except Exception as exc:
             try:
-                release(cur)
+                _release_slot(cur)
             except Exception:
                 pass
             retryable = False
@@ -206,7 +218,7 @@ def run_with_failover(
                 raise first_exc
             continue
         try:
-            release(cur)
+            _release_slot(cur)
         except Exception:
             pass
         return result
@@ -217,6 +229,25 @@ def error_text(code: str | None, message: str | None) -> str:
     code = (code or "").strip()
     message = (message or "").strip()
     return f"{code}: {message}" if code else message
+
+
+# Shared error vocabularies for the providers' ``classify_error`` tables.
+# ``transport.http_error_code`` renders every non-200 as "HTTP_502: <body>",
+# so a bare status shape must classify the same way on every provider: the
+# word lists were forked into each classifier and the numeric fallbacks were
+# never back-propagated (DeepSeek retried "bad gateway" but answered a bare
+# "502" terminally). A provider composes the neutral tuple with its own extras
+# (``_engine.TRANSIENT_OVERLOAD_MARKERS + (...)``) and keeps its own check order:
+# rate-limit before overload wherever a throttle body also says "try again".
+TRANSIENT_OVERLOAD_MARKERS = (
+    "overload", "overloaded", "server busy", "server_busy",
+    "service unavailable", "temporarily unavailable", "try again",
+    "timed out", "timeout", "bad gateway", "gateway timeout",
+    "500", "502", "503", "504",
+)
+RATE_LIMIT_MARKERS = ("rate_limit", "rate limit", "429", "too many")
+UPSTREAM_INVALID_MARKERS = (
+    "http_422", "http 422", "http_400", "http 400", "unprocessable")
 
 
 # An "opaque run" is a long unbroken stretch of token characters -- exactly
@@ -411,8 +442,36 @@ def drain_attempt(stream_fn: Callable[[dict, dict], object],
 # can legitimately run for a full stream (a ~90s socket budget plus PoW).
 # One minute covers that for a single-account deployment; a WAF warmup or a
 # browser login that outlives it just means this attempt proceeds without
-# the slot, which is the safe direction.
+# the slot, which is the safe direction *and* is published to the release
+# sites via ``consume_slot_abandoned``.
 SLOT_REACQUIRE_TIMEOUT = 60.0
+
+# The account whose slot this thread gave up and did not get back. Thread-local
+# for the same reason as ``_CURRENT_CANCEL``: the thread that released the
+# slot is the thread whose ``run_with_failover`` release runs later. It is
+# needed because ``threading.Lock.release()`` has NO owner check -- releasing
+# a lock this thread does not hold SUCCEEDS -- so a blind release after a
+# give-up unlocked the request that had acquired the account meanwhile, and a
+# third request could then start a stream on an account already in flight.
+_SLOT_ABANDONED = threading.local()
+
+
+def _slot_given_up(item) -> bool:
+    """True when THIS thread already gave up ``item``'s slot (read-only)."""
+    return getattr(_SLOT_ABANDONED, "item", None) is item
+
+
+def consume_slot_abandoned(item) -> bool:
+    """True once when THIS thread gave up ``item``'s slot; consumes it.
+
+    Identity-matched (``is``), not a bare flag: a give-up belongs to one
+    account for the rest of one attempt, never to whatever account the thread
+    touches next. Otherwise a stale entry would suppress a real release --
+    leaking a lock that stays held until the process restarts.
+    """
+    given_up = _slot_given_up(item)
+    _SLOT_ABANDONED.item = None
+    return given_up
 
 
 @contextmanager
@@ -422,51 +481,65 @@ def slot_releaser(item, cancel_event: threading.Event | None = None):
     Releases ``item.lock`` on entry (no-op when not held, e.g. unit tests
     calling the engine with a fresh account), reacquires on exit. The
     reacquire polls so a disconnect aborts promptly instead of blocking
-    indefinitely under contention (raises ``_StreamCancelled``). Leaving
-    the slot released on cancel is safe: the outer ``run_with_failover``
-    release is ``RuntimeError``-safe.
+    indefinitely under contention (raises ``_StreamCancelled``).
+
+    Exiting WITHOUT the slot back (cancel, deadline, acquire raising) leaves
+    the lock to whoever took the account meanwhile, so the give-up is
+    published for this thread and ``run_with_failover``'s release sites skip
+    it: ``Lock.release()`` from a non-holder succeeds and steals the new
+    holder's lock. A second ``slot_releaser`` on the same item later in the
+    same attempt (token refresh after a WAF give-up) must not release either,
+    which is why the entry release is guarded too.
 
     The reacquire is DEADLINE-bounded (``SLOT_REACQUIRE_TIMEOUT``) because
     ``cancel_event=None`` is legal (it is ``Provider.complete``'s documented
     default, and the direct-call/unit-test path), so every wait in this module
-    has to be bounded. On give-up the slot simply stays released, which is the
-    same state the cancel path already left behind and is safe by
-    construction: the outer ``run_with_failover`` release is authoritative and
-    swallows the ``RuntimeError`` of releasing a lock nobody holds.
+    has to be bounded. On give-up the attempt continues without the slot
+    rather than block forever; the pool still rate-limits it.
     """
     released = False
-    try:
-        item.lock.release()
-        released = True
-    except RuntimeError:
-        released = False
-    except Exception:
-        released = False
+    if not _slot_given_up(item):
+        try:
+            item.lock.release()
+            released = True
+        except Exception:
+            # RuntimeError when nobody holds it (a fresh account in a unit
+            # test, or an attempt whose give-up already released it): not held
+            # is the answer, not a malfunction.
+            released = False
     try:
         yield released
     finally:
         if released:
-            deadline = time.monotonic() + SLOT_REACQUIRE_TIMEOUT
-            while True:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise _StreamCancelled()
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    # Bound hit, not a cancel: the account is busy elsewhere
-                    # (another request, or a failover to this very account).
-                    # Continue WITHOUT the slot rather than block forever --
-                    # the attempt is still rate-limited by the pool and the
-                    # outer release stays authoritative either way.
-                    logger.warning(
-                        "account slot still held elsewhere after %.0fs; "
-                        "continuing without re-acquiring it for this attempt",
-                        SLOT_REACQUIRE_TIMEOUT)
-                    break
-                try:
-                    if item.lock.acquire(timeout=min(0.5, remaining)):
+            reacquired = False
+            try:
+                deadline = time.monotonic() + SLOT_REACQUIRE_TIMEOUT
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise _StreamCancelled()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        # Bound hit, not a cancel: the account is busy
+                        # elsewhere (another request, or a failover to this
+                        # very account). Continue WITHOUT the slot rather than
+                        # block forever -- the attempt is still rate-limited by
+                        # the pool, and the outer release skips a slot this
+                        # thread no longer owns.
+                        logger.warning(
+                            "account slot still held elsewhere after %.0fs; "
+                            "continuing without re-acquiring it for this "
+                            "attempt",
+                            SLOT_REACQUIRE_TIMEOUT)
                         break
-                except Exception:
-                    break
+                    try:
+                        if item.lock.acquire(timeout=min(0.5, remaining)):
+                            reacquired = True
+                            break
+                    except Exception:
+                        break
+            finally:
+                if not reacquired:
+                    _SLOT_ABANDONED.item = item
 
 
 def app_settings(app):
@@ -512,8 +585,6 @@ def ensure_token(item, no_token_detail: str) -> str:
 
 
 def _http_401(detail: str):
-    from fastapi import HTTPException
-
     return HTTPException(status_code=401, detail=detail)
 
 
@@ -540,8 +611,6 @@ def ban_403_for_item(app, item, ban_until: float | None,
     owns its settings we save exactly as before; otherwise the in-memory
     marker stands alone and a warning says so.
     """
-    from fastapi import HTTPException
-
     try:
         from ..accounts import AccountPool
 
@@ -593,8 +662,6 @@ def is_ban_http_exception(exc: BaseException,
                           is_ban_text: Callable[[str], bool]) -> bool:
     """True when exc is the ban 403 raised by ``_run_completion_core``."""
     try:
-        from fastapi import HTTPException
-
         return (isinstance(exc, HTTPException) and exc.status_code == 403
                 and bool(is_ban_text(str(getattr(exc, "detail", "") or ""))))
     except Exception:
@@ -712,8 +779,6 @@ def complete_with_failover_sync(app, pool, prep: dict, first_item,
 
     def _is_retryable(exc: BaseException) -> bool:
         try:
-            from fastapi import HTTPException
-
             return (isinstance(exc, HTTPException)
                     and (bool(is_ban_exc(exc)) or exc.status_code == 401))
         except Exception:
@@ -724,8 +789,6 @@ def complete_with_failover_sync(app, pool, prep: dict, first_item,
         if first_exc is None:
             first_exc, failed_item = exc, account
         try:
-            from fastapi import HTTPException
-
             from ..accounts import AccountPool
 
             if isinstance(exc, HTTPException) and exc.status_code == 401:
@@ -808,8 +871,6 @@ class LiveEmitTracker:
 
 def raise_rate_limit(provider_label: str, error: str | None) -> None:
     """Global throttle: 429, never account-marked. Always raises."""
-    from fastapi import HTTPException
-
     raise HTTPException(status_code=429,
                         detail=f"{provider_label} rate limited: {scrub_upstream_text(error, 200)}. "
                                "Wait 2-20 min, space requests, avoid parallel loops.")
@@ -817,8 +878,6 @@ def raise_rate_limit(provider_label: str, error: str | None) -> None:
 
 def raise_overload(provider_label: str, error: str | None) -> None:
     """Transient upstream overload: 503 (retryable), never a 500. Always raises."""
-    from fastapi import HTTPException
-
     raise HTTPException(status_code=503,
                         detail=f"{provider_label} server busy: {scrub_upstream_text(error, 200)}. "
                                "Retry shortly (transient overload).")
@@ -826,8 +885,6 @@ def raise_overload(provider_label: str, error: str | None) -> None:
 
 def raise_upstream_invalid(provider_label: str, prep: dict, error: str | None) -> None:
     """Upstream payload rejection (422/400 family): 502. Always raises."""
-    from fastapi import HTTPException
-
     logger.warning("upstream rejected completion payload (%s); "
                    "prompt_len=%d model=%s",
                    scrub_upstream_text(error, 500), len(str((prep or {}).get("prompt", ""))),
@@ -842,8 +899,6 @@ def raise_upstream_invalid(provider_label: str, prep: dict, error: str | None) -
 
 def raise_upstream(provider_label: str, error: str | None) -> None:
     """Generic upstream error: 502. Always raises."""
-    from fastapi import HTTPException
-
     logger.warning("upstream completion error: %s", scrub_upstream_text(error, 500))
     raise HTTPException(
         status_code=502,
@@ -852,8 +907,6 @@ def raise_upstream(provider_label: str, error: str | None) -> None:
 
 def empty_response_error(provider_label: str):
     """Upstream closed without content/thinking/error: 502, never silent 200."""
-    from fastapi import HTTPException
-
     return HTTPException(status_code=502,
                          detail=f"empty upstream response from {provider_label} "
                                 "(no content/thinking/error events; often "
@@ -936,15 +989,31 @@ def dispatch_terminal(classify_fn: Callable[[str | None], object],
 # engine has no view of ``max_retries`` and the worst case is unbounded anyway.
 _BUFFERED_PRODUCER_READS = 3
 
+# A producer running silently is normal: session create, PoW solve, and one
+# recovery pass (a ~180s browser login, an Obscura warmup) all emit nothing
+# until the reply lands. A proxy in front does not know that -- nginx drops an
+# idle response body at 60s (proxy_read_timeout), Cloudflare at 100s -- so a
+# healthy slow reply died without even an error frame. The consumer therefore
+# waits in slices this long and writes one SSE comment frame per slice: the
+# one line every SSE client ignores.
+_KEEPALIVE_INTERVAL = 15.0
+_KEEPALIVE_FRAME = b": ping\n\n"
+
 
 def stream_chunk(cid: str, created: int, model: str,
-                 delta: dict, finish: str | None = None) -> bytes:
-    """One OpenAI-style ``chat.completion.chunk`` SSE frame."""
-    return ("data: " + json.dumps(
-        {"id": cid, "object": "chat.completion.chunk", "created": created,
-         "model": model, "choices": [{"index": 0, "delta": delta,
-                                      "finish_reason": finish}]},
-        ensure_ascii=False) + "\n\n").encode("utf-8")
+                 delta: dict, finish: str | None = None,
+                 extra: dict | None = None) -> bytes:
+    """One OpenAI-style ``chat.completion.chunk`` SSE frame.
+
+    ``extra`` merges top-level keys into the payload (dry run stamps
+    ``{"dry_run": True}``); absent/empty keeps the frame byte-identical.
+    """
+    payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+               "model": model, "choices": [{"index": 0, "delta": delta,
+                                            "finish_reason": finish}]}
+    if extra:
+        payload.update(extra)
+    return ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
 
 
 def tool_finish_chunks(chunk_fn: Callable[..., bytes], calls,
@@ -975,23 +1044,27 @@ def tool_finish_chunks(chunk_fn: Callable[..., bytes], calls,
 
 def usage_chunk(cid: str, created: int, model: str, prep: dict,
                 content: str, thinking: str,
-                usage_total: int | None = None) -> bytes:
+                usage_total: int | None = None,
+                extra: dict | None = None) -> bytes:
     """Final OpenAI-style usage chunk (stream_options.include_usage).
 
     Emitted with empty choices before [DONE] so cost-tracking harnesses see
     the same prompt/completion totals as the non-stream response. Uses the
     shared ``core.openai.build_usage`` estimate (upstream never reports
     prompt tokens); ``usage_total`` wins for completion tokens when seen.
+    ``extra`` merges top-level keys into the payload (dry run stamps
+    ``{"dry_run": True}``).
     """
     try:
         from .openai import build_usage as _build_usage
         usage = _build_usage(prep, content or "", thinking or "", usage_total)
     except Exception:  # pragma: no cover - build_usage is pure and local
         usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-    return ("data: " + json.dumps(
-        {"id": cid, "object": "chat.completion.chunk", "created": created,
-         "model": model, "choices": [], "usage": usage},
-        ensure_ascii=False) + "\n\n").encode("utf-8")
+    payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+               "model": model, "choices": [], "usage": usage}
+    if extra:
+        payload.update(extra)
+    return ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
 
 
 # In-band SSE error frames (OpenAI ``{"error": {message, type, code}}``)
@@ -1116,16 +1189,33 @@ async def drain_stream_queue(out: asyncio.Queue, prep: dict, live: bool,
     both, which can outlast a single read. From the first payload on the plain
     ``consumer_timeout`` applies -- an event resets the clock, so it measures
     genuine silence only.
+
+    Each wait is sliced at ``_KEEPALIVE_INTERVAL`` and every slice that
+    expires with budget left emits a comment frame, so the client and the
+    proxies between us see bytes through a silent producer stretch. A slice
+    never crosses the budget, so a sub-interval budget (every hermetic test)
+    produces exactly the frames it did before the slices existed.
     """
     chunk = lambda delta, finish=None: stream_chunk(cid, created, model, delta, finish)  # noqa: E731
     yield chunk({"role": "assistant"})
     got_first = False
+    loop = asyncio.get_running_loop()
     while True:
         budget = consumer_timeout if got_first else (
             consumer_timeout * _BUFFERED_PRODUCER_READS)
-        try:
-            kind, payload = await asyncio.wait_for(out.get(), timeout=budget)
-        except asyncio.TimeoutError:
+        deadline = loop.time() + budget
+        timed_out = False
+        while True:
+            slice_left = min(_KEEPALIVE_INTERVAL, deadline - loop.time())
+            try:
+                kind, payload = await asyncio.wait_for(out.get(), timeout=slice_left)
+                break
+            except asyncio.TimeoutError:
+                if loop.time() >= deadline:
+                    timed_out = True
+                    break
+                yield _KEEPALIVE_FRAME
+        if timed_out:
             yield sse_error_frame("upstream timed out")
             yield b"data: [DONE]\n\n"
             return
@@ -1239,6 +1329,26 @@ def live_emit_pair(on_content, on_thinking):
     return tracker, tracker.wrap(on_content), tracker.wrap(on_thinking)
 
 
+def live_retry_predicate(classify_fn, kind, tracker):
+    """One predicate factory so NO row retries after a live emit.
+
+    The guard used to sit on the overload row alone, on the assumption that
+    the other kinds fail before any content. ``drain_attempt`` makes
+    content-then-error a legal ordering, and the completion POST is not
+    idempotent (the upstream already appended a turn), so a recovery fired
+    after a delta re-POSTs the same payload on the same session/chat and
+    re-streams from delta 0 into a stream the client already read: duplicated
+    text, or two interleaved halves of one ``tool_calls`` JSON object, then a
+    clean ``[DONE]`` and no error to stop the harness executing the corrupt
+    call. Every provider row goes through its local ``_retryable(kind)``,
+    which returns this.
+    """
+    def _ok(e):
+        return classify_fn(e) == kind and not tracker.emitted
+
+    return _ok
+
+
 def ban_until_of(outcome) -> float | None:
     """Best-effort ban-expiry from an attempt outcome (None when absent)."""
     try:
@@ -1253,11 +1363,8 @@ def new_producer_context(prep: dict, client_timeout: float,
 
     Owns ``new_stream_context`` + ``prep["model"]`` + the running loop +
     ``_emit``/``_put`` pair so the three providers share one queue/cancel/
-    emit shape. The producer bodies stay provider-specific (failover entry
-    vs live token tail); the bounded-executor submit stays at the call site
-    so the executor property remains greppable per provider. ``buffered``
-    is forwarded to the watchdog sizing (see ``new_stream_context``) and
-    defaults to False so every existing call site keeps its exact budget.
+    emit shape; ``stream_producer`` is its only caller. ``buffered``
+    is forwarded to the watchdog sizing (see ``new_stream_context``).
     """
     cid, created, out, cancel_event, consumer_timeout = new_stream_context(
         client_timeout, consumer_grace, buffered=buffered)
@@ -1305,3 +1412,52 @@ async def consume_stream(out: asyncio.Queue, prep: dict, live: bool,
                 cancel_event.set()
         except Exception:
             pass
+
+
+async def stream_producer(run, *, prep: dict, timeout: float, live: bool,
+                          grace: float = 10.0, parse_fn: Callable | None = None,
+                          truncated_fn: Callable | None = None):
+    """Shared _stream_completion skeleton the three adapters copied.
+
+    Owns context allocation (``new_producer_context``, with the watchdog sized
+    by ``buffered=not live``), the producer exception ladder, the bounded
+    submit (``_STREAM_EXECUTOR.submit`` plus the raw-thread fallback when the
+    executor is already shut down) and the ``consume_stream`` tail.
+    ``run(live, put, cancel_event)`` performs ONE completion on the producer
+    thread and returns the result dict; ``put(kind, text)`` publishes one live
+    delta. The provider keeps its failover entrypoint, its timeout global and
+    its grace global (read at generator-body time, so tests can patch them per
+    module).
+    """
+    (cid, created, out, cancel_event, consumer_timeout, model,
+     _emit, _put) = new_producer_context(prep, timeout, grace, buffered=not live)
+
+    def produce() -> None:
+        try:
+            result = run(live, _put, cancel_event)
+            _emit(("done", result))
+        except _StreamCancelled:
+            pass
+        except HTTPException as exc:
+            _emit(("http_error", exc))
+        except Exception as exc:  # noqa: BLE001
+            # Scrubbed because this is the one emit path that does NOT go
+            # through the terminal ladder: the client helpers raise with a raw
+            # slice of the upstream body in the message, and that body is the
+            # one most likely to echo the Authorization header it was given.
+            # 800 is the scrubber's default and a superset of that 200-char
+            # slice, so no diagnostic text is lost relative to today.
+            _emit(("error", scrub_upstream_text(exc, 800)))
+
+    # Bounded producer: one account-holding thread per stream, capped by the
+    # shared executor so a parallel-subagent burst queues instead of piling
+    # unbounded raw threads (each with account + PoW CPU).
+    try:
+        _STREAM_EXECUTOR.submit(produce)
+    except RuntimeError:
+        # Executor shut down (interpreter exit): fall back to a raw thread.
+        threading.Thread(target=produce, daemon=True).start()
+    async for frame in consume_stream(
+            out, prep, live, cid, created, model, consumer_timeout,
+            parse_fn, truncated_fn, cancel_event):
+        yield frame

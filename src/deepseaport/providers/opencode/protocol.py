@@ -152,8 +152,8 @@ def message_payload(prompt: str) -> dict:
     the agent is session-scoped too (``POST /api/session/:id/agent``), and
     native tools have no per-message map at all: the agent config's permission
     map is the single authority for what the model may call (see
-    ``managed_serve.managed_config_content``: bash/edit/webfetch denied, read
-    allowed).
+    ``managed_serve.managed_config_content``: read/bash require approval;
+    editing and external tools are denied).
     """
     return {"text": str(prompt)}
 

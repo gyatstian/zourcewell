@@ -32,7 +32,6 @@ from ...core.tools import (
 )
 from ...server_concurrency import (
     _CONSUMER_GRACE_SECONDS,
-    _STREAM_EXECUTOR,
     _StreamCancelled,
 )
 
@@ -65,25 +64,27 @@ _error_text = _engine.error_text
 
 
 def classify_error(error: str | None) -> RetryKind | None:
-    """Map an attempt error string to its retry/terminal kind."""
+    """Map an attempt error string to its retry/terminal kind.
+
+    Marker tuples come from ``core.engine`` plus this provider's own extras
+    (serve-level transport phrases); a bare "502" classifies like "bad
+    gateway" here as everywhere.
+    """
     if not error:
         return None
     low = error.lower()
     if P.is_serve_down_error(error):
         return RetryKind.UPSTREAM
-    if any(k in low for k in ("rate_limit", "rate limit", "429", "too many",
-                              "quota", "freeusagelimit", "free_usage")):
+    if any(k in low for k in _engine.RATE_LIMIT_MARKERS + (
+            "quota", "freeusagelimit", "free_usage")):
         return RetryKind.RATE_LIMIT
-    if any(k in low for k in ("http_422", "http 422", "http_400", "http 400",
-                              "unprocessable", "validation")):
+    if any(k in low for k in _engine.UPSTREAM_INVALID_MARKERS + (
+            "validation",)):
         return RetryKind.UPSTREAM_INVALID
-    if any(k in low for k in ("overload", "overloaded", "server busy",
-                              "server_busy", "try again", "timed out", "timeout",
-                              "500", "502", "503", "504", "bad gateway",
-                              "service unavailable", "temporarily unavailable",
-                              "fetch failed", "failed to fetch", "network error",
-                              "socket hang up", "econnreset", "etimedout",
-                              "empty completion", "opencode_empty")):
+    if any(k in low for k in _engine.TRANSIENT_OVERLOAD_MARKERS + (
+            "fetch failed", "failed to fetch", "network error",
+            "socket hang up", "econnreset", "etimedout",
+            "empty completion", "opencode_empty")):
         return RetryKind.OVERLOAD
     return RetryKind.UPSTREAM
 
@@ -96,9 +97,7 @@ def _terminal_upstream(app, item, prep, token, error, login_note, stream_ban_unt
     # login_note ignored (dispatch uniformity). Serve-down stays a distinct
     # 502 with an actionable message (managed-serve boot), not generic 502.
     if P.is_serve_down_error(error):
-        from fastapi import HTTPException as _HTTP
-
-        raise _HTTP(status_code=502, detail=f"opencode serve down: {error[:800]}")
+        raise HTTPException(status_code=502, detail=f"opencode serve down: {error[:800]}")
     _engine.raise_upstream("Opencode", error)
 
 
@@ -384,14 +383,10 @@ def _run_completion_core(
             return
         _do_attempt()
 
-    # Same shape the two web providers use, so the one-row table here reads the
-    # same way and a second row cannot be added without the guard.
+    # Every row goes through _retryable, which ANDs the partial-emit guard.
     def _retryable(kind) -> Callable[[str | None], bool]:
-        def _ok(e: str | None) -> bool:
-            return (classify_error(e) == kind
-                    and not _emit_tracker.emitted)
-
-        return _ok
+        return _engine.live_retry_predicate(
+            classify_error, kind, _emit_tracker)
 
     drive_retries(
         max_retries,
@@ -431,17 +426,16 @@ async def _stream_completion(app: FastAPI, pool, item, prep: dict):
     (otherwise a tool_calls reply would also leak as user-visible text) —
     thinking always streams. ``stream_mode=buffered`` keeps the historical
     blocking fan-out; live falls back to it when the SSE tail cannot start.
-    Queue/cancel/emit shape + consumer are engine-owned
-    (``new_producer_context`` / ``consume_stream``); the live vs buffered
-    session lifecycle stays here (no accounts, stale-session recreate +
-    overload sleep preserved).
+    Queue/cancel/emit shape + consumer are engine-owned (``stream_producer``);
+    the live vs buffered session lifecycle stays here (no accounts,
+    stale-session recreate + overload sleep preserved).
     """
     try:
         settings = _app_settings(app)
         live = str(getattr(settings, "stream_mode", "live")).lower() == "live"
     except Exception:
         live = True
-    # `buffered=not live` is the cross-provider contract, not a detail (see
+    # ``buffered=not live`` is the cross-provider contract, not a detail (see
     # ARCHITECTURE.md, "Provider architecture"); DeepSeek passes the same
     # argument. The watchdog must be sized from the SAME timeout the producer
     # runs with: `_run_completion_core` reads DEEPSEAPORT_OPENCODE_TIMEOUT
@@ -452,48 +446,19 @@ async def _stream_completion(app: FastAPI, pool, item, prep: dict):
     # is thrown away. Live mode keeps the single-read budget exactly: every
     # delta resets the per-get clock.
     timeout = P.opencode_timeout(OC.DEFAULT_TIMEOUT)
-    (cid, created, out, cancel_event, consumer_timeout, model,
-     _emit, _put) = _engine.new_producer_context(
-        prep, timeout, _CONSUMER_GRACE_SECONDS, buffered=not live)
 
-    def _produce(*, live_produce: bool) -> None:
-        try:
-            if live_produce:
-                result = _run_completion_core(
-                    app, item, prep, cancel_event=cancel_event, live=True,
-                    on_content=(None if prep.get("tools") else lambda t: _put("content", t)),
-                    on_thinking=lambda t: _put("thinking", t))
-            else:
-                result = _run_completion_core(
-                    app, item, prep, cancel_event=cancel_event, live=False)
-            _emit(("done", result))
-        except _StreamCancelled:
-            pass
-        except HTTPException as exc:
-            _emit(("http_error", exc))
-        except Exception as exc:  # noqa: BLE001
-            # Scrubbed because this is the one emit path that does NOT go
-            # through the terminal ladder: the client helpers raise with a raw
-            # slice of the upstream body in the message, and that body is the
-            # one most likely to echo the Authorization header it was given.
-            # 800 is the scrubber's default and a superset of that 200-char
-            # slice, so no diagnostic text is lost relative to today.
-            _emit(("error", _engine.scrub_upstream_text(exc, 800)))
+    def _run_producer(live: bool, put, cancel_event) -> dict:
+        if live:
+            return _run_completion_core(
+                app, item, prep, cancel_event=cancel_event, live=True,
+                on_content=(None if prep.get("tools") else lambda t: put("content", t)),
+                on_thinking=lambda t: put("thinking", t))
+        return _run_completion_core(
+            app, item, prep, cancel_event=cancel_event, live=False)
 
-    def produce_buffered():
-        _produce(live_produce=False)
-
-    def produce_live():
-        _produce(live_produce=True)
-
-    try:
-        _STREAM_EXECUTOR.submit(produce_live if live else produce_buffered)
-    except RuntimeError:
-        threading.Thread(
-            target=produce_live if live else produce_buffered,
-            daemon=True).start()
-    async for frame in _engine.consume_stream(
-            out, prep, live, cid, created, model, consumer_timeout,
-            _parse_tool_calls_local, looks_truncated_tool_attempt,
-            cancel_event):
+    async for frame in _engine.stream_producer(
+            _run_producer, prep=prep, timeout=timeout, live=live,
+            grace=_CONSUMER_GRACE_SECONDS,
+            parse_fn=_parse_tool_calls_local,
+            truncated_fn=looks_truncated_tool_attempt):
         yield frame

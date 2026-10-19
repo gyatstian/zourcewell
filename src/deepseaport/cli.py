@@ -7,6 +7,7 @@ import json
 import re
 import sys
 
+from . import __version__
 from . import server_runner as _runner
 from .providers.deepseek.auth import unpack_login_result
 from .server_runner import _resolve_bind_host
@@ -337,6 +338,34 @@ def cmd_models(args) -> int:
     return 0
 
 
+def _accounts_provider_scope(args, pool) -> str | None:
+    """Provider scope for ``accounts set-token`` / ``accounts remove``.
+
+    Returns the pid to scope the write to, or None after printing a refusal
+    (the caller then exits 2). Same rule as the account routes
+    (``pid or pool.provider_id``): one identifier can exist once per provider
+    (``config.account_identity``), and the unscoped first match wrote the token
+    onto -- or deleted -- the OTHER provider's record, with no way to say which
+    one was meant. The fallback is the pool's provider, so the flag-less call
+    keeps its old target wherever the first match already lived there (every
+    single-provider config).
+
+    An unregistered id is accepted (unlike ``login``/``serve``/``chat``): the
+    target record has to exist in the config anyway, and a hand-edited provider
+    the registry does not know is still the operator's. A shape-INVALID flag is
+    refused instead of falling back to the pool's provider, because that
+    fallback would silently mutate a record nobody named -- the bug this
+    scoping exists to close.
+    """
+    raw = getattr(args, "provider", None)
+    if not raw:
+        return pool.provider_id
+    pid = _valid_provider_id(raw)
+    if not pid:
+        print(f"invalid provider id: {raw!r} (lowercase letters, digits, dash)")
+    return pid or None
+
+
 def cmd_accounts(args) -> int:
     from .accounts import (TOKEN_HELP, AccountPool, account_has_token,
                            extract_token, sync_current_from_settings)
@@ -460,7 +489,11 @@ def cmd_accounts(args) -> int:
             print("usage: accounts set-token <email> --token <userToken value>")
             print(TOKEN_HELP)
             return 2
-        matched = _set(settings, args.identifier, token)
+        scope = _accounts_provider_scope(
+            args, AccountPool(settings.accounts, current=settings.active_account))
+        if scope is None:
+            return 2
+        matched = _set(settings, args.identifier, token, provider=scope)
         if matched is not None:
             if not _save(settings):
                 return 1
@@ -474,13 +507,21 @@ def cmd_accounts(args) -> int:
         if not identifier:
             print("need identifier (email/mobile/token)")
             return 2
-        pool = AccountPool(settings.accounts, current=settings.active_account)
+        scope = _accounts_provider_scope(
+            args, AccountPool(settings.accounts, current=settings.active_account))
+        if scope is None:
+            return 2
+        # The pool is built from THAT provider's records only, so a match in
+        # another provider's record cannot be removed by an unscoped first hit.
+        from .core import pools as _pools
+        pool = AccountPool(_pools.accounts_for_provider(settings, scope),
+                           current=settings.active_account)
         if not pool.remove(identifier):
             print(f"not found: {identifier}")
             return 1
         # Keep config file in sync with pool.
         from .accounts import remove_account as _remove
-        _remove(settings, identifier)
+        _remove(settings, identifier, provider=scope)
         if not _save(settings):
             return 1
         print(f"removed {identifier}")
@@ -581,6 +622,15 @@ def _obscura_login_token(email: str, password: str, settings,
 
     DeepSeek default keeps the canonical ``providers.deepseek.auth`` path so
     existing monkeypatch seams (tests) and behavior are unchanged.
+
+    A non-DeepSeek provider that raises (opencode's ``login`` raises by design,
+    a failed Qwen signin raises) or that is not registered is REPORTED, never
+    retried against DeepSeek: the old bare ``except: pass`` fell through to the
+    DeepSeek driver, which opened a ~30s chat.deepseek.com browser login with
+    the operator's credentials and stored DeepSeek's userToken under ``pid``
+    ("login ok, token saved" for a provider that never authenticated).
+    ``cmd_login``'s no-token path turns this detail into an ``Evidence:`` line
+    and exit 3.
     """
     pid = resolve_login_provider_id(settings, provider)
     if pid != "deepseek":
@@ -589,8 +639,10 @@ def _obscura_login_token(email: str, password: str, settings,
             prov = _reg.get(pid)
             if prov is not None:
                 return _unpack_login_token_result(prov.login(email, password, settings))
-        except Exception:
-            pass
+            reason = f"no provider registered for {pid!r}"
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc) or exc.__class__.__name__
+        return None, False, f"{pid} login failed: {reason}"
     from .providers.deepseek.auth import obscura_login_token as _impl
     return _impl(email, password, settings)
 
@@ -771,6 +823,15 @@ def cmd_login(args) -> int:
         print(f"login ok, token not saved for {email}; token value: {token}")
         return 3
     print(f"login ok, token saved for {email} -> {settings.config_path}")
+    if getattr(acc, "banned", False) or getattr(acc, "banned_until", 0.0):
+        # A fresh token does NOT clear a persisted ban: `_upsert_account` only
+        # writes the token, and a suspended account can complete login (see the
+        # branch above). The pool then skips the account, so "token saved"
+        # without this line reads as usable while `chat` says no account free.
+        # Not auto-cleared on purpose: `accounts unblock` is the operator's
+        # call, and the ban_until it might still carry is real evidence.
+        print(f"  ! {email} keeps a persisted ban (the pool skips it); "
+              f"clear it with: deepseaport accounts unblock {email}")
     return 0
 
 
@@ -846,7 +907,13 @@ def cmd_chat(args) -> int:
         app.state.bridge = None
     if not getattr(_chat_provider, "requires_accounts", True):
         # Local (accountless) provider (opencode CLI): no pool, no slot.
-        result = _chat_provider.complete(app, None, prep, None)
+        try:
+            result = _chat_provider.complete(app, None, prep, None)
+        except Exception as exc:  # noqa: BLE001
+            # Same one-shot-CLI rule as the account-holding branch below: a raw
+            # traceback is the whole UX (the frozen exe appends "Press Enter to
+            # close..." to it). Only Exception is caught, so Ctrl+C still is.
+            return _chat_fail(exc)
         print(("THINKING:\n" + result["thinking"] + "\n\n" if result["thinking"] else "") + result["content"])
         return 0
     try:
@@ -875,7 +942,13 @@ def cmd_chat(args) -> int:
         # failover and the 4-positional engine-seam doubles working (see
         # src/deepseaport/AGENTS.md).
         result = _chat_provider.complete(app, pool, prep, item)
-    except (ValueError, HTTPException, TimeoutError) as exc:
+    except Exception as exc:  # noqa: BLE001
+        # Exception, not just the three named ones: a provider's engine raises
+        # whatever its upstream helper raises (deepseek/client.py's
+        # create_session / pow RuntimeErrors, opencode's serve failures), and
+        # `_chat_fail` already prints HTTP/Timeout with their own wording. A
+        # raw traceback from a one-shot command is the whole UX, and a traceback
+        # can reprint the upstream body verbatim.
         return _chat_fail(exc)
     print(("THINKING:\n" + result["thinking"] + "\n\n" if result["thinking"] else "") + result["content"])
     return 0
@@ -884,6 +957,10 @@ def cmd_chat(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="deepseaport")
     parser.add_argument("--config", default=None)
+    # f-string from the one version name (deepseaport.__init__); the frozen exe
+    # has no pyproject.toml and reports 0.0.0 there rather than crashing.
+    parser.add_argument("--version", action="version",
+                        version=f"deepseaport {__version__}")
     sub = parser.add_subparsers(dest="cmd")
     serve = sub.add_parser("serve",
                            help="run the OpenAI-compatible API server "
@@ -924,12 +1001,18 @@ def main(argv: list[str] | None = None) -> int:
                                 help="paste/refresh the userToken of an existing "
                                      "account (--token is REQUIRED)")
     acc_st.add_argument("identifier", help="email/mobile/identifier")
+    acc_st.add_argument("--provider", default=None,
+                        help="scope to a provider id (default: the pool's provider); "
+                             "one email can exist once per provider")
     acc_st.add_argument("--token", default="", required=True,
                         help="userToken value (raw 64-char or full JSON). "
                              "REQUIRED: set-token has no prompt, and a "
                              "tokenless account cannot serve requests")
     acc_rm = acc_sub.add_parser("remove", help="delete account from pool")
     acc_rm.add_argument("identifier", help="email/mobile/identifier/token")
+    acc_rm.add_argument("--provider", default=None,
+                        help="scope to a provider id (default: the pool's provider); "
+                             "one email can exist once per provider")
     acc_unblock = acc_sub.add_parser("unblock", help="clear persisted + in-memory ban/cooldown")
     acc_unblock.add_argument("identifier", nargs="?", default="",
                              help="email/mobile/identifier; empty = all accounts "

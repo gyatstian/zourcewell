@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import queue
 import time
 from typing import Iterator
 
@@ -11,7 +10,6 @@ from curl_cffi import requests as crequests
 
 from . import pow as PoW
 from . import protocol as P
-from ...core import engine as _engine
 from ...core import transport as T
 from .sse_parser import StreamParser
 
@@ -176,78 +174,14 @@ def _ban_stream_event(data) -> P.StreamEvent | None:
     return None
 
 
-class _ClientGone(Exception):
-    """Internal: the client disconnected while we were blocked on a read."""
-
-
-def _abandon(resp) -> None:
-    """Stop the transfer without waiting for curl to notice.
-
-    ``Response.close()`` joins curl's worker thread, and curl only re-checks
-    ``quit_now`` from inside its WRITE callback -- verified against the
-    installed curl_cffi 0.16.3: with the upstream still streaming, ``quit_now``
-    ends the transfer on the next delta (close returned in 0.05s); with the
-    upstream silent it is never called again and the join blocked for the rest
-    of DEFAULT_TIMEOUT. A cancelled reply is discarded anyway, so set the flag
-    and let go: curl ends the transfer on the next byte or on its own stall
-    timer, in a thread curl_cffi owns, and the account slot comes back now.
-    ``Curl.__del__`` reclaims the handle, so nothing is leaked.
-    """
-    if getattr(resp, "quit_now", None) is not None:
-        resp.quit_now.set()
-
-    def _close() -> None:
-        pass
-
-    resp.close = _close
-
-
-class _BoundedQueue:
-    """``Response.queue`` proxy whose ``get`` returns control every slice.
-
-    curl_cffi offers no per-read timeout -- ``iter_lines`` takes no ``timeout``
-    (0.16: ``chunk_size`` / ``decode_unicode`` / ``delimiter``) and
-    ``iter_content`` blocks on an untimed ``queue.get`` -- so the queue is the
-    only place a blocked read can be handed control back. The stall budget is
-    NOT shortened: curl still aborts at DEFAULT_TIMEOUT and puts its error in
-    the queue (``iter_content`` re-raises it). Only the granularity changes, so
-    a disconnected client gives its account slot back within a slice instead of
-    after the whole budget.
-    """
-
-    def __init__(self, raw, cancel_event, resp) -> None:
-        self._raw = raw
-        self._cancel = cancel_event
-        self._resp = resp
-        self._fired = False
-
-    def get(self, *a, **k):
-        while True:
-            try:
-                return self._raw.get(timeout=_READ_SLICE_SECONDS)
-            except queue.Empty:
-                if self._cancel is not None and self._cancel.is_set():
-                    if not self._fired:
-                        self._fired = True
-                        _abandon(self._resp)
-                    raise _ClientGone from None
-
-    def __getattr__(self, name):
-        return getattr(self._raw, name)
-
-
-def _cancellable(resp) -> None:
-    """Bound ``resp``'s blocking read to the cancel token in force, if any.
-
-    No token (a direct/unit-test call) or no live stream queue (a test double, a
-    non-stream response) means nothing to observe, so ``resp`` is left exactly
-    as it was and nothing else about the pump changes.
-    """
-    cancel = _engine.current_cancel_event()
-    q = getattr(resp, "queue", None)
-    if cancel is None or q is None:
-        return
-    resp.queue = _BoundedQueue(q, cancel, resp)
+# The bounded read lives in core.transport now: a second provider (Qwen) needed
+# the same machinery. Re-exported under this module's historical names because
+# tests read ``client._cancellable`` / ``client._READ_SLICE_SECONDS`` off here.
+_READ_SLICE_SECONDS = T._READ_SLICE_SECONDS
+_ClientGone = T._ClientGone
+_abandon = T._abandon
+_BoundedQueue = T._BoundedQueue
+_cancellable = T._cancellable
 
 
 def _raw_json_ban_precheck(line: str) -> P.StreamEvent | None:
@@ -272,6 +206,11 @@ def stream_completion(headers: dict, payload: dict,
     """POST completion and yield parsed events. Caller must close on break."""
     resp = _SESSION.post(P.COMPLETION_URL, headers=headers, json=payload,
                          impersonate=IMPERSONATE, timeout=timeout, stream=True)
+    # Bound EVERY read on this response (the SSE pump AND the 200 non-SSE
+    # drain below): both block on curl_cffi's untimed queue, so without the
+    # swap a disconnect during a silent body is invisible until the socket
+    # speaks. No token (direct/unit-test call) is a no-op.
+    _cancellable(resp)
     if resp.status_code == 200 and not T.is_sse_response(resp):
         # Some errors arrive as JSON with HTTP 200 (e.g. ban:
         # biz_code 5 "user is muted" + mute_until). With stream=True the body
@@ -314,9 +253,8 @@ def stream_completion(headers: dict, payload: dict,
         yield event
         return
     # Shared decode/close scaffolding; wire parser + ban precheck stay
-    # DeepSeek-specific (Qwen uses its own parser + WAF guard). Bounding the
-    # read is done here, on the only read that can park for the whole budget.
-    _cancellable(resp)
+    # DeepSeek-specific (Qwen uses its own parser + WAF guard). The read was
+    # bounded above, before the non-SSE branch, so it covers both paths.
     try:
         yield from T.pump_sse(resp, StreamParser(), precheck=_raw_json_ban_precheck)
     except _ClientGone:

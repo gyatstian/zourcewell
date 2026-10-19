@@ -20,9 +20,9 @@ Seven fixes, each pinned here by a test that fails on the pre-change code:
 * K7 -- the main serve path logged every request target, and an account
   identifier may be a full bearer token.
 * K8 -- four paths the K6 fix missed: the non-200 completion log, the
-  recovery-failure log (message AND traceback), the three producer tails that
-  emit ``str(exc)`` without passing the terminal ladder, and the SSE error
-  frame, which clamped nothing at all.
+  recovery-failure log (message AND traceback), each provider's producer tail
+  that emitted ``str(exc)`` without passing the terminal ladder (one shared
+  engine sink today), and the SSE error frame, which clamped nothing at all.
 
 No network, no credentials: every upstream call is a monkeypatched stub.
 """
@@ -946,17 +946,24 @@ RAW_UPSTREAM_BODY = (
     "{'biz_code': 40003, 'Authorization': 'Bearer " + LIVE_TOKEN + "', "
     "'token': '" + LIVE_JWT + "', 'msg': 'user is muted'}")
 
-# The three producer tails, byte-identical sibling copies. Listed with the seam
-# each `_produce` calls so the real producer thread, queue and consumer run and
-# only the upstream work is replaced.
-_PRODUCER_TAILS = [
-    pytest.param(CS, "_complete_with_failover_sync", "deepseek",
-                 "deepseek-flash", id="deepseek"),
-    pytest.param(QCS, "_complete_with_failover_sync", "qwen",
-                 "qwen3.7-plus", id="qwen"),
-    pytest.param(OCS, "_run_completion_core", "opencode",
-                 "opencode/muse-spark-1.3-contributor-free", id="opencode"),
-]
+# The producer's exception tail lives once in ``core.engine.stream_producer``
+# now; this table drives each provider's real producer thread, queue and
+# consumer (via support.collect_sse) with only the upstream work replaced, so
+# the engine sink is exercised under every provider's own failover seam.
+_PRODUCER_TAILS = {
+    "deepseek": (CS, "_complete_with_failover_sync", "deepseek-flash"),
+    "qwen": (QCS, "_complete_with_failover_sync", "qwen3.7-plus"),
+    "opencode": (OCS, "_run_completion_core",
+                 "opencode/muse-spark-1.3-contributor-free"),
+}
+
+
+def test_producer_tail_table_covers_every_registered_provider():
+    """A new upstream must not silently skip the table above: the tail is
+    shared, so a provider missing from it would be untested rather than red."""
+    from deepseaport.core import registry
+
+    assert set(_PRODUCER_TAILS) == set(registry.registered())
 
 
 def _crashing_stream(monkeypatch, mod, seam, provider, model) -> str:
@@ -979,9 +986,8 @@ def _crashing_stream(monkeypatch, mod, seam, provider, model) -> str:
     return sse_text(asyncio.run(collect_sse(mod, app, pool, None, prep)))
 
 
-@pytest.mark.parametrize("mod,seam,provider,model", _PRODUCER_TAILS)
-def test_producer_tail_scrubs_the_exception_it_emits(monkeypatch, mod, seam,
-                                                     provider, model):
+@pytest.mark.parametrize("provider", list(_PRODUCER_TAILS))
+def test_producer_tail_scrubs_the_exception_it_emits(monkeypatch, provider):
     """K8a. ``HTTPException`` goes to ``_raise_for_terminal_error`` and is
     scrubbed there; EVERY other exception fell into a bare ``except Exception``
     and ``str(exc)`` went out raw. With the SSE headers already sent the client
@@ -991,6 +997,7 @@ def test_producer_tail_scrubs_the_exception_it_emits(monkeypatch, mod, seam,
     Without that, the frame's own clamp+scrub would mask a regression here and
     the two fixes would only ever be tested as one.
     """
+    mod, seam, model = _PRODUCER_TAILS[provider]
     monkeypatch.setattr(engine_mod, "sse_error_frame",
                         lambda message, status_code=None: (
                             b"data: " + json.dumps(

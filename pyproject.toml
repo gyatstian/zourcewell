@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=68"]
+# >=77 for PEP 639 license metadata (`license = "MIT"` + `license-files`),
+# which replaces the deprecated `license = { file = ... }` table.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,14 +12,17 @@ name = "deepseaport"
 version = "0.28"
 description = "Unofficial web2api bridge: OpenAI-compatible API over the DeepSeek, Qwen and opencode chat backends, with stable tool_calls for agentic harnesses. Research/educational use only."
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
+# From git history (`git log --format="%an <%ae>"`), not invented.
+authors = [{ name = "gyatstian", email = "krystianpomni@gmail.com" }]
 requires-python = ">=3.11"
 keywords = ["openai", "deepseek", "qwen", "web2api", "llm", "proxy", "agent"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: Console",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
+  # No license classifier: PEP 639 retires it in favour of `license = "MIT"`.
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
@@ -36,7 +41,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "httpx>=0.27"]
+# openai pins the "OpenAI-compatible" claim to the real SDK: tests/test_openai_sdk.py
+# drives it against the app over an in-process ASGI transport. 3.33 is the
+# version that suite was verified against (it speaks httpx2, its own hard
+# dependency).
+test = ["pytest>=8", "httpx>=0.27", "openai>=3.33,<4"]
 build = ["pyinstaller>=6"]
 
 [project.scripts]

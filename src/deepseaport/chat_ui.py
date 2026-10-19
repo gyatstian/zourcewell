@@ -29,6 +29,7 @@ from .chat_repl import (
     _prompt_instance_count,
     _remember_chat_model,
     _restore_chat_logs,
+    _scoped_accounts,
     _select_usable_accounts_live,
     _silence_chat_logs,
     resolve_chat_models,
@@ -110,13 +111,20 @@ def run_multi_chat_servers(settings, args=None, count: int | None = None) -> int
     """
     # Account gating only applies when a provider that needs accounts is
     # active; an accountless local provider (opencode) has nothing to
-    # provision, so an empty pool must not block the start.
+    # provision, so an empty pool must not block the start. The check reads the
+    # provider-SCOPED accounts, not the global list: with only another
+    # provider's account on file the old check passed and the run then 503'd on
+    # every request (an empty per-provider pool is a hard 503, no fallback).
     if _active_providers_need_accounts(settings):
-        if not getattr(settings, "accounts", None):
-            print("  ! No accounts yet. Add one first.")
+        scoped = _scoped_accounts(settings)
+        if not scoped:
+            from .core import pools as _pools
+
+            _need = (_pools.providers_requiring_accounts(settings)
+                     or _pools.active_provider_ids(settings))
+            print(f"  ! No accounts yet for {', '.join(_need)}. Add one first.")
             return 1
-        if not any((getattr(a, "token", "") or "").strip()
-                   for a in (settings.accounts or [])):
+        if not any((getattr(a, "token", "") or "").strip() for a in scoped):
             print("  ! Accounts have no token. Add one (y = auto-token) first.")
             return 1
 

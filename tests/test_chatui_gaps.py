@@ -136,6 +136,31 @@ def test_select_usable_empty():
     assert chat_ui._select_usable_accounts_live(Settings(accounts=[], config_path="")) == ([], 0, 0)
 
 
+def test_select_usable_is_provider_scoped(monkeypatch):
+    """A single-qwen server with only a DeepSeek account on file: the split
+    used to offer that account as usable and pin an instance to it, while
+    ``server_routes._pool`` builds per-provider pools with no cross-provider
+    fallback -- an empty qwen pool is a hard 503 on every request. The tokenless
+    count is scoped for the same reason: a foreign record without a token is not
+    a reason to tell a qwen operator to go and add one."""
+    from deepseaport import chat_ui
+    from deepseaport.config import AccountConfig, Settings
+    ds = AccountConfig(email="ds@x.com", token="tok-ds", provider="deepseek")
+    ds_empty = AccountConfig(email="ds2@x.com", token="", provider="deepseek")
+    qw = AccountConfig(email="qw@x.com", token="tok-qw", provider="qwen")
+    s = Settings(provider="qwen", providers=[],
+                 accounts=[ds, ds_empty, qw], config_path="")
+    monkeypatch.setattr(
+        "deepseaport.accounts.collect_ban_labels",
+        lambda accs, force_refresh=False, **k: {},
+    )
+
+    usable, banned, no_token = chat_ui._select_usable_accounts_live(s)
+
+    assert [a.identifier for a in usable] == ["qw@x.com"]
+    assert (banned, no_token) == (0, 0)
+
+
 # _prompt_instance_count
 
 def test_prompt_cancel_empty(monkeypatch):
@@ -250,6 +275,76 @@ def test_run_multi_tokenless():
     from deepseaport.config import Settings
     s = Settings(accounts=[_mk_acc("a@x.com", "")], config_path="")
     assert chat_ui.run_multi_chat_servers(s) == 1
+
+
+def test_run_multi_refuses_when_only_another_providers_account_exists(
+        monkeypatch, capsys):
+    """The gate read the GLOBAL account list, so a single-qwen config with one
+    DeepSeek account passed it and then 503'd per request (an empty qwen pool
+    never borrows another provider's credentials). It must refuse before the
+    live ban probe, and say which provider has nothing."""
+    from deepseaport import chat_ui
+    from deepseaport.config import AccountConfig, Settings
+    s = Settings(provider="qwen", providers=[], config_path="", accounts=[
+        AccountConfig(email="ds@x.com", token="tok-ds", provider="deepseek")])
+
+    def _no_probe(st):
+        raise AssertionError(
+            "a non-active provider's account reached the live ban probe")
+
+    monkeypatch.setattr(chat_ui, "_select_usable_accounts_live", _no_probe)
+
+    assert chat_ui.run_multi_chat_servers(s, count=1) == 1
+    assert "No accounts yet for qwen." in capsys.readouterr().out
+
+
+def test_run_multi_refuses_multi_qwen_opencode_with_no_accounts(capsys):
+    """Multi [qwen, opencode] with nothing on file: qwen blocks the start and
+    is named; opencode needs no account, so it is not named as missing."""
+    from deepseaport import chat_ui
+    from deepseaport.config import Settings
+    s = Settings(provider="qwen", providers=["qwen", "opencode"],
+                 accounts=[], config_path="")
+
+    assert chat_ui.run_multi_chat_servers(s, count=1) == 1
+    out = capsys.readouterr().out
+    assert "No accounts yet for qwen." in out
+    assert "opencode" not in out, "an accountless provider must not be named"
+
+
+class _GatePassed(Exception):
+    """Raised where the next real step would run: proves the gate let us through."""
+
+
+def _probe_raises(st):
+    raise _GatePassed
+
+
+def test_run_multi_lets_an_accountless_provider_past_the_gate(monkeypatch, capsys):
+    """Control: opencode provisions nothing, so an empty account list is not a
+    reason to refuse (the account-needing rule is core.pools' answer)."""
+    from deepseaport import chat_ui
+    from deepseaport.config import Settings
+    s = Settings(provider="opencode", providers=[], accounts=[], config_path="")
+    monkeypatch.setattr(chat_ui, "_select_usable_accounts_live", _probe_raises)
+
+    with pytest.raises(_GatePassed):
+        chat_ui.run_multi_chat_servers(s, count=1)
+    assert "No accounts yet" not in capsys.readouterr().out
+
+
+def test_run_multi_accepts_an_account_bound_to_the_active_provider(
+        monkeypatch, capsys):
+    """Control for the refusal: the scope's OWN account still starts the run."""
+    from deepseaport import chat_ui
+    from deepseaport.config import AccountConfig, Settings
+    s = Settings(provider="qwen", providers=[], config_path="", accounts=[
+        AccountConfig(email="qw@x.com", token="tok-qw", provider="qwen")])
+    monkeypatch.setattr(chat_ui, "_select_usable_accounts_live", _probe_raises)
+
+    with pytest.raises(_GatePassed):
+        chat_ui.run_multi_chat_servers(s, count=1)
+    assert "No accounts yet" not in capsys.readouterr().out
 
 
 def test_run_multi_all_banned(monkeypatch):

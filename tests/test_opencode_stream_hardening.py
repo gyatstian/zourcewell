@@ -1,6 +1,6 @@
 """opencode streaming + managed-serve hardening: watchdog budget, live tail, child reap.
 
-Five defects, each pinned by a test that fails on the pre-change code:
+Six defects, each pinned by a test that fails on the pre-change code:
 
 * **The consumer watchdog was one socket read in both stream modes.** In
   ``stream_mode: buffered`` (and in ``live`` *with* tools, where content
@@ -45,6 +45,9 @@ Five defects, each pinned by a test that fails on the pre-change code:
   attempt when the OS reports that pid gone, because a process that no longer
   exists cannot be the busy serve the retries are for. On a host where even a
   refused connect costs seconds, that narrowing is most of a startup.
+* **Permission prompts must not stall headless turns.** The managed client
+  rejects every matching ``permission.asked`` event immediately, in both the
+  buffered and live paths.
 
 No network, no opencode binary, no credentials: the serve is a fake
 ``urlopen()`` and every process is a fake ``Popen``.
@@ -176,6 +179,10 @@ def _event(kind: str, **data) -> str:
     return _frame({"type": kind, "data": {"sessionID": SESSION, **data}})
 
 
+def _permission_event() -> str:
+    return _event("permission.asked", id="per_tool", action="shell")
+
+
 def _fake_serve(monkeypatch, *, messages: list, sse: str | None = None,
                 sse_up: bool = True, sse_resp=None) -> list[str]:
     """Route the v2 endpoints the opencode client uses; return the call log.
@@ -218,6 +225,8 @@ def _fake_serve(monkeypatch, *, messages: list, sse: str | None = None,
             return _json_body({"data": {"id": USER_ID}})
         if method == "POST" and (path.endswith("/model") or path.endswith("/agent")):
             return _FakeResp(b"", 204)
+        if method == "POST" and path.endswith("/permission/per_tool/reply"):
+            return _FakeResp(b"", 204)
         if method == "DELETE" and path.endswith(f"/api/session/{SESSION}"):
             return _FakeResp(b"", 204)
         raise AssertionError(f"unexpected serve request: {method} {url}")
@@ -249,6 +258,30 @@ def _live_sse() -> str:
                 "data": {"sessionID": SESSION, "info": {"title": "x"}}}),
         _event("session.execution.succeeded", messageID="msg_a"),
     ])
+
+
+def test_buffered_turn_rejects_permission_requests(monkeypatch):
+    """A permission request cannot leave the blocking turn waiting forever."""
+    calls = _fake_serve(monkeypatch, messages=_final_messages(),
+                        sse=_permission_event())
+
+    result = OC.send_message(SESSION, "opencode", "muse", "agent", "hi",
+                             timeout=5)
+
+    assert result["content"] == FINAL_TEXT
+    assert f"POST /api/session/{SESSION}/permission/per_tool/reply" in calls
+
+
+def test_live_turn_rejects_permission_requests(monkeypatch):
+    """The live event reader rejects tool approval before continuing."""
+    calls = _fake_serve(monkeypatch, messages=_final_messages(),
+                        sse=_permission_event() + _live_sse())
+
+    result = OC.stream_message(SESSION, "opencode", "muse", "agent", "hi",
+                               timeout=5)
+
+    assert result["content"] == FINAL_TEXT
+    assert f"POST /api/session/{SESSION}/permission/per_tool/reply" in calls
 
 
 def _assistant_item(text: str, thinking: str = "", usage: int = 11) -> dict:

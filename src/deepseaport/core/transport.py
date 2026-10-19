@@ -13,12 +13,17 @@ Ownership:
 - Ban-envelope mapping (_biz_error/_ban_stream_event) stays in client.py;
   this module only moves the byte-handling primitives so client.py keeps
   its _SESSION hook (tests monkeypatch client._SESSION).
+- The bounded read for the SSE pump (``_cancellable`` / ``_BoundedQueue`` /
+  ``_abandon`` / ``_ClientGone``) is here because BOTH web2api providers need
+  it. It changes the GRANULARITY of cancellation only, never the socket
+  budget, and it reads the cancel token late -- see ``_cancellable``.
 """
 
 from __future__ import annotations
 
 import json as _jsonlib
 import logging
+import queue
 import re as _re
 from typing import Any, Callable, Iterator
 
@@ -290,3 +295,96 @@ def pump_sse(resp: Any, parser: Any,
                     return
     finally:
         close_quietly(resp)
+
+
+# --- The bounded read every SSE pump needs -----------------------------------
+#
+# curl_cffi offers NO per-read timeout -- ``iter_lines(chunk_size,
+# decode_unicode, delimiter)`` has no ``timeout`` parameter (0.16.3) and
+# ``iter_content`` blocks on an untimed ``queue.get`` -- so the response's queue
+# is the only place a read parked on a silent socket can hand control back.
+# Shared by both web2api providers: the stream function sits inside a BLOCKING
+# read, and ``drain_attempt``'s per-event cancel check cannot run until an event
+# is yielded out of the generator.
+
+# How long one bounded read waits for the next socket chunk before handing
+# control back. Not a timeout: an empty wait is re-entered and the TOTAL budget
+# stays the provider's DEFAULT_TIMEOUT. It only decides how often cancellation
+# is noticed.
+_READ_SLICE_SECONDS = 2.0
+
+
+class _ClientGone(Exception):
+    """Internal: the client disconnected while we were blocked on a read."""
+
+
+def _abandon(resp) -> None:
+    """Stop the transfer without waiting for curl to notice.
+
+    ``Response.close()`` joins curl's worker thread, and curl only re-checks
+    ``quit_now`` from inside its WRITE callback -- verified against the
+    installed curl_cffi 0.16.3: with the upstream still streaming, ``quit_now``
+    ends the transfer on the next delta (close returned in 0.05s); with the
+    upstream silent it is never called again and the join blocked for the rest
+    of DEFAULT_TIMEOUT. A cancelled reply is discarded anyway, so set the flag
+    and let go: curl ends the transfer on the next byte or on its own stall
+    timer, in a thread curl_cffi owns, and the account slot comes back now.
+    ``Curl.__del__`` reclaims the handle, so nothing is leaked.
+    """
+    if getattr(resp, "quit_now", None) is not None:
+        resp.quit_now.set()
+
+    def _close() -> None:
+        pass
+
+    resp.close = _close
+
+
+class _BoundedQueue:
+    """``Response.queue`` proxy whose ``get`` returns control every slice.
+
+    curl_cffi offers no per-read timeout -- ``iter_lines`` takes no ``timeout``
+    (0.16: ``chunk_size`` / ``decode_unicode`` / ``delimiter``) and
+    ``iter_content`` blocks on an untimed ``queue.get`` -- so the queue is the
+    only place a blocked read can be handed control back. The stall budget is
+    NOT shortened: curl still aborts at its own timeout and puts its error in
+    the queue (``iter_content`` re-raises it). Only the granularity changes, so
+    a disconnected client gives its account slot back within a slice instead of
+    after the whole budget.
+    """
+
+    def __init__(self, raw, cancel_event, resp) -> None:
+        self._raw = raw
+        self._cancel = cancel_event
+        self._resp = resp
+        self._fired = False
+
+    def get(self, *a, **k):
+        while True:
+            try:
+                return self._raw.get(timeout=_READ_SLICE_SECONDS)
+            except queue.Empty:
+                if self._cancel is not None and self._cancel.is_set():
+                    if not self._fired:
+                        self._fired = True
+                        _abandon(self._resp)
+                    raise _ClientGone from None
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+def _cancellable(resp) -> None:
+    """Bound ``resp``'s blocking read to the cancel token in force, if any.
+
+    No token (a direct/unit-test call) or no live stream queue (a test double, a
+    non-stream response) means nothing to observe, so ``resp`` is left exactly
+    as it was and nothing else about the pump changes.
+    """
+    from .engine import current_cancel_event
+
+    cancel = current_cancel_event()
+    q = getattr(resp, "queue", None)
+    if cancel is None or q is None:
+        return
+    resp.queue = _BoundedQueue(q, cancel, resp)

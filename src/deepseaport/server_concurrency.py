@@ -165,6 +165,28 @@ async def _watch_disconnect(request: Request, cancel_event: threading.Event) -> 
         pass
 
 
+def _retry_after_headers(pool) -> dict | None:
+    """Retry-After for a queue-timeout 429, ONLY when a horizon is known.
+
+    The soonest a cooling (cooldown/ban) account becomes usable again is a real
+    lower bound on "retry later", and the pool already reports it per account
+    (``AccountPool.status``). When every account is merely BUSY the horizon is
+    unknown -- a stream ends when the upstream finishes -- so no header is sent
+    rather than a fabricated one. Same rule as the empty-pool 503: only config
+    makes that one retryable, so it carries no header either.
+    """
+    try:
+        rows = pool.status() or []
+    except Exception:
+        return None  # a pool double without status(): no horizon, no header
+    remainders = [float(r.get("cooldown_remaining") or 0.0) for r in rows
+                  if isinstance(r, dict)]
+    horizon = min((r for r in remainders if r > 0), default=0.0)
+    if horizon <= 0:
+        return None
+    return {"Retry-After": str(max(1, int(horizon + 0.999)))}
+
+
 async def _acquire_slot_or_499(pool, request: Request,
                                cancel_event: threading.Event,
                                timeout: float, allow_failover: bool):
@@ -202,7 +224,8 @@ async def _acquire_slot_or_499(pool, request: Request,
                 pass
             if time.monotonic() >= deadline:
                 raise _HTTPException(status_code=429,
-                                     detail=f"all {label} accounts busy, retry later")
+                                     detail=f"all {label} accounts busy, retry later",
+                                     headers=_retry_after_headers(pool))
             continue
 
 

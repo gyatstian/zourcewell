@@ -513,3 +513,52 @@ def test_tui_ask_account_provider_keeps_a_registered_selection():
     from deepseaport.tui import _ask_account_provider
 
     assert _ask_account_provider(Settings(provider="qwen")) == "qwen"
+
+
+def test_tui_ask_account_provider_empty_answer_stays_in_the_active_set(monkeypatch):
+    """The multi-mode default was the literal "deepseek", so with
+    ``providers=["qwen","opencode"]`` a bare Enter filed the account under a
+    provider that is not active -- the ``login --provider glm`` class: an
+    account no pool builds from and no request can serve."""
+    from deepseaport.core import pools
+    from deepseaport.tui import _ask_account_provider
+
+    settings = Settings(providers=["qwen", "opencode"])
+    shown: dict = {}
+
+    def _ask(prompt, default=""):
+        shown["default"] = default
+        return ""
+
+    monkeypatch.setattr("deepseaport.tui._ask", _ask)
+
+    picked = _ask_account_provider(settings)
+
+    assert picked in pools.active_provider_ids(settings)
+    assert picked != "deepseek"
+    assert shown["default"] == picked, "the on-screen default differs from the result"
+
+
+def test_tui_ask_account_provider_eof_stays_in_the_active_set(monkeypatch):
+    """Same guarantee on the EOF/KeyboardInterrupt path, which returns its own
+    literal."""
+    from deepseaport.core import pools
+    from deepseaport.tui import _ask_account_provider
+
+    settings = Settings(providers=["qwen", "opencode"])
+
+    def _eof(*a, **k):
+        raise EOFError
+
+    monkeypatch.setattr("deepseaport.tui._ask", _eof)
+
+    assert _ask_account_provider(settings) in pools.active_provider_ids(settings)
+
+
+def test_tui_ask_account_provider_keeps_deepseek_as_the_default(monkeypatch):
+    """Control: while deepseek IS active the historical default is unchanged."""
+    from deepseaport.tui import _ask_account_provider
+
+    monkeypatch.setattr("deepseaport.tui._ask", lambda *a, **k: "")
+
+    assert _ask_account_provider(Settings(providers=["deepseek", "qwen"])) == "deepseek"

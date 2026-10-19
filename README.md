@@ -87,7 +87,7 @@ curl -N http://127.0.0.1:5001/v1/chat/completions `
 
 ## Config
 
-`config.json` (or env, see `.env.example`):
+`config.json` (or env: `.env.example` is text to copy into a shell export — nothing reads a `.env` file, and an empty var counts as unset):
 
 ```json
 {
@@ -314,9 +314,11 @@ means the artifact is clean. Full rationale:
 
 **Version.** `pyproject.toml` `[project] version` is the only place a version
 is written. `deepseaport.spec` reads it at build time (so the exe's version
-resource and a broken pyproject now fail the build loudly instead of silently
-stamping `0.0.0`), `deepseaport.__version__` derives from it, and both FastAPI
-apps pass that to `FastAPI(version=...)`. Bump it there and nowhere else.
+resource and a broken pyproject fail the build loudly instead of silently
+stamping `0.0.0`) and bundles it as `_version.txt`, which `deepseaport.__version__`
+reads first — then pyproject, then the installed metadata, then `0.0.0`.
+`cli --version` and both FastAPI apps report that same value. Bump it there and
+nowhere else.
 
 Interpreter: CPython >= 3.11 (CI: 3.11/3.13); `.[build]` asks for
 `pyinstaller>=6`, and the exact PyInstaller version is whatever the build used —
@@ -333,7 +335,7 @@ anyway for obscura (see top of this file).
 ## Development
 
 ```powershell
-pip install -e ".[test]"     # editable install + pytest/httpx
+pip install -e ".[test]"     # editable install + pytest/httpx/openai SDK
 python -m pytest -q          # hermetic suite, no network
 ```
 

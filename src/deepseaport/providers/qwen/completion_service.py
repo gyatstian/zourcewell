@@ -38,7 +38,6 @@ from ...core.tools import (
 from ...server_concurrency import (
     _CLEANUP_EXECUTOR,
     _CONSUMER_GRACE_SECONDS,
-    _STREAM_EXECUTOR,
     _StreamCancelled,
 )
 
@@ -74,7 +73,10 @@ def classify_error(error: str | None) -> RetryKind | None:
     BAN; WAF/challenge -> WAF; 401/unauthorized -> INVALID_TOKEN; rate limits
     -> RATE_LIMIT; 422/400 -> UPSTREAM_INVALID; overload/busy/timeout/502 ->
     OVERLOAD; anything else -> UPSTREAM. Every kind also carries the
-    partial-live-emit guard (see providers/AGENTS.md).
+    partial-live-emit guard (see providers/AGENTS.md). Marker tuples come from
+    ``core.engine`` (RATE_LIMIT_MARKERS / UPSTREAM_INVALID_MARKERS /
+    TRANSIENT_OVERLOAD_MARKERS) plus this upstream's "quota" extra, so a bare
+    "502"/"500" classifies like "bad gateway" here too.
 
     BAN is checked FIRST: Qwen's WAF answers 200 + text/html, never 403, so a
     403 is a real upstream status whose body may be a suspension -- and no
@@ -92,16 +94,12 @@ def classify_error(error: str | None) -> RetryKind | None:
         return RetryKind.WAF
     if any(k in low for k in ("401", "unauthorized", "invalid", "authorization")):
         return RetryKind.INVALID_TOKEN
-    if any(k in low for k in ("rate_limit", "rate limit", "429", "too many",
-                               "quota", "quota_limit")):
+    if any(k in low for k in _engine.RATE_LIMIT_MARKERS + (
+            "quota", "quota_limit")):
         return RetryKind.RATE_LIMIT
-    if any(k in low for k in ("http_422", "http 422", "http_400", "http 400",
-                              "unprocessable")):
+    if any(k in low for k in _engine.UPSTREAM_INVALID_MARKERS):
         return RetryKind.UPSTREAM_INVALID
-    if any(k in low for k in ("overload", "overloaded", "server busy",
-                              "server_busy", "try again", "timed out", "timeout",
-                              "502", "bad gateway", "service unavailable",
-                              "temporarily unavailable")):
+    if any(k in low for k in _engine.TRANSIENT_OVERLOAD_MARKERS):
         # Partial live emit: do not retry (would duplicate), but the
         # terminal ladder still surfaces it as 503. Signal that by returning
         # OVERLOAD anyway; the retry recover checks the guard.
@@ -472,9 +470,13 @@ def _terminal_ban(app: FastAPI, item: PooledAccount, prep: dict,
     ban_until: float | None = stream_ban_until
     if ban_until is None:
         try:
-            _, ban_until = _probe_ban(app, token)
+            banned, probed_until = _probe_ban(app, token)
         except Exception:
-            ban_until = None
+            banned, probed_until = False, None
+        # The probe's BOOLEAN is honoured, not just its timestamp: a stray
+        # (False, ts) must not be adopted as a ban cooldown. The fix landed in
+        # DeepSeek only; this is its twin.
+        ban_until = probed_until if banned else None
     raise _ban_403_for_item(app, item, ban_until, error)
 
 
@@ -712,21 +714,10 @@ def _run_completion_core(
             pass
         else:
             _do_attempt(headers, payload)
-        # One predicate factory so NO row retries after a live emit. The guard
-        # used to sit on the overload row alone, on the assumption that WAF and
-        # 401 fail before any content. ``drain_attempt`` makes content-then-error
-        # a legal ordering, and the POST is not idempotent (the chat gains a
-        # turn), so a waf/token recovery here re-POSTs on the same chat and
-        # re-streams from delta 0 into a stream the client already read:
-        # duplicated text, or two interleaved halves of one tool_calls JSON
-        # object, then a clean ``[DONE]`` and no error to stop the harness
-        # executing the corrupt call.
+        # Every row goes through _retryable, which ANDs the partial-emit guard.
         def _retryable(kind) -> Callable[[str | None], bool]:
-            def _ok(e: str | None) -> bool:
-                return (classify_error(e) == kind
-                        and not _emit_tracker.emitted)
-
-            return _ok
+            return _engine.live_retry_predicate(
+                classify_error, kind, _emit_tracker)
 
         drive_retries(
             max_retries,
@@ -774,78 +765,39 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
 
     Producer (account-holding thread) is Qwen-specific only in the failover
     entrypoint; queue/cancel/emit shape + SSE consumer are engine-owned
-    (``new_producer_context`` / ``consume_stream``).
+    (``stream_producer``), including the ``buffered=not live`` watchdog
+    sizing ARCHITECTURE.md's cross-provider contract requires: in buffered
+    mode the producer emits nothing until the whole reply lands, so the
+    consumer watchdog must cover the WHOLE producer budget -- chat create +
+    the reply + up to ``max_retries`` WAF/401 recovery passes, each of which
+    can include a qwen-host solved-jar fetch and a direct re-signin. Live
+    keeps the single-read budget because every delta resets the clock. Same
+    call DeepSeek makes in its own ``_stream_completion``.
     """
     settings = _app_settings(app)
     live = str(getattr(settings, "stream_mode", "live")).lower() == "live"
-    # ``buffered=not live`` is the cross-provider contract ARCHITECTURE.md
-    # ("Cross-provider contract that every adapter must keep", and the
-    # "stream_mode: buffered sizes its watchdog" rule) requires: in buffered
-    # mode the producer emits nothing until the whole reply lands, so the
-    # consumer watchdog must cover the WHOLE producer budget -- chat create +
-    # the reply + up to ``max_retries`` WAF/401 recovery passes, each of which
-    # can include a qwen-host solved-jar fetch and a direct re-signin. Omitting
-    # it sized the watchdog from one socket read (QC.DEFAULT_TIMEOUT 300 s +
-    # grace) instead of 3x that, which killed a healthy-but-slow Qwen answer
-    # and replaced it with a client-visible "upstream timed out" -- in an agent
-    # loop that reads as "the tool stopped working". Live keeps the
-    # single-read budget because every delta resets the clock.
-    # Same call DeepSeek makes at providers/deepseek/completion_service.py:
-    # 1155-1157.
-    (cid, created, out, cancel_event, consumer_timeout, model,
-     _emit, _put) = _engine.new_producer_context(
-        prep, QC.DEFAULT_TIMEOUT, _CONSUMER_GRACE_SECONDS, buffered=not live)
 
-    def _produce(*, live: bool) -> None:
+    def _run_producer(live: bool, put, cancel_event) -> dict:
         # Single publisher: buffered and live differ only in callbacks.
         # Thinking always streams live (never tool JSON); content streams
         # live only when no tools requested, else buffered so a tool_calls
         # reply is not also emitted as user-visible text.
-        try:
-            if live:
-                result = _complete_with_failover_sync(
-                    app, pool, prep, item,
-                    on_content=(None if prep.get("tools") else lambda t: _put("content", t)),
-                    on_thinking=lambda t: _put("thinking", t),
-                    cancel_event=cancel_event,
-                )
-            else:
-                # Ban failover lives in the helper (owns item's lock): a
-                # banned account retries on the next unbanned one inside the
-                # same request. Ban errors carry no content prefix, so
-                # nothing partial leaks.
-                result = _complete_with_failover_sync(
-                    app, pool, prep, item, cancel_event=cancel_event)
-            _emit(("done", result))
-        except _StreamCancelled:
-            pass
-        except HTTPException as exc:
-            _emit(("http_error", exc))
-        except Exception as exc:  # noqa: BLE001
-            # Scrubbed because this is the one emit path that does NOT go
-            # through the terminal ladder: the client helpers raise with a raw
-            # slice of the upstream body in the message, and that body is the
-            # one most likely to echo the Authorization header it was given.
-            # 800 is the scrubber's default and a superset of that 200-char
-            # slice, so no diagnostic text is lost relative to today.
-            _emit(("error", _engine.scrub_upstream_text(exc, 800)))
+        if live:
+            return _complete_with_failover_sync(
+                app, pool, prep, item,
+                on_content=(None if prep.get("tools") else lambda t: put("content", t)),
+                on_thinking=lambda t: put("thinking", t),
+                cancel_event=cancel_event,
+            )
+        # Ban failover lives in the helper (owns item's lock): a banned
+        # account retries on the next unbanned one inside the same request.
+        # Ban errors carry no content prefix, so nothing partial leaks.
+        return _complete_with_failover_sync(
+            app, pool, prep, item, cancel_event=cancel_event)
 
-    def produce_buffered():
-        _produce(live=False)
-
-    def produce_live():
-        _produce(live=True)
-
-    # Bounded producer: one account-holding thread per stream, capped by the
-    # shared executor so a parallel-subagent burst queues instead of piling
-    # unbounded raw threads.
-    try:
-        _STREAM_EXECUTOR.submit(produce_live if live else produce_buffered)
-    except RuntimeError:
-        # Executor shut down (interpreter exit): fall back to a raw thread.
-        threading.Thread(target=produce_live if live else produce_buffered, daemon=True).start()
-    async for frame in _engine.consume_stream(
-            out, prep, live, cid, created, model, consumer_timeout,
-            _parse_tool_calls_local, looks_truncated_tool_attempt,
-            cancel_event):
+    async for frame in _engine.stream_producer(
+            _run_producer, prep=prep, timeout=QC.DEFAULT_TIMEOUT, live=live,
+            grace=_CONSUMER_GRACE_SECONDS,
+            parse_fn=_parse_tool_calls_local,
+            truncated_fn=looks_truncated_tool_attempt):
         yield frame

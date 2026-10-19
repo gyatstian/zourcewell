@@ -43,6 +43,7 @@ from deepseaport.config import AccountConfig, Settings
 from deepseaport.core import engine as _engine
 from deepseaport.providers.deepseek import client as DS
 from deepseaport.providers.deepseek import completion_service as CS
+from deepseaport.providers.qwen import completion_service as QCS
 from deepseaport.server import create_app
 from deepseaport.server_routes import _prepare
 
@@ -439,6 +440,55 @@ def test_terminal_ban_ignores_timestamp_from_a_negative_probe(monkeypatch, tmp_p
         "a negative probe verdict must not pin the probe's timestamp"
     assert item.cooldown_remaining <= 300, \
         "negative probe must not apply a multi-day cooldown"
+
+
+def test_qwen_terminal_ban_ignores_timestamp_from_a_negative_probe(monkeypatch):
+    """E3e (Qwen twin). The DeepSeek fix above landed in DeepSeek only; Qwen
+    kept ``_, ban_until = _probe_ban(...)`` and adopted the timestamp from a
+    False verdict, cooling a healthy account for the stray expiry."""
+    stray_until = time.time() + 7 * 86400
+    app = _app(_settings(max_retries=0))
+    item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
+    monkeypatch.setattr(QCS, "_probe_ban", lambda *a, **k: (False, stray_until))
+
+    with pytest.raises(HTTPException) as exc_info:
+        QCS._terminal_ban(app, item, {}, "tok", BAN_ERROR, "", None)
+
+    assert exc_info.value.status_code == 403
+    assert item.cfg.banned is True
+    assert item.cfg.banned_until == 0.0, \
+        "a negative probe verdict must not pin the probe's timestamp"
+    assert item.cooldown_remaining <= 300, \
+        "negative probe must not apply a multi-day cooldown"
+
+
+def test_every_registered_provider_classifies_the_shared_status_shapes():
+    """E3f. ``transport.http_error_code`` renders every non-200 as
+    "HTTP_<status>: <body>" on every upstream, so a bare status text must
+    classify the same way everywhere. The marker tuples live in
+    ``core.engine`` and each provider composes them with its own extras;
+    derived from ``registry.registered()`` rather than a literal list so this
+    check cannot silently miss a provider that ships a divergent classifier.
+    """
+    import importlib
+
+    from deepseaport.core import registry
+
+    cases = {
+        "HTTP_502: ": "OVERLOAD",
+        "HTTP_500: Internal Server Error": "OVERLOAD",
+        "429 too many requests": "RATE_LIMIT",
+        "HTTP_422: ": "UPSTREAM_INVALID",
+    }
+    provider_ids = sorted(registry.registered())
+    assert provider_ids, "registry imported no providers"
+    for pid in provider_ids:
+        mod = importlib.import_module(
+            f"deepseaport.providers.{pid.replace('-', '_')}.completion_service")
+        for text, kind_name in cases.items():
+            got = mod.classify_error(text)
+            assert got is getattr(mod.RetryKind, kind_name), (
+                f"{pid}: {text!r} classified {got}, want {kind_name}")
 
 
 # --- E5: buffered watchdog vs the real producer budget ----------------------

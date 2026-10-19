@@ -41,7 +41,6 @@ from ...server_concurrency import (
     _CHALLENGE_EXECUTOR,
     _CLEANUP_EXECUTOR,
     _CONSUMER_GRACE_SECONDS,
-    _STREAM_EXECUTOR,
     _StreamCancelled,
     _await_cancelable,
 )
@@ -103,13 +102,12 @@ def _is_transient_overload(error: str | None) -> bool:
     e.g. "generation_timeout: Server busy, please try again later."
     Global throttle, not account-specific: must surface as 503 (retryable),
     never RuntimeError (unhandled 500 "Exception in ASGI application").
+    Shared markers from ``core.engine`` (a bare "502" classifies like "bad
+    gateway" here now) plus this upstream's own strings.
     """
     low = (error or "").lower()
-    return any(k in low for k in (
-        "generation_timeout", "server busy", "server_busy",
-        "overloaded", "overload", "service unavailable",
-        "temporarily unavailable", "try again", "timed out", "timeout",
-        "bad gateway", "gateway timeout", "upstream timed out",
+    return any(k in low for k in _engine.TRANSIENT_OVERLOAD_MARKERS + (
+        "generation_timeout", "upstream timed out",
     ))
 
 
@@ -154,13 +152,14 @@ def _is_pow_error(error: str | None) -> bool:
 def _is_rate_limit_error(error: str | None) -> bool:
     """True for global throttles (429, never account-marked)."""
     low = (error or "").lower()
-    return any(k in low for k in ("rate_limit", "too frequent", "too_frequent", "429"))
+    return any(k in low for k in _engine.RATE_LIMIT_MARKERS + (
+        "too frequent", "too_frequent"))
 
 
 def _is_upstream_invalid_error(error: str | None) -> bool:
     """True for upstream payload rejections (422/400 family)."""
     low = (error or "").lower()
-    return "http_422" in low or "unprocessable" in low or "http_400" in low
+    return any(k in low for k in _engine.UPSTREAM_INVALID_MARKERS)
 
 
 def classify_error(error: str | None) -> RetryKind | None:
@@ -1080,23 +1079,8 @@ def _run_completion_core(
         # Ordered like the historical loops (pow -> session -> token -> waf ->
         # overload); a later kind sees whatever error the earlier one left.
         def _retryable(kind) -> Callable[[str | None], bool]:
-            """One predicate factory so NO row retries after a live emit.
-
-            The guard used to sit on the overload row alone, on the assumption
-            that the other kinds fail before any content. ``drain_attempt``
-            makes content-then-error a legal ordering, and the POST is not
-            idempotent (upstream appended a turn), so a pow/session/token/waf
-            recovery here re-POSTs the same payload on the same session and
-            re-streams from delta 0 into a stream the client already read:
-            duplicated text, or two interleaved halves of one tool_calls JSON
-            object, then a clean ``[DONE]`` and no error to stop the harness
-            executing the corrupt call.
-            """
-            def _ok(e: str | None) -> bool:
-                return (classify_error(e) == kind
-                        and not _emit_tracker.emitted)
-
-            return _ok
+            return _engine.live_retry_predicate(
+                classify_error, kind, _emit_tracker)
 
         drive_retries(
             max_retries,
@@ -1145,64 +1129,33 @@ async def _stream_completion(app: FastAPI, pool: AccountPool, item: PooledAccoun
     """Async generator: buffered (default) or live deltas, tools parsed at end.
 
     Producer (account-holding thread) is DeepSeek-specific only in the
-    failover entrypoint; queue/cancel/emit shape + SSE consumer are
-    engine-owned (``new_producer_context`` / ``consume_stream``).
+    failover entrypoint; queue/cancel/emit shape + SSE consumer are engine-owned
+    (``stream_producer``).
     """
     settings = _app_settings(app)
     live = str(getattr(settings, "stream_mode", "live")).lower() == "live"
-    (cid, created, out, cancel_event, consumer_timeout, model,
-     _emit, _put) = _engine.new_producer_context(
-        prep, DS.DEFAULT_TIMEOUT, _CONSUMER_GRACE_SECONDS, buffered=not live)
 
-    def _produce(*, live: bool) -> None:
+    def _run_producer(live: bool, put, cancel_event) -> dict:
         # Single publisher: buffered and live differ only in callbacks.
         # Thinking always streams live (never tool JSON); content streams
         # live only when no tools requested, else buffered so a tool_calls
         # reply is not also emitted as user-visible text.
-        try:
-            if live:
-                result = _complete_with_failover_sync(
-                    app, pool, prep, item,
-                    on_content=(None if prep.get("tools") else lambda t: _put("content", t)),
-                    on_thinking=lambda t: _put("thinking", t),
-                    cancel_event=cancel_event,
-                )
-            else:
-                # Ban failover lives in the helper (owns item's lock): a banned
-                # account retries on the next unbanned one inside the same request.
-                # Ban errors carry no content prefix, so nothing partial leaks.
-                result = _complete_with_failover_sync(
-                    app, pool, prep, item, cancel_event=cancel_event)
-            _emit(("done", result))
-        except _StreamCancelled:
-            pass
-        except HTTPException as exc:
-            _emit(("http_error", exc))
-        except Exception as exc:  # noqa: BLE001
-            # Scrubbed because this is the one emit path that does NOT go
-            # through the terminal ladder: the client helpers raise with a raw
-            # slice of the upstream body in the message, and that body is the
-            # one most likely to echo the Authorization header it was given.
-            # 800 is the scrubber's default and a superset of that 200-char
-            # slice, so no diagnostic text is lost relative to today.
-            _emit(("error", _engine.scrub_upstream_text(exc, 800)))
+        if live:
+            return _complete_with_failover_sync(
+                app, pool, prep, item,
+                on_content=(None if prep.get("tools") else lambda t: put("content", t)),
+                on_thinking=lambda t: put("thinking", t),
+                cancel_event=cancel_event,
+            )
+        # Ban failover lives in the helper (owns item's lock): a banned
+        # account retries on the next unbanned one inside the same request.
+        # Ban errors carry no content prefix, so nothing partial leaks.
+        return _complete_with_failover_sync(
+            app, pool, prep, item, cancel_event=cancel_event)
 
-    def produce_buffered():
-        _produce(live=False)
-
-    def produce_live():
-        _produce(live=True)
-
-    # Bounded producer: one account-holding thread per stream, capped by the
-    # shared executor so a parallel-subagent burst queues instead of piling
-    # unbounded raw threads (each with account + PoW CPU).
-    try:
-        _STREAM_EXECUTOR.submit(produce_live if live else produce_buffered)
-    except RuntimeError:
-        # Executor shut down (interpreter exit): fall back to a raw thread.
-        threading.Thread(target=produce_live if live else produce_buffered, daemon=True).start()
-    async for frame in _engine.consume_stream(
-            out, prep, live, cid, created, model, consumer_timeout,
-            _parse_tool_calls_local, looks_truncated_tool_attempt,
-            cancel_event):
+    async for frame in _engine.stream_producer(
+            _run_producer, prep=prep, timeout=DS.DEFAULT_TIMEOUT, live=live,
+            grace=_CONSUMER_GRACE_SECONDS,
+            parse_fn=_parse_tool_calls_local,
+            truncated_fn=looks_truncated_tool_attempt):
         yield frame

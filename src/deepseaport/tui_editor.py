@@ -156,6 +156,8 @@ def _char_cell(ch: str, col: int) -> int:
     """Display columns ``ch`` occupies when written at column ``col``."""
     if ch == "\t":
         return 8 - (col % 8)
+    if unicodedata.combining(ch):
+        return 0  # combining marks stack on the previous cell
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 

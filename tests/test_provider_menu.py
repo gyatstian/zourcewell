@@ -392,8 +392,14 @@ def test_cli_login_refuses_an_unregistered_provider(tmp_path, monkeypatch, capsy
     assert prompts == [], f"credentials were prompted for anyway: {prompts!r}"
     out = capsys.readouterr().out
     assert "unknown provider: glm" in out
-    # The available list is what makes the refusal actionable.
-    for pid in ("deepseek", "qwen"):
+    # The available list is what makes the refusal actionable, and it IS
+    # `sorted(registered().keys())` (cli._unknown_provider_exit). A hand-copied
+    # pair drifts every time a provider lands -- opencode already had.
+    from deepseaport.core import registry
+
+    known = sorted(registry.registered().keys())
+    assert known, "need a registered provider to assert the list against"
+    for pid in known:
         assert pid in out
     assert on_disk(cfg)["accounts"] == [], "an account was persisted anyway"
 
@@ -439,6 +445,108 @@ def test_tui_login_refuses_an_unregistered_provider_and_stays_alive(
     assert "unknown provider: glm" in out
     # The refusal lands BEFORE the banner, so it never promises a browser.
     assert "Running glm login" not in out
+
+
+# TUI login parity: the two steps cli.cmd_login does after a successful login --
+
+
+def _jwt(exp: int) -> str:
+    """Minimal unsigned JWT: only the ``exp`` claim matters to jwt_exp."""
+    import base64
+
+    def _b64(obj: dict) -> str:
+        raw = json.dumps(obj).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{_b64({'alg': 'none'})}.{_b64({'exp': exp})}.sig"
+
+
+def _tui_qwen_login(monkeypatch, token: str, banned: bool = False,
+                    detail: str = "") -> None:
+    """Registry login seam for qwen, with the DeepSeek driver rigged to explode."""
+    import deepseaport.core.registry as reg
+
+    class _FakeQwen:
+        def login(self, email, password, settings):
+            return (token, banned, detail)
+
+    real_get = reg.get
+    monkeypatch.setattr(reg, "get",
+                        lambda pid: _FakeQwen() if pid == "qwen" else real_get(pid))
+    monkeypatch.setattr(
+        "deepseaport.providers.deepseek.auth.obscura_login_token",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("the DeepSeek driver ran for a qwen login")))
+
+
+def test_tui_added_qwen_account_keeps_the_signin_expiry(monkeypatch):
+    """cli.cmd_login recovers the signin expiry from the token (jwt_exp, because
+    the registry ``login()`` seam drops ``login_with_expiry``'s own value) and
+    passes it into ``_upsert_account``. The TUI built its AccountConfig without
+    it, so a Qwen account added here kept ``token_expires_at`` 0.0 and the
+    documented proactive re-signin could never fire for it."""
+    from deepseaport.tui import accounts_menu
+
+    token = _jwt(1789555791)
+    _tui_qwen_login(monkeypatch, token)
+
+    s = _fresh(provider="qwen", providers=[], accounts=[])
+    inputs = iter(["a", "q@x.com", "pw", "y", "q"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+
+    accounts_menu(s)
+
+    assert [(a.provider, a.token, a.token_expires_at) for a in s.accounts] == [
+        ("qwen", token, 1789555791.0)]
+
+
+def test_tui_set_token_qwen_keeps_the_signin_expiry(monkeypatch):
+    """The same guarantee on the set-token path, the TUI's other token write."""
+    from deepseaport.tui import accounts_menu
+
+    token = _jwt(1789555791)
+    _tui_qwen_login(monkeypatch, token)
+
+    s = _fresh(provider="qwen", providers=[], accounts=[
+        AccountConfig(email="q@x.com", password="pw", token="old-tok",
+                      provider="qwen")])
+    # t = set token, email, "" = no token -> auto-login offer, Enter accepts, q.
+    inputs = iter(["t", "q@x.com", "", "", "q"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+
+    accounts_menu(s)
+
+    assert (s.accounts[0].token, s.accounts[0].token_expires_at) == (
+        token, 1789555791.0)
+
+
+def test_tui_banned_qwen_login_keeps_the_probe_expiry(monkeypatch):
+    """cli refines a banned login's expiry through ``check_ban_for_token``
+    (Provider.probe_ban, so a Qwen token is probed as Qwen) instead of trusting
+    the login page's wording alone. The TUI took only the wording, so a ban with
+    no parseable date was persisted with ``banned_until`` 0.0."""
+    import deepseaport.accounts as acc_mod
+    from deepseaport.tui import accounts_menu
+
+    _tui_qwen_login(monkeypatch, _jwt(1789555791), banned=True,
+                    detail="suspended")
+    seen: list = []
+
+    def _probe(token, timeout=12, provider="deepseek"):
+        seen.append(provider)
+        return True, 4000000000.0
+
+    monkeypatch.setattr(acc_mod, "check_ban_for_token", _probe)
+
+    s = _fresh(provider="qwen", providers=[], accounts=[])
+    inputs = iter(["a", "q@x.com", "pw", "y", "q"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
+
+    accounts_menu(s)
+
+    assert seen == ["qwen"], "the ban probe was not scoped to the login provider"
+    assert (s.accounts[0].banned, s.accounts[0].banned_until) == (
+        True, 4000000000.0)
 
 
 def test_cli_login_still_reaches_deepseek_and_qwen_browsers(

@@ -236,6 +236,27 @@ def _login_banner(pid: str) -> str:
     return f"Running {provider_label(key)} login (direct API signin, ~5s)..."
 
 
+def _login_token_expiry(token: str, provider: str | None) -> float:
+    """JWT ``exp`` of a login token for a non-DeepSeek provider, else 0.0.
+
+    Mirrors cli.cmd_login: providers.qwen.auth.login_with_expiry captures the
+    signin expiry, but the registry ``login()`` seam returns the legacy 3-tuple
+    and discards it, so the expiry is recovered from the token afterwards.
+    jwt_exp is the tree's only JWT ``exp`` reader; 0.0 = unknown, never fatal.
+    Without this a Qwen account added by the TUI kept ``token_expires_at`` 0.0,
+    so the documented proactive re-signin could never fire for it.
+    """
+    key = str(provider or "").strip().lower() or "deepseek"
+    if not token or key == "deepseek":
+        return 0.0
+    try:
+        from .providers.qwen.auth import jwt_exp
+
+        return float(jwt_exp(token) or 0.0)
+    except Exception:
+        return 0.0
+
+
 def _provider_scope(settings: Settings) -> tuple[list[str], bool, str]:
     """The one provider-scope lookup: (active_ids, is_multi, single).
 
@@ -694,6 +715,12 @@ def _select_provider(settings: Settings) -> bool:
             except (EOFError, KeyboardInterrupt):
                 print()
                 return True
+            except (RuntimeError, OSError) as exc:
+                # Same treatment as _run_submenu / cli._save: save() refuses an
+                # unparsable config and fails on an unwritable one, and this is
+                # also the serve startup gate -- a traceback here killed the TUI.
+                _err(f"Provider not saved: {type(exc).__name__}: {exc}")
+                return True
             _ok(f"Provider mode -> multi ({', '.join(ids)}) (saved)")
             return True
         picked = ""
@@ -713,6 +740,9 @@ def _select_provider(settings: Settings) -> bool:
             settings.save()
         except (EOFError, KeyboardInterrupt):
             print()
+            return True
+        except (RuntimeError, OSError) as exc:
+            _err(f"Provider not saved: {type(exc).__name__}: {exc}")
             return True
         _ok(f"Provider -> {picked} (saved)")
         return True
@@ -739,8 +769,9 @@ def _normalize_provider_choice(raw: str, valid_ids: list[str]) -> str:
 def _ask_account_provider(settings: Settings) -> str:
     """Provider id for a new account. Single mode returns it directly.
 
-    Multi mode prompts with text choices (e.g. deepseek [ds] / qwen),
-    defaulting to deepseek on empty input. Never raises; EOF defaults.
+    Multi mode prompts with text choices (e.g. deepseek [ds] / qwen), defaulting
+    to deepseek when it is active, else to the first active provider. Never
+    raises; EOF defaults the same way.
     """
     active, multi, single = _provider_scope(settings)
     if not multi:
@@ -755,6 +786,11 @@ def _ask_account_provider(settings: Settings) -> str:
             return _usable(single)
         except Exception:
             return (single or "deepseek").strip().lower() or "deepseek"
+    # The empty/EOF answer must land INSIDE the active set. It used to return
+    # the literal "deepseek", so with providers=["qwen","opencode"] an Enter
+    # filed the account under a provider that is not active -- no pool builds
+    # from it and no request can serve it (the `login --provider glm` class).
+    _default = "deepseek" if "deepseek" in active else (active[0] if active else "deepseek")
     # Multi: text choices only, deepseek shows its ds alias in brackets.
     parts: list[str] = []
     for pid in active:
@@ -766,12 +802,12 @@ def _ask_account_provider(settings: Settings) -> str:
     prompt = f"Provider ({' / '.join(parts)})"
     while True:
         try:
-            ans = _ask(prompt, default="deepseek")
+            ans = _ask(prompt, default=_default)
         except (EOFError, KeyboardInterrupt):
             print()
-            return "deepseek"
+            return _default
         if not ans.strip():
-            return "deepseek"
+            return _default
         picked = _normalize_provider_choice(ans, active)
         if picked:
             return picked
@@ -1176,6 +1212,19 @@ def accounts_menu(settings: Settings) -> None:
             except Exception:
                 _until = 0.0
             if token:
+                # cli.cmd_login's refinement, same reason: the login page's
+                # wording is one source for the expiry, the provider's own ban
+                # probe (Provider.probe_ban, so a Qwen token is probed as Qwen)
+                # is the better one when it answers. Best-effort, never fatal.
+                try:
+                    from .accounts import check_ban_for_token
+                    if _pid != "deepseek":
+                        _probed, _probe_until = check_ban_for_token(token, provider=_pid)
+                    else:
+                        _probed, _probe_until = check_ban_for_token(token)
+                    _until = float(_probe_until or 0.0) or _until
+                except Exception:
+                    pass
                 _err(f"Auto-login captured a token for {email}, "
                      "but the account is BANNED. Token saved; Account "
                      "list will show the ban.")
@@ -1417,7 +1466,8 @@ def accounts_menu(settings: Settings) -> None:
             # saved account kept banned=False.
             cfg = AccountConfig(email=email, password=password, token=token,
                                 provider=new_provider, banned=login_banned,
-                                banned_until=banned_until)
+                                banned_until=banned_until,
+                                token_expires_at=_login_token_expiry(token, new_provider))
             try:
                 from .accounts import add_account as _add
                 _add(settings, pool, cfg)
@@ -1457,8 +1507,13 @@ def accounts_menu(settings: Settings) -> None:
                 ident = rows[idx]["identifier"]
             if not token:
                 from .accounts import _matches as _m
+                # Scoped like the `d` branch: the visible rows are the scope,
+                # and the unscoped first match offered the OTHER provider's
+                # credentials for auto-login -- then wrote the token it
+                # produced onto the scoped record.
                 existing = (target if target is not None else
-                            next((a for a in settings.accounts if _m(a, ident)), None))
+                            next((a for a in _visible_accounts
+                                  if _m(a, ident)), None))
                 if existing is None:
                     _pending = f"Not found: {ident}"
                     continue
@@ -1481,10 +1536,27 @@ def accounts_menu(settings: Settings) -> None:
                 matched = target
             else:
                 from .accounts import set_account_token as _set
-                matched = _set(settings, ident, token)
+                # Provider-SCOPED like the routes / the delete path: the same
+                # email is one record per provider, and the unscoped first
+                # match wrote the token onto the OTHER provider's record.
+                # Multi scope ("") keeps the historical first match.
+                matched = _set(settings, ident, token, provider=_single_v)
             if matched is not None:
+                _exp = _login_token_expiry(token, getattr(matched, "provider", ""))
+                if _exp:
+                    # cli parity (_upsert_account writes a known expiry only):
+                    # a token that says nothing about its expiry must not erase
+                    # one already persisted.
+                    matched.token_expires_at = _exp
                 settings.save()
                 _ok(f"Token updated for {_label_of(matched)} (saved)")
+                if getattr(matched, "banned", False):
+                    # CLI parity (cmd_login's banned branch): name the persisted
+                    # ban instead of a bare "(saved)", and say what clears it.
+                    # Never auto-clear the flag here -- the REST/CLI unblock owns
+                    # that decision.
+                    _err("Account is BANNED; token kept. Clear with: "
+                         "accounts unblock")
             else:
                 _pending = f"Not found: {ident}"
             continue
@@ -1533,12 +1605,16 @@ def accounts_menu(settings: Settings) -> None:
                     _pending = f"Not found: {shown} (nothing deleted)"
                     continue
             else:
-                # Typed identifier: legacy by-identifier path, kept working.
-                if not pool.remove(ident):
+                # Typed identifier: legacy by-identifier path, kept working --
+                # but provider-SCOPED like the routes (server_routes
+                # .delete_account): one email is one record per provider, and
+                # the unscoped first match removed the OTHER provider's record
+                # while the one this screen shows survived. Multi scope ("")
+                # keeps the historical first match; a row number disambiguates.
+                from .accounts import remove_account as _remove
+                if not _remove(settings, ident, provider=_single_v):
                     _pending = f"Not found: {ident} (nothing deleted)"
                     continue
-                from .accounts import remove_account as _remove
-                _remove(settings, ident)
             settings.save()
             _ok(f"Removed {shown} (saved)")
             continue

@@ -101,6 +101,7 @@ Five rules keep that table from lying to the client:
 - **No row of that table may fire once a live delta has reached the client.**
   `core.engine.LiveEmitTracker`, wrapped onto the live callbacks by
   `live_emit_pair`, flags exactly that, and every provider's `_retryable(kind)`
+  is `core.engine.live_retry_predicate(classify_error, kind, tracker)`, whose
   predicate ANDs `not tracker.emitted`. Live mode `_put`s deltas as they
   arrive and `drain_attempt` makes content-then-error a legal ordering, while
   the completion POST is **not idempotent** — the upstream already appended a
@@ -112,6 +113,18 @@ Five rules keep that table from lying to the client:
   started on the `overload` row alone, on the assumption that the other kinds
   fail before any content. All three tables gate **every** row now (each
   `drive_retries` call in `providers/*/completion_service.py`).
+- **One marker vocabulary, composed per provider.** `core.engine` owns
+  `TRANSIENT_OVERLOAD_MARKERS` / `RATE_LIMIT_MARKERS` /
+  `UPSTREAM_INVALID_MARKERS`; each `classify_error` composes the neutral tuple
+  with its own extras and keeps its own check order (rate-limit before
+  overload, where a throttled body also says "try again"). `transport`
+  renders every non-200 as `HTTP_<status>: <body>`, so a bare status text has
+  to classify identically on every upstream: the word lists had been forked
+  per provider and the numeric fallbacks were never back-propagated (DeepSeek
+  retried "bad gateway" but answered a bare `502` terminally). A bare
+  `500`/`502`/`503`/`504` is therefore retryable overload everywhere now,
+  `max_retries`-bounded and gated by the partial-emit tracker; only an
+  exhausted retry budget surfaces it (503).
 - **`stream_mode: buffered` sizes its watchdog against the whole producer
   budget, not one read.** In live mode `stream_timeout` is one socket read
   (correct: every delta resets the clock). In buffered mode the producer
@@ -151,10 +164,11 @@ must keep:
   surface. Qwen scrubs at every point that could echo one: the re-signin
   failure log, the terminal 401 detail, the overload-retry log (all three
   *before* an 80-char slice, because truncating first can cut a JWT mid-token),
-  and the `except Exception:` producer tail inside `_produce` — that tail is the
-  one path that bypasses the terminal ladder, so the 800-cap scrub there is what
-  keeps a client helper's raw body slice out of a live stream. Same helper and
-  same reason as DeepSeek's `_invalid_token_401_detail` and
+  and the shared `except Exception:` producer tail in
+  `core.engine.stream_producer` — that tail is the one path that bypasses the
+  terminal ladder, so the 800-cap scrub there is what keeps a client helper's
+  raw body slice out of a live stream. Same helper and same reason as
+  DeepSeek's `_invalid_token_401_detail` and
   `_refresh_token_via_obscura` login note. `core/AGENTS.md` holds the full
   cross-provider list of sinks; check it before adding one.
 - **The superseded chat id is deleted, not orphaned.** `_prepare_chat`
@@ -514,12 +528,17 @@ no search). `/v1/models` serves the union of the active providers.
   clear the delete-then-save way out would re-arm the refusal the next time a
   save ran against the recreated file. A missing or blank file is a
   legitimate fresh install and is never latched.
-- **A present-but-empty env var is treated as absent** (`_env_str`,
-  `config.py:747-761`). `os.environ.get("OBSCURA_BIN", raw.get("obscura_bin", ""))`
-  returns `""` for `OBSCURA_BIN=`, so a `.env` copied from the example file
-  silently reverted `obscura_bin` to `""` and the WAF path began
-  auto-discovering a *different* binary than the operator pinned, with no
-  warning. A real value still overrides.
+- **A present-but-empty env var is treated as absent, module-wide.** `_env_str`
+  is where the rule is documented, but every other env read in `config.py`
+  follows it too (the `_bool` / `_int` / `_str` / `_text` closures,
+  `active_account`, `browser_bin`, `_providers_list`, the import-time
+  `DEEPSEAPORT_DATA` / `_env_dir`): `os.environ.get(K, raw.get(...))` returns
+  `""` for `K=`, and an empty string is truthy as far as the rest of the loader
+  is concerned, so a shell profile that exports `KEY=` (`set -a; . .env`)
+  silently reverted each field to its built-in default — `OBSCURA_BIN=` sent the
+  WAF path auto-discovering a *different* binary than the operator pinned, with
+  no warning. Whitespace-only counts as empty; a real value still overrides
+  `config.json`.
 - The load path treats a hand-edited file as hostile input, because every field
   in it can be wrong in a way that is unrecoverable from the outside:
   - **`banned` goes through the string-aware bool** (`_as_bool`,
@@ -572,7 +591,10 @@ no search). `/v1/models` serves the union of the active providers.
   `config_path` — because that is what a debugging print is for.
 - **The release guard is `scripts/prepare_release.py`.** `dist/` is both the
   PyInstaller output directory and the frozen app's live credential store
-  (`config._app_dir()` → `Path(sys.executable).parent` when frozen), so zipping
+  (`config._app_dir()` → `Path(sys.executable).parent` when frozen, the checkout
+  root only when a `pyproject.toml` sits beside it, else the per-user dir —
+  `%APPDATA%` / `$XDG_CONFIG_HOME` / `~/.config`, the same base
+  `DEEPSEAPORT_DATA` defaults under), so zipping
   it by hand ships `config.json` — gitignored or not. The script reads `dist/`,
   strips `*.bak`/`*.tmp`/`*.log`/profile dirs, refuses to build when a
   `config.json` or any JSON with non-empty `token`/`password`/`keys` is present,
@@ -660,12 +682,14 @@ no search). `/v1/models` serves the union of the active providers.
   ban-probe, cross-account failover — and only confirmed ban evidence sets
   `accounts[].banned`; a raising `recover()` is contained by
   `core.engine._run_recovery` so the original upstream status survives; and
-  every adapter must pass `buffered=not live` into
-  `new_producer_context(...)` so the consumer watchdog covers the whole
-  producer budget rather than one socket read. All three comply — each
-  `providers/*/completion_service.py` passes `buffered=not live` into
-  `_engine.new_producer_context(...)` — so `stream_mode` means the
-  same thing whichever upstream is serving.
+  `status`/retry classification comes from the shared marker tuples in
+  `core.engine` composed with a provider's own extras, never a second fork.
+  All
+  three adapters call `core.engine.stream_producer(...)` with their own
+  `live` flag and timeout/grace globals, and that helper passes
+  `buffered=not live` into `new_producer_context(...)` so the consumer
+  watchdog covers the whole producer budget rather than one socket read — so
+  `stream_mode` means the same thing whichever upstream is serving.
   The `RetryKind` enum is per-provider too, and deliberately so: its members
   are facts about *that* upstream. A member that exists but is never produced
   is fine; a member produced from the wrong evidence is not — and every
@@ -746,8 +770,9 @@ below are v2-specific. Full protocol detail lives in
   take `cancel_event`, abort the session and raise the same `_StreamCancelled`
   the live tail raises.
 - **Live streaming is real, not buffered** (this is the opencode-specific
-  answer to the `stream_mode` discussion above, and the one place a provider
-  does *not* use the engine's blocking producer). In `stream_mode: live`
+  answer to the `stream_mode` discussion above, and the one place the flag
+  changes the *client flow*, not only the callbacks: `live=True` drives the
+  `GET /api/event` SSE tail instead of prompt-then-poll). In `stream_mode: live`
   (`completion_service._stream_completion`) it runs
   `_run_completion_core(..., live=True)`, which calls
   `client.stream_message` — that subscribes to `GET /api/event` **first** (so
@@ -775,12 +800,17 @@ below are v2-specific. Full protocol detail lives in
   upstream on v2, so it stays warn-and-drop like the web providers.
 - **Tool access is the managed permission map, and nothing else.** v2 has no
   message-level `tools` map — the prompt body is `{text}` and nothing else — so
-  the map in `managed_serve.managed_config_content` (`read`/`glob`/`grep`/
-  `subagent` and `edit`/`bash`/`webfetch`/`external_directory`, all `deny`,
-  globally and on the agent) is the single layer that bounds what the model
-  may call. `read`-like tools are denied because sessions are rooted at the
-  operator's cwd, where `config.json` can sit, and `subagent` because a
-  spawned agent carries its own permission set. The free-tier
+  the map in `managed_serve.managed_config_content` (`read` and `bash` are
+  `ask`; `glob`/`grep`/`subagent` and `edit`/`webfetch`/`external_directory`
+  are `deny`, globally and on the agent) is the single layer that bounds what
+  the model may call. The free-tier gateway rejects requests when `read` or
+  `bash` are absent from the tool list, so they remain approval-gated rather
+  than denied. The client subscribes to `permission.asked` before each turn
+  and posts `{"decision":"reject"}` for the matching session, so managed
+  headless turns never wait for approval. `read` is restricted because
+  sessions are rooted at the operator's cwd, where `config.json` can sit, and
+  `subagent` stays denied because a spawned agent carries its own permission
+  set. The free-tier
   gatekeeper survives only as a terminal classification
   (`protocol.is_free_tier_error` → `OPENCODE_FREE_TIER_DENIED`); the
   declare-the-native-keys trick that used to ride the message body is history.
@@ -793,8 +823,9 @@ below are v2-specific. Full protocol detail lives in
   with a code prefix the classifier reads (`OPENCODE_SERVE_DOWN`,
   `OPENCODE_HTTP_<status>`, `OPENCODE_UPSTREAM`, `OPENCODE_EMPTY`,
   `OPENCODE_INVALID_SESSION`, `OPENCODE_RATE_LIMITED`,
-  `OPENCODE_FREE_TIER_DENIED`); free-tier refusals are terminal with an
-  upgrade hint and serve-down becomes 502 + an actionable hint. Retry table is
+  `OPENCODE_FREE_TIER_DENIED`); free-tier refusals are terminal and explain
+  that a permission map denying `read` or `bash`/`shell` may trigger them;
+  serve-down becomes 502 + an actionable hint. Retry table is
   overload-only (there are no accounts to fail over to) plus one inline
   stale-session recreate outside the budget.
 - **Model catalogue.** Two layers in `providers/opencode/models.py`:

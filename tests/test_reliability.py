@@ -676,26 +676,36 @@ def test_nonstream_disconnect_while_queued_returns_499(monkeypatch):
         AccountPool.release(held)
 
 
-@pytest.mark.parametrize("provider", ["deepseek", "qwen", "opencode"])
-def test_stream_producer_uses_bounded_executor(provider):
+def test_stream_producer_uses_bounded_executor():
     """Fix 3: stream producers submit to a bounded executor, not raw threads.
 
-    Parametrized over all three `completion_service` modules because each owns
-    its own `_stream_completion` and each is a separate submit site; a source
-    grep of only the deepseek one would let qwen's or opencode's regress to
-    raw threads unnoticed.
+    The submit site moved into the one shared skeleton
+    (``core.engine.stream_producer``), so the invariant is asserted there once
+    plus per provider that its ``_stream_completion`` delegates to it. The
+    provider set comes from ``registry.registered()``, not a literal list, so a
+    new upstream cannot be added without being checked.
     """
     import importlib
     import inspect
 
     from deepseaport import server_concurrency as SC
+    from deepseaport.core import engine as engine_mod
+    from deepseaport.core import registry
 
-    mod = importlib.import_module(
-        f"deepseaport.providers.{provider}.completion_service")
-
-    src = inspect.getsource(mod._stream_completion)
-    assert "_STREAM_EXECUTOR.submit" in src, f"{provider} streams off a raw thread"
+    engine_src = inspect.getsource(engine_mod.stream_producer)
+    assert "_STREAM_EXECUTOR.submit" in engine_src, \
+        "engine.stream_producer streams off a raw thread"
     assert SC._STREAM_EXECUTOR._max_workers <= 64
+
+    provider_ids = sorted(registry.registered())
+    assert provider_ids, "registry imported no providers"
+    for pid in provider_ids:
+        mod = importlib.import_module(
+            f"deepseaport.providers.{pid.replace('-', '_')}.completion_service")
+        src = inspect.getsource(mod._stream_completion)
+        assert "stream_producer" in src, (
+            f"{pid}._stream_completion does not delegate to "
+            "engine.stream_producer")
 
 
 def test_no_bridge_surfaces_real_error(monkeypatch, tmp_path):

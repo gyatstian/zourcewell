@@ -73,38 +73,37 @@ def test_managed_config_content_is_minimal():
     assert cfg["instructions"] == []
     assert MANAGED_AGENT_PRESENT(cfg)
     perms = cfg["agent"][MS.MANAGED_AGENT]["permission"]
-    # every native tool is denied; the map is the only tool boundary on v2.
-    assert perms["read"] == "deny" and perms["edit"] == "deny"
-    assert perms["bash"] == "deny" and perms["webfetch"] == "deny"
+    # The managed permission map is the only native-tool boundary on v2.
+    assert perms["read"] == "ask" and perms["edit"] == "deny"
+    assert perms["bash"] == "ask" and perms["webfetch"] == "deny"
     assert perms["external_directory"] == "deny"
     # The agent-level map mirrors the top-level one (both are sent).
     assert cfg["permission"] == perms
 
 
-def test_managed_config_denies_native_shell():
-    """The map granted bash while the comment claimed it was unused.
-
-    The child is an agentic CLI rooted at the operator's cwd; a
-    prompt-injection chain must not get native shell access. On opencode v2
-    this map is also the ONLY thing bounding native tools -- there is no
-    per-message override left to grant one back.
-    """
+def test_managed_config_approval_gates_read_and_shell():
+    """Keep gateway-required tools available, but never auto-approve them."""
     cfg = json.loads(MS.managed_config_content())
     for scope in (cfg["permission"], cfg["agent"][MS.MANAGED_AGENT]["permission"]):
-        assert scope["bash"] == "deny"
-        assert scope["read"] == "deny"
+        assert scope["bash"] == "ask"
+        assert scope["read"] == "ask"
+        assert scope["glob"] == scope["grep"] == "deny"
+        assert scope["edit"] == scope["webfetch"] == "deny"
+        assert scope["external_directory"] == scope["subagent"] == "deny"
 
 
-def test_managed_config_denies_read_like_tools():
-    """#17: read sat at "allow" while the session directory is the operator's
-    cwd -- the repo root or dist/ -- where config.json holds plaintext
-    passwords and bearer tokens. ``subagent`` (alias ``task``) is denied
+def test_managed_config_denies_sensitive_native_tools():
+    """Sensitive file/search tools stay denied; ``subagent`` cannot bypass it.
+
+    The session directory is the operator's cwd -- the repo root or dist/ --
+    where config.json holds plaintext passwords and bearer tokens.
+    ``subagent`` (alias ``task``) is denied
     because a spawned opencode agent carries its own permission set (the
     built-in explore agent allows read/grep/glob), which would bypass the map.
     """
     cfg = json.loads(MS.managed_config_content())
-    expected = ("read", "glob", "grep", "subagent", "edit", "bash",
-                "webfetch", "external_directory")
+    expected = ("glob", "grep", "subagent", "edit", "webfetch",
+                "external_directory")
     for scope in (cfg["permission"], cfg["agent"][MS.MANAGED_AGENT]["permission"]):
         for key in expected:
             assert scope[key] == "deny", f"{key} is not denied: {scope}"
@@ -120,6 +119,24 @@ def test_client_headers_identity(monkeypatch):
     assert headers["x-opencode-project"] == "global"
     assert headers["X-Session-ID"] == "ses_abc123"
     assert "X-Session-ID" not in OP.client_headers(None)
+
+
+def test_permission_event_is_rejected_for_its_session(monkeypatch):
+    seen = []
+
+    def _request(method, path, body=None, timeout=20, session_id=None, **kw):
+        seen.append((method, path, body, session_id))
+        return 204, {}
+
+    monkeypatch.setattr(OC, "_request", _request)
+    event = {"type": "permission.asked",
+             "properties": {"sessionID": "ses_1", "id": "per_shell"}}
+    OC._reject_permission_event(event, "ses_1")
+    OC._reject_permission_event(event, "ses_other")
+
+    assert seen == [
+        ("POST", "/api/session/ses_1/permission/per_shell/reply",
+         {"decision": "reject"}, "ses_1")]
 
 
 def test_request_sends_identity_headers(monkeypatch):
@@ -166,6 +183,7 @@ def test_free_tier_denied_is_terminal(monkeypatch):
         raise AssertionError("must raise")
     except RuntimeError as exc:
         assert "OPENCODE_FREE_TIER_DENIED" in str(exc)
+        assert "permission map" in str(exc)
         assert OCS.classify_error(str(exc)) is OCS.RetryKind.UPSTREAM
 
 
@@ -407,7 +425,7 @@ def test_ensure_child_env_has_no_parent_secrets(monkeypatch, tmp_path):
     assert env["OPENCODE_SERVER_PASSWORD"]
     assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
     assert env["OPENCODE_DISABLE_CLAUDE_CODE"] == "1"
-    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"]["bash"] == "deny"
+    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"]["bash"] == "ask"
     # The parent process env is untouched: only the child copy is stripped.
     assert os.environ["DEEPSEEK_PASSWORD"] == "hunter2-s3cret"
 

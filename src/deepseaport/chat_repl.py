@@ -175,8 +175,26 @@ def _print_multi_help() -> None:
     print("            /quit or /exit (stop all servers, back to menu), /help (this)")
 
 
+def _scoped_accounts(settings) -> list:
+    """Accounts bound to an active provider that needs one (the TUI's scope).
+
+    ``server_routes._pool`` has no cross-provider fallback, so an account bound
+    to a provider that is not active is not poolable: counting it as usable
+    pinned an instance to a credential its own pool then never held, and every
+    request 503'd. Gating on the GLOBAL ``settings.accounts`` list is what let a
+    single-qwen config with only a DeepSeek account on file pass preflight.
+    ``providers`` is empty when the registry could not answer, in which case
+    every active id counts (same conservative rule as ``tui._preflight_reason``).
+    """
+    from .core import pools
+
+    ids = (pools.providers_requiring_accounts(settings)
+           or pools.active_provider_ids(settings))
+    return [a for pid in ids for a in pools.accounts_for_provider(settings, pid)]
+
+
 def _select_usable_accounts_live(settings) -> tuple[list, int, int]:
-    """Split pool into usable vs banned vs tokenless via live ban probes.
+    """Split the SCOPED pool into usable vs banned vs tokenless via live probes.
 
     Usable = has a token AND live check says not banned. Offline/probe
     failures count as usable (best-effort, never blocks startup on network
@@ -189,7 +207,7 @@ def _select_usable_accounts_live(settings) -> tuple[list, int, int]:
     """
     from .accounts import ban_label_for, collect_ban_labels
 
-    all_accs = list(getattr(settings, "accounts", []) or [])
+    all_accs = _scoped_accounts(settings)
     cands = [a for a in all_accs if (getattr(a, "token", "") or "").strip()]
     no_token = len(all_accs) - len(cands)
     if not cands:

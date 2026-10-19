@@ -440,8 +440,11 @@ def _normalize_calls(
         truncated_extra: list[int] = []
     lower_map: dict[str, str] = {}
     if valid_names:
-        for n in valid_names:
-            if isinstance(n, str) and n.lower() not in lower_map:
+        # Deterministic order: two declared names that differ only in case
+        # (Read/read) must canonicalize to the same one in every process, and
+        # set iteration order follows PYTHONHASHSEED.
+        for n in sorted(n for n in valid_names if isinstance(n, str)):
+            if n.lower() not in lower_map:
                 lower_map[n.lower()] = n
     calls: list[dict] = []
     dropped: list[int] = []
@@ -735,7 +738,8 @@ def _recover_loose_openai_call(text: str, valid: set[str] | None,
         parsed = _loads_json_lenient(parsed)
     if parsed is _LOOSE_JSON_MISS or not isinstance(parsed, (dict, list)):
         return None
-    lower_map = {n.lower(): n for n in valid if isinstance(n, str)}
+    lower_map = {n.lower(): n
+                 for n in sorted(n for n in valid if isinstance(n, str))}
     name = None
     for candidate in reversed(re.findall(r'"name"[ ]*:[ ]*"([^"]+)"',
                                          text[:value_start])):

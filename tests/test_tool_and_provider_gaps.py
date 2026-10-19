@@ -4,8 +4,8 @@ Groups:
 
 * ``MAX_PARAMS_PER_INVOKE`` must bound how many parameters are *scanned*,
   never the value range of the last accepted one (H1).
-* The managed agent's permission map must keep native tools denied -- bash
-  (playbook H2) and read (the session dir holds config.json) (H2).
+* The managed agent's permission map must expose only gateway-required native
+  tools as approval-gated; the client rejects those prompts (H2).
 * Dead provider surface stays deleted (H3): no dead `*_models` diagnostics
   helper, no dead stop helper; `snapshot_verdict` is live and must remain.
 * ``MAX_ARGS_CHARS`` is an import-time snapshot, not a live env read, and
@@ -131,12 +131,13 @@ def test_param_cap_is_the_documented_hardcoded_64():
 # opencode v2 removed the per-message tool map, so there is no override left
 # that could re-grant a native tool: this map is the only authority.
 
-def test_managed_permission_map_still_denies_bash():
+def test_managed_permission_map_keeps_gateway_tools_approval_gated():
     from deepseaport.providers.opencode import managed_serve as MS
 
     cfg = json.loads(MS.managed_config_content())
-    assert cfg["permission"]["bash"] == "deny"
-    assert cfg["permission"]["read"] == "deny"
+    assert cfg["permission"]["bash"] == "ask"
+    assert cfg["permission"]["read"] == "ask"
+    assert cfg["permission"]["edit"] == "deny"
 
 
 # --- H3: the live provider helper stays live ------------------------------

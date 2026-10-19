@@ -148,22 +148,23 @@ def managed_config_content() -> str:
     ``agents``, ``prompt`` to ``system``, ``bash`` to ``shell``); the
     permission map below is the ONLY thing that bounds what the model may
     call on v2, since v2 has no per-message tool map left to override it.
-    read/glob/grep are DENIED for the same reason bash is: sessions are rooted
-    at the operator's cwd (``protocol.session_directory``), which can be the
-    repo root or dist/, so ``config.json`` -- account emails, plaintext
-    passwords and bearer tokens -- sits inside the session directory, and a
-    native read (or a grep over it) is a credential leak. editing,
-    webfetch and external_directory access are denied with them, and
-    ``subagent`` (opencode's ``task`` tool) is denied because a spawned agent
-    carries its OWN permission set -- the built-in explore agent allows
-    read/grep/glob -- so it would otherwise bypass this map. Keys are tool
-    names: write/patch normalize to edit and task to subagent, so this set
-    covers every read-like default tool. The agent prompt forces text-only
+    The free tier rejects requests when ``read`` or ``bash`` is omitted from
+    the tool list, so those are approval-gated rather than denied. ``read``
+    still needs approval because sessions are rooted at the operator's cwd
+    (``protocol.session_directory``), which can contain ``config.json`` with
+    plaintext credentials. ``glob``/``grep``, editing, webfetch and
+    external_directory access are denied; ``subagent`` (opencode's ``task``
+    tool) is denied because a spawned agent carries its OWN permission set --
+    the built-in explore agent allows read/grep/glob -- so it would otherwise
+    bypass this map. Keys are tool names: write/patch normalize to edit and
+    task to subagent. The agent prompt forces text-only
     output so the harness (e.g. pi) owns execution; sessions are pinned to the
     caller's workdir via the create body's ``location.directory``.
     """
-    perms = {"read": "deny", "glob": "deny", "grep": "deny",
-             "edit": "deny", "bash": "deny", "webfetch": "deny",
+    # The free-tier gateway rejects requests when read/shell are absent from
+    # the tool list. `ask` keeps them available without auto-approving use.
+    perms = {"read": "ask", "glob": "deny", "grep": "deny",
+             "edit": "deny", "bash": "ask", "webfetch": "deny",
              "external_directory": "deny", "subagent": "deny"}
     cfg = {
         "$schema": "https://opencode.ai/config.json",
@@ -941,7 +942,7 @@ def _reap_previous_child(recorded_pid: int = 0) -> None:
     boots a fresh instance on a new free port. The orphan then keeps its port,
     its ``work/`` cwd and its per-boot basic-auth
     password for the life of the bridge, serving an instance (with the
-    managed agent's ``bash: "deny"`` map) that nothing can reach or shut down
+    managed agent's approval-gated shell map) that nothing can reach or shut down
     again -- and ``ensure()`` runs from every serve-down error path
     (completion_service.py:145, 226), so they accumulated.
 

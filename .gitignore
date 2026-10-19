@@ -16,6 +16,7 @@ secrets*.json
 .ruff_cache/
 .tox/
 .nox/
+.dsh-acl-recovery/
 
 # Empty leftover browser-profile directory. Git cannot track an empty dir, so
 # name it here instead of leaving it as untracked noise.
@@ -88,6 +89,7 @@ dmypy.json
 # --- packaging / uv ---
 .uv/
 *.whl
+release/
 
 # --- IDE / editors ---
 .vscode/

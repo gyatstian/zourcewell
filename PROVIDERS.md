@@ -54,8 +54,11 @@ src/deepseaport/
                          are set per session, not per message;
                          `reasoning_effort` forwards as that `variant`;
                          native tools are bounded only by the managed agent's
-                         permission map; pi tools ride DSML text -> OpenAI
-                         `tool_calls` (see README "Pi harness + opencode").
+                         permission map; each matching `permission.asked`
+                         event is immediately rejected by the client. Pi tools
+                         ride DSML text ->
+                          OpenAI `tool_calls` (see README "Pi harness +
+                          opencode").
   server.py              thin wiring: create_app + re-exports (historical surface)
   server_routes.py       FastAPI endpoints (dispatch via provider.complete_request / stream_response; shaping via _server()._openai_response)
   accounts.py            AccountPool (per-provider instances via core.pools)
@@ -245,7 +248,7 @@ auto-register until it is implemented and its line is added.
 | protocol / client / SSE parser | `providers/<name>/` | Per-provider: every web API differs. |
 | PoW / WAF warmup | `providers/<name>/` | Per-provider: only DeepSeek has `DeepSeekHashV1`. Qwen has a WAF but no PoW. |
 | auth / login / ban probe | `providers/<name>/` | Per-provider: token location + login flow differ. Qwen's is a direct-API POST with a SHA-256-hex password; DeepSeek's needs a real Chromium-family CDP session for Shumei. |
-| completion engine | `core/engine.py` | Reuse: `drive_retries`, `run_with_failover`, `complete_with_failover_sync`, `drain_attempt`, `slot_releaser`, `ban_403_for_item`, `switch_current_after_ban_failover`, `LiveEmitTracker`, terminal raisers, `drain_stream_queue`. Providers keep only `classify_error`, session/chat setup, PoW solve, WAF warmup body, and the invalid-token terminal. Do NOT copy `completion_service.py` for a new provider — write a thin adapter over `core.engine` and keep the same monkeypatch names (`_attempt`, `_run_completion_core`, `_complete_with_failover_sync`, `_stream_completion`). |
+| completion engine | `core/engine.py` | Reuse: `drive_retries`, `run_with_failover`, `complete_with_failover_sync`, `drain_attempt`, `slot_releaser` (its give-up is published through `consume_slot_abandoned`, and every release site routes through `run_with_failover`'s `_release_slot`), `ban_403_for_item`, `switch_current_after_ban_failover`, `LiveEmitTracker` / `live_retry_predicate`, the `TRANSIENT_OVERLOAD_MARKERS` / `RATE_LIMIT_MARKERS` / `UPSTREAM_INVALID_MARKERS` tuples, terminal raisers, `drain_stream_queue`, and the whole `_stream_completion` skeleton via `stream_producer` / `new_producer_context` / `consume_stream`. Providers keep only `classify_error` (composing its own extras onto the neutral tuples), session/chat setup, PoW solve, WAF warmup body, the invalid-token terminal, and their own timeout/grace globals. Do NOT copy `completion_service.py` for a new provider — write a thin adapter over `core.engine` and keep the same monkeypatch names (`_attempt`, `_run_completion_core`, `_complete_with_failover_sync`, `_stream_completion`). |
 | prompt + tool parsing | `core.tools` | Reuse: `render_prompt`, `parse_tool_calls`. |
 | SSE drain helpers | `core.transport` | Reuse. |
 | OpenAI response shim | `core.openai._openai_response` | Reuse: tool parsing resolves via `deepseaport.server.parse_tool_calls` at call time. |

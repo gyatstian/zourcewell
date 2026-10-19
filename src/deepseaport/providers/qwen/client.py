@@ -613,6 +613,12 @@ def stream_completion(headers: dict, payload: dict,
     resp = _SESSION.post(_with_chat_id(P.CHAT_COMPLETIONS_URL, payload),
                          headers=headers, json=payload,
                          impersonate=IMPERSONATE, timeout=timeout, stream=True)
+    # Bound EVERY read on this response, not just the SSE pump: the non-SSE
+    # 200 body is drained through the same untimed curl_cffi queue
+    # (``T.drain_json_text`` below), so without the swap a disconnect during a
+    # silent body is invisible for the whole socket budget -- the account lock
+    # and its worker stay held. No token (direct/unit-test call) is a no-op.
+    T._cancellable(resp)
     if resp.status_code == 200 and P.is_waf_challenge(resp):
         resp.close()
         _log_waf_headers("stream_completion", headers)
@@ -687,4 +693,14 @@ def stream_completion(headers: dict, payload: dict,
                 message="Qwen completions returned a WAF challenge line")
         return None
 
-    yield from T.pump_sse(resp, QwenStreamParser(), precheck=_qwen_waf_precheck)
+    # Read bounded above (a silent pre-first-token stretch or idle hop must
+    # notice a disconnect instead of holding the account lock for the whole
+    # DEFAULT_TIMEOUT); the pump itself is the same shared scaffolding.
+    try:
+        yield from T.pump_sse(resp, QwenStreamParser(),
+                              precheck=_qwen_waf_precheck)
+    except T._ClientGone:
+        # Client left mid-read: stop cleanly so the caller releases the account
+        # slot. The pump's own finally already closed the response, and
+        # _abandon replaced that close with the non-blocking one.
+        return

@@ -69,15 +69,34 @@ MAX_ACCOUNTS_LIMIT = 64
 _CONFIG_SAVE_LOCK = threading.Lock()
 
 
+def _env_dir(key: str, default: Path) -> Path:
+    """A path-ish env var: blank/whitespace counts as unset, like _env_str."""
+    raw = str(os.environ.get(key) or "").strip()
+    return Path(raw) if raw else default
+
+
+def _user_dir() -> Path:
+    """Per-user config dir, for when there is no source checkout to live in."""
+    if os.name == "nt":
+        return _env_dir("APPDATA", Path.home() / "AppData" / "Roaming") / "deepseaport"
+    return _env_dir("XDG_CONFIG_HOME", Path.home() / ".config") / "deepseaport"
+
+
 def _app_dir() -> Path:
-    # Frozen exe: exe location; source: repo root.
+    # Frozen exe: exe location; source checkout: repo root; otherwise per-user.
+    # PACKAGE_DIR.parent.parent is the repo root in a checkout but the
+    # interpreter's Lib/ for a pip-installed wheel, i.e. a stdlib directory --
+    # admin-only on a system Python and wiped by a venv rebuild, which is where
+    # `login` would otherwise write the live credential store. A pyproject.toml
+    # next to it is what tells the two apart.
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    return PACKAGE_DIR.parent.parent
+    root = PACKAGE_DIR.parent.parent
+    return root if (root / "pyproject.toml").is_file() else _user_dir()
 
 
 REPO_DIR = _app_dir()
-DATA_DIR = Path(os.environ.get("DEEPSEAPORT_DATA", str(REPO_DIR / "data")))
+DATA_DIR = _env_dir("DEEPSEAPORT_DATA", REPO_DIR / "data")
 
 
 @dataclass(repr=False)
@@ -599,8 +618,10 @@ def _default_config_path() -> Path:
     # then a config.json in the current working directory (per-deployment
     # override), then the app/exe directory. Keeping cwd support (not a single
     # path) preserves portable multi-instance setups; callers log the chosen
-    # file so a different-cwd silent 401/503 is diagnosable.
-    env = os.environ.get("DEEPSEAPORT_CONFIG")
+    # file so a different-cwd silent 401/503 is diagnosable. A blank env value
+    # is unset (see _env_str): ``DEEPSEAPORT_CONFIG=`` must not become a
+    # CWD-relative Path("").
+    env = str(os.environ.get("DEEPSEAPORT_CONFIG") or "").strip()
     if env:
         return Path(env)
     here = Path.cwd() / "config.json"
@@ -749,16 +770,40 @@ def _env_str(env_key: str, raw_key: str, raw: dict | None = None) -> str:
 
     ``os.environ.get(K, raw.get(...))`` returns "" for ``K=``, and an empty
     string is truthy as far as the rest of the loader is concerned -- so
-    ``OBSCURA_BIN=`` in a .env silently reverts obscura_bin to "" and the WAF
-    path starts auto-discovering a *different* binary than the operator
-    pinned, with no warning. An empty override is indistinguishable from an
-    accidental one, so treat it as absent and fall back to config.json.
+    ``OBSCURA_BIN=`` in the environment silently reverts obscura_bin to "" and
+    the WAF path starts auto-discovering a *different* binary than the
+    operator pinned, with no warning. An empty override is indistinguishable
+    from an accidental one, so treat it as absent and fall back to
+    config.json.
+
+    The rule is not local to this helper: every other env read in this module
+    follows it too (the ``_bool`` / ``_int`` / ``_str`` / ``_text`` closures,
+    ``active_account``, ``browser_bin``, ``_providers_list``, the account vars
+    through ``_env_value``, ``DEEPSEAPORT_KEYS``, ``DEEPSEAPORT_CONFIG`` and
+    the import-time ``DEEPSEAPORT_DATA``), because a shell profile that
+    exports ``KEY=`` (`set -a; . .env`) would otherwise silently revert each
+    field to its built-in default. Whitespace-only counts as empty.
     """
     val = str(os.environ.get(env_key, "") or "").strip()
     if val:
         return val
     src = raw if isinstance(raw, dict) else {}
     return str(src.get(raw_key, "") or "").strip()
+
+
+def _env_value(*keys: str) -> str:
+    """First alias with a non-blank value; blank counts as unset (see _env_str).
+
+    For the account var pairs (``DEEPSEAPORT_*`` then ``DEEPSEEK_*``): a
+    whitespace-only value would otherwise shadow the alias and mint an account
+    out of nothing. The value is returned verbatim -- a password may hold
+    leading or trailing spaces.
+    """
+    for key in keys:
+        val = os.environ.get(key)
+        if val is not None and val.strip():
+            return val
+    return ""
 
 
 def _read_config_json(cfg_path: Path) -> tuple[dict, bool]:
@@ -842,7 +887,7 @@ def load_settings(path: str | None = None) -> Settings:
             "(blank): the server is AUTH DISABLED (no API key required on any "
             "endpoint). Set a real key, or remove \"keys\" if you want it open.",
             cfg_path, len(raw_keys) if hasattr(raw_keys, "__len__") else 1)
-    env_keys = os.environ.get("DEEPSEAPORT_KEYS")
+    env_keys = str(os.environ.get("DEEPSEAPORT_KEYS") or "").strip()
     if env_keys:
         parsed = _normalize_keys(env_keys.split(","))
         if parsed:
@@ -887,12 +932,11 @@ def load_settings(path: str | None = None) -> Settings:
             ))
     # Single-account env: replaces placeholder config, otherwise appends as an
     # extra failover account (DEEPSEAPORT_KEYS replaces keys; TOKEN appends).
-    env_token = os.environ.get("DEEPSEAPORT_TOKEN") or os.environ.get("DEEPSEEK_TOKEN")
-    env_email = os.environ.get("DEEPSEAPORT_EMAIL") or os.environ.get("DEEPSEEK_EMAIL")
-    env_password = os.environ.get("DEEPSEAPORT_PASSWORD") or os.environ.get("DEEPSEEK_PASSWORD")
+    env_token = _env_value("DEEPSEAPORT_TOKEN", "DEEPSEEK_TOKEN")
+    env_email = _env_value("DEEPSEAPORT_EMAIL", "DEEPSEEK_EMAIL")
+    env_password = _env_value("DEEPSEAPORT_PASSWORD", "DEEPSEEK_PASSWORD")
     if env_token or (env_email and env_password):
-        env_provider = (os.environ.get("DEEPSEAPORT_PROVIDER")
-                        or raw.get("provider", "deepseek") or "deepseek")
+        env_provider = _env_str("DEEPSEAPORT_PROVIDER", "provider", raw) or "deepseek"
         env_acc = AccountConfig(email=env_email or "", password=env_password or "",
                                 token=env_token or "", provider=env_provider)
         if not accounts or not (accounts[0].token or accounts[0].email):
@@ -917,8 +961,9 @@ def load_settings(path: str | None = None) -> Settings:
             cfg_path, len(accounts), MAX_ACCOUNTS_LIMIT)
 
     def _bool(env_key: str, raw_key: str, default: bool) -> bool:
-        if env_key in os.environ:
-            return _as_bool(os.environ[env_key])
+        env_val = str(os.environ.get(env_key) or "").strip()
+        if env_val:
+            return _as_bool(env_val)
         return _as_bool(raw.get(raw_key, default), default)
 
     # Clamp bookkeeping per field, keyed by the config.json key:
@@ -945,9 +990,10 @@ def load_settings(path: str | None = None) -> Settings:
                 return hi
             return val
 
-        if env_key in os.environ:
+        env_val = str(os.environ.get(env_key) or "").strip()
+        if env_val:
             try:
-                return _bounded(max(0, int(os.environ[env_key])))
+                return _bounded(max(0, int(env_val)))
             except ValueError:
                 return default
         try:
@@ -967,8 +1013,9 @@ def load_settings(path: str | None = None) -> Settings:
 
     def _str(env_key: str, raw_key: str, default: str,
              valid: tuple[str, ...] | None = None) -> str:
+        env_val = str(os.environ.get(env_key) or "").strip()
         raw_val = raw.get(raw_key, default)
-        val = str(os.environ.get(env_key, raw_val)).strip()
+        val = env_val or str(raw_val).strip()
         if valid and val not in valid:
             # Case-insensitive match for convenience, else fall back.
             lowered = {v.lower(): v for v in valid}
@@ -980,8 +1027,10 @@ def load_settings(path: str | None = None) -> Settings:
         # No .strip(): leading spaces (code indent) and blank edge lines are
         # the user's formatting; _prepare trims only edge blank lines when
         # joining. \r\n normalized so Windows-edited config/env joins cleanly.
-        if env_key in os.environ:
-            return str(os.environ[env_key]).replace("\r\n", "\n")
+        # A blank env value is "unset" (see _env_str), so config.json decides.
+        env_val = os.environ.get(env_key)
+        if env_val is not None and env_val.strip():
+            return str(env_val).replace("\r\n", "\n")
         val = raw.get(raw_key, "")
         if val is None:
             return ""
@@ -1004,27 +1053,29 @@ def load_settings(path: str | None = None) -> Settings:
         # so each request fails with [WinError 10061] and nothing anywhere
         # points at config.json. Treat it as "no port chosen" (and a negative
         # value lands here through _int's floor of 0).
+        env_port = str(os.environ.get("DEEPSEAPORT_PORT") or "").strip()
         logger.warning(
             "port=%r is not a usable listen port (0 means \"bind any free "
             "port\", which nothing can dial): using the default %d instead",
-            os.environ.get("DEEPSEAPORT_PORT", raw.get("port")), DEFAULT_PORT)
+            env_port or raw.get("port"), DEFAULT_PORT)
         port = DEFAULT_PORT
-        if ("DEEPSEAPORT_PORT" not in os.environ and raw.get("port") == 0):
+        if (not env_port and raw.get("port") == 0):
             # Recorded like any other clamp so an unrelated save() cannot
             # rewrite the operator's own number (see _RAW_PERSISTED_VALUES);
             # the next load re-warns, which is right for a value that was
             # never what they meant. An env override is transient and has no
-            # on-disk value to protect.
+            # on-disk value to protect -- and a blank var is unset, not an
+            # override, so it must not neutralize the protection either.
             clamped_from_file["port"] = (0, DEFAULT_PORT)
     settings = Settings(
         keys=keys,
         accounts=accounts,
-        active_account=str(os.environ.get("DEEPSEAPORT_ACTIVE_ACCOUNT",
-                                           raw.get("active_account", ""))).strip(),
+        active_account=_env_str("DEEPSEAPORT_ACTIVE_ACCOUNT", "active_account", raw),
         obscura_bin=_env_str("OBSCURA_BIN", "obscura_bin", raw),
         obscura_profile=_env_str("OBSCURA_PROFILE", "obscura_profile", raw),
-        browser_bin=os.environ.get(
-            "DEEPSEAPORT_BROWSER_BIN", raw.get("browser_bin", "auto")),
+        browser_bin=(
+            str(os.environ.get("DEEPSEAPORT_BROWSER_BIN") or "").strip()
+            or raw.get("browser_bin", "auto")),
         browser_headless=_bool("DEEPSEAPORT_BROWSER_HEADLESS", "browser_headless", False),
         port=port,
         listen=_bool("DEEPSEAPORT_LISTEN", "listen", False),
@@ -1065,8 +1116,9 @@ def load_settings(path: str | None = None) -> Settings:
 
 def _providers_list(raw: dict) -> list[str]:
     """Parse the multi-provider selection (env comma-list, else config list)."""
-    if "DEEPSEAPORT_PROVIDERS" in os.environ:
-        raw_val = os.environ["DEEPSEAPORT_PROVIDERS"]
+    env_val = str(os.environ.get("DEEPSEAPORT_PROVIDERS") or "").strip()
+    if env_val:
+        raw_val: object = env_val
     else:
         raw_val = raw.get("providers", [])
     if isinstance(raw_val, str):

@@ -17,10 +17,23 @@ from ..common import (
 )
 
 
-def _coerce_dsml_value(value: str, string_attr: str | None):
+def _coerce_dsml_value(value: str, string_attr: str | None,
+                       declared_type: str | None = None):
+    """Value of one DSML parameter.
+
+    A parameter the schema declares ``string`` (lowercased by
+    ``_tool_param_info``) or that the model marked ``string="true"`` is taken
+    verbatim: that value is file content or a shell command, so stripping it
+    drops a trailing newline and coercing it turns a zero-padded id into an
+    int and ``None`` into null. The JSON-object invoke body keeps its values
+    verbatim too (the parsed dict is used as-is), and the two shapes must
+    agree. Anything else keeps the historical coercion, which untyped bare
+    values rely on.
+    """
+    if declared_type == "string" or (string_attr is not None
+                                     and string_attr.lower() == "true"):
+        return value
     v = value.strip()
-    if string_attr is not None and string_attr.lower() == "true":
-        return v
     low = v.lower()
     if low in ("true", "false"):
         return low == "true"
@@ -159,10 +172,22 @@ def _unescape_dsml_value(value: str) -> str:
     return value.replace("&amp;", "&").replace("&AMP;", "&")
 
 
-def _tool_param_info(tools: list[dict] | None) -> tuple[dict, dict]:
-    """Schema lookup for forgiving inference: {name: {required, props}}.
+def _declared_param_type(schema: dict | None, name: str | None) -> str | None:
+    """Declared JSON type of one parameter, or None when the schema is silent."""
+    props = (schema or {}).get("props")
+    if not isinstance(props, dict) or not isinstance(name, str):
+        return None
+    ptype = props.get(name)
+    return ptype if isinstance(ptype, str) and ptype else None
 
-    Second item maps lowercased names back to canonical ones.
+
+def _tool_param_info(tools: list[dict] | None) -> tuple[dict, dict]:
+    """Schema lookup for inference and value typing: {name: {required, props}}.
+
+    ``props`` maps every declared property name to its declared type
+    (lowercased; "" when the entry is not an object or names no type), so a
+    parameter declared ``string`` can keep its value verbatim. Second item
+    maps lowercased names back to canonical ones.
     """
     info: dict[str, dict] = {}
     lowers: dict[str, str] = {}
@@ -176,11 +201,16 @@ def _tool_param_info(tools: list[dict] | None) -> tuple[dict, dict]:
         params = fn.get("parameters", {}) or {}
         if not isinstance(params, dict):
             params = {}
-        props = params.get("properties", {}) or {}
+        props: dict[str, str] = {}
+        raw_props = params.get("properties", {}) or {}
+        if isinstance(raw_props, dict):
+            for pname, pinfo in raw_props.items():
+                ptype = pinfo.get("type", "") if isinstance(pinfo, dict) else ""
+                props[pname] = ptype.lower() if isinstance(ptype, str) else ""
         req = params.get("required", []) or []
         info[nm] = {
             "required": [r for r in req if isinstance(r, str)],
-            "props": [p for p in props] if isinstance(props, dict) else [],
+            "props": props,
         }
         lowers.setdefault(nm.lower(), nm)
     return info, lowers
@@ -249,9 +279,24 @@ def _parse_dsml_attrs(attr_text: str, forgiving: bool = False) -> dict[str, str]
 
 def _find_close(text: str, start: int, end: int,
                 specific: re.Pattern,
-                generic: re.Pattern | None = None) -> re.Match | None:
+                generic: re.Pattern | None = None,
+                *, prefer_specific: bool = False) -> re.Match | None:
+    """Close marker for a range, which may hold the matching marker verbatim.
+
+    A parameter value is raw text, so it may legitimately contain a ``</>``
+    (a JSX fragment) or a quoted close. With ``prefer_specific`` - the bounded
+    range of one parameter, which ends at the next ``<parameter>`` or at the
+    invoke close - the specific close wins whenever one exists there: it can
+    only be this parameter's own, while an earlier ``</>`` may be value text.
+    Without it the range is unbounded past the invoke (the far-out fallback)
+    and the nearest marker of either kind wins, as before. ``</>`` stays the
+    answer for the generic-close dialect, where one range can span the closers
+    of parameters past MAX_PARAMS_PER_INVOKE.
+    """
     m = specific.search(text, start, end)
     g = (generic or _GENERIC_CLOSE_RE).search(text, start, end)
+    if m is not None and prefer_specific:
+        return m
     if m and g:
         return m if m.start() <= g.start() else g
     return m or g
@@ -276,8 +321,11 @@ def _scan_dsml_calls(text: str, forgiving: bool = False,
     invoke_close = _INVOKE_CLOSE_FORGIVING_RE if forgiving else _INVOKE_CLOSE_RE
     param_close = _PARAM_CLOSE_FORGIVING_RE if forgiving else _PARAM_CLOSE_RE
     generic_close = _GENERIC_CLOSE_FORGIVING_RE if forgiving else _GENERIC_CLOSE_RE
-    info, lowers = _tool_param_info(tools) if forgiving else ({}, {})
-    single_tool = next(iter(info)) if len(info) == 1 else None
+    info, lowers = _tool_param_info(tools)
+    # Fix 4 (missing invoke name) stays forgiving-only: guessing the tool is
+    # unsafe, while the schema map itself is needed in both modes to type
+    # parameter values (see _coerce_dsml_value).
+    single_tool = next(iter(info)) if (forgiving and len(info) == 1) else None
     # Bound work: at most MAX_SCAN_OBJECTS invokes per reply. Lazy
     # enumeration (no list materialization) so thousands of <invoke> tags
     # stop scanning at the cap instead of building match lists first.
@@ -326,7 +374,7 @@ def _scan_dsml_calls(text: str, forgiving: bool = False,
             value_limit = (params[pidx + 1].start()
                            if pidx + 1 < len(params) else param_limit)
             pclose = _find_close(norm, value_start, value_limit, param_close,
-                                 generic_close)
+                                 generic_close, prefer_specific=True)
             if pclose is None and named_close is None:
                 # A raw value may quote invoke markup, which the opens scan
                 # took for a nested block and used as body_end. The value is
@@ -347,13 +395,15 @@ def _scan_dsml_calls(text: str, forgiving: bool = False,
                 raw_value = _unescape_dsml_value(raw_value)
             if pname:
                 args[pname] = _coerce_dsml_value(
-                    raw_value, pattrs.get("string"))
+                    raw_value, pattrs.get("string"),
+                    _declared_param_type(schema, pname))
             elif forgiving:
                 # Fix 5: nameless parameter with an unambiguous target.
                 target = _assign_unnamed_param(schema, args)
                 if target:
                     args[target] = _coerce_dsml_value(
-                        raw_value, pattrs.get("string"))
+                        raw_value, pattrs.get("string"),
+                        _declared_param_type(schema, target))
             last_param_end = max(last_param_end,
                                  pclose.end() if pclose else value_stop)
         body_json_found = False

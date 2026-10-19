@@ -141,23 +141,56 @@ def test_run_core_maps_http_422_to_502(monkeypatch, tmp_path, attempt_error):
 
 
 def test_run_core_maps_generic_upstream_to_502_not_500(monkeypatch, tmp_path):
-    """Any other unknown upstream error is a bad-gateway 502, not a 500."""
+    """Any genuinely unclassified upstream error is a bad-gateway 502, never a
+    bare RuntimeError/500.
+
+    The error text matters now: a bare "HTTP_500" is classified OVERLOAD (the
+    shared vocabulary in ``core.engine``), so the unclassified shape this test
+    needs is a status none of the marker tuples carry.
+    """
     app = app_with_bridge(_settings())
     cached_wasm(monkeypatch, tmp_path)
     _stub_session_pow(monkeypatch)
     monkeypatch.setattr(
         "deepseaport.providers.deepseek.completion_service._attempt",
-        lambda *a, **k: ("", "", "HTTP_500: Internal Server Error", 0))
+        lambda *a, **k: ("", "", "HTTP_404: session route moved", 0))
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
 
     with pytest.raises(HTTPException) as exc_info:
         _run_completion_core(app, item, prep)
-    # "HTTP_500: ..." matches no overload row ("timeout", "overload",
-    # "bad gateway" -- a bare 500 is not one of them), so it lands on the
-    # generic UPSTREAM row: a deterministic 502, never a bare RuntimeError.
     assert exc_info.value.status_code == 502
+
+
+def test_bare_500_is_retried_as_overload_then_surfaces_503(monkeypatch, tmp_path):
+    """A bare "HTTP_500: ..." classifies OVERLOAD on every provider.
+
+    Pre-change DeepSeek retried "bad gateway" but answered a bare 500
+    terminally (502), while Qwen's copy already carried "502" -- the numeric
+    fallbacks had drifted apart per provider. Now the shared marker tuple
+    applies everywhere: one retry runs and the exhausted row surfaces the
+    retryable 503, not the generic 502.
+    """
+    app = app_with_bridge(_settings(max_retries=1))
+    cached_wasm(monkeypatch, tmp_path)
+    _stub_session_pow(monkeypatch)
+    calls = {"n": 0}
+
+    def _attempt(*_a, **_k):
+        calls["n"] += 1
+        return ("", "", "HTTP_500: Internal Server Error", 0)
+
+    monkeypatch.setattr(
+        "deepseaport.providers.deepseek.completion_service._attempt", _attempt)
+    prep = _prepare({"model": "deepseek-flash",
+                     "messages": [{"role": "user", "content": "hi"}]})
+    item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
+
+    with pytest.raises(HTTPException) as exc_info:
+        _run_completion_core(app, item, prep)
+    assert exc_info.value.status_code == 503, exc_info.value.detail
+    assert calls["n"] == 2, "a bare 500 must take the overload retry row"
 
 
 # 3. endpoint returns 502 JSON (no ASGI traceback / 500) ------------------
