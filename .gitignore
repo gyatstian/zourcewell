@@ -8,7 +8,7 @@ config.json
 secrets*.json
 
 # Local-only dot-directories. Explicit allowlist, not a blanket `.*/`:
-# a blanket rule silently ignores .github/ (CI workflow), .circleci/, etc.
+# a blanket rule silently ignores .circleci/, .idea/, etc.
 .pi/
 .pytest_cache/
 .venv/

@@ -38,5 +38,5 @@ stand-ins. It is not collected as a test module.
 
 ## Verification
 
-- `python -m pytest -m "not live" -q` is the gate, and CI runs exactly that on ubuntu-latest and windows-latest with Python 3.11 and 3.13.
+- `python -m pytest -m "not live" -q` is the gate.
 - `python -m pytest -m live -q` periodically, and after any upstream wire change. `tests/test_live_smoke.py` is small (one run per provider, seconds) and asserts what a stub cannot: DeepSeek's bare continuation chunks, Qwen's `delta.phase` split, the WAF jar, the streamed `tool_calls` index, and that a reply contains the end of the prompt.

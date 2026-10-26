@@ -23,5 +23,5 @@ Release packaging. Nothing here is imported by the package.
 
 ## Verification
 
-- `python scripts/prepare_release.py --check`, expecting exit 0. This is the check that has to run before any release, and `.github/workflows/release.yml` runs it as a hard gate ahead of the PyPI upload on a `v*` tag.
+- `python scripts/prepare_release.py --check`, expecting exit 0. This is the check that has to run before any release.
 - `tests/test_release_guard.py` in the suite covers the guard's verdicts and the version derivation in `zourcewell.spec`.

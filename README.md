@@ -306,10 +306,9 @@ build noise and secret-shaped leftovers, **refuses to build** when any JSON in
 the tree carries a non-empty `email` / `mobile` / `token` / `password` /
 `keys` / `api_key` / `secret` value (content scanning is JSON-only), and never
 writes to `dist/` — your live `config.json` stays where the exe expects it.
-`.github/workflows/release.yml` runs `prepare_release.py --check` as a **hard
-gate before every upload step** on a `v*` tag. Exit 1 means the check failed
-(a credential was found, or a JSON file it could not read or parse); exit 0
-means the artifact is clean. Full rationale:
+Run `--check` as a **hard gate before every upload**: exit 1 means the check
+failed (a credential was found, or a JSON file it could not read or parse);
+exit 0 means the artifact is clean. Full rationale:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Version.** `pyproject.toml` `[project] version` is the only place a version
@@ -320,7 +319,7 @@ reads first — then pyproject, then the installed metadata, then `0.0.0`.
 `cli --version` and both FastAPI apps report that same value. Bump it there and
 nowhere else.
 
-Interpreter: CPython >= 3.11 (CI: 3.11/3.13); `.[build]` asks for
+Interpreter: CPython >= 3.11 (3.13 is the verified target); `.[build]` asks for
 `pyinstaller>=6`, and the exact PyInstaller version is whatever the build used —
 record the interpreter and PyInstaller version in the release notes of any build
 you produce. One gotcha if you reach for the module instead of the script: the
@@ -377,16 +376,14 @@ Two things a new contributor will hit immediately:
    and the SSE path the deltas arrived on, so a drift report is diagnosable
    without ever printing a credential.
 
-CI: `.github/workflows/ci.yml` runs exactly
-`python -m pytest -m "not live" -q` on Python 3.11 and 3.13 (3.11 is the
-`requires-python` floor) against ubuntu-latest and windows-latest, with
-`.[test]` installed **editable** so the install and pytest's `pythonpath = ["src"]`
-agree — a plain install was shadowed by the checkout and proved nothing about
-what was in the wheel. One extra step then installs a real (non-editable) wheel
-and imports `zourcewell.core.tools.parser` and `zourcewell.providers.qwen`
-from outside the checkout, which is the only check that notices a package
-directory missing its `__init__.py`. No obscura, no browser, no account, no
-secrets.
+The gate is `python -m pytest -m "not live" -q` on Python 3.11 and 3.13 (3.11 is
+the `requires-python` floor), with `.[test]` installed **editable** so the
+install and pytest's `pythonpath = ["src"]` agree — a plain install was shadowed
+by the checkout and proved nothing about what was in the wheel. Before a
+release, also install a real (non-editable) wheel and import
+`zourcewell.core.tools.parser` and `zourcewell.providers.qwen` from outside the
+checkout, which is the only check that notices a package directory missing its
+`__init__.py`. No obscura, no browser, no account, no secrets.
 
 ## Disclaimer
 

@@ -600,8 +600,8 @@ no search). `/v1/models` serves the union of the active providers.
   `config.json` or any JSON with non-empty `token`/`password`/`keys` is present,
   and never writes inside the source tree. Guarded by
   `tests/test_release_guard.py`; `zourcewell.spec` has no `datas` exclusion,
-  so this script is the packaging step, and `.github/workflows/release.yml`
-  runs `--check` as a hard gate on a `v*` tag before it publishes.
+  so this script is the packaging step, and `--check` is the hard gate that
+  runs before anything is uploaded.
 - `data/` (gitignored): PoW wasm. `~/.zourcewell/obscura-profile`: WAF cookies + login localStorage.
 - `providers/deepseek/real_browser.py` drives Helium/Chrome/Edge/Chromium
   login over CDP; `core/browser_paths.py` discovers the binary.
@@ -849,7 +849,7 @@ below are v2-specific. Full protocol detail lives in
 
 ## Tests: what the suite does and does not prove
 
-The default run (`pytest -m "not live" -q`, exactly what CI runs) is fully
+The default run (`pytest -m "not live" -q`, the gate) is fully
 hermetic: `tests/conftest.py` points the config/data at a temp tree, strips
 every `ZOURCEWELL_*`/`DEEPSEEK_*`/`OBSCURA_*` var, raises on any non-loopback
 socket connect, and asserts the imported package is THIS checkout's `src/`.

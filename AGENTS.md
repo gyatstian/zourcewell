@@ -87,7 +87,7 @@ and educational use only.
 
 ## Repo-wide Contracts
 
-- Interpreter: CPython 3.13 is the verified target. `pyproject.toml` declares `requires-python = ">=3.11"`; CI runs the matrix on 3.11 and 3.13. 3.11 is the floor because `zourcewell.spec` reads `pyproject.toml` with stdlib `tomllib`.
+- Interpreter: CPython 3.13 is the verified target. `pyproject.toml` declares `requires-python = ">=3.11"`. 3.11 is the floor because `zourcewell.spec` reads `pyproject.toml` with stdlib `tomllib`.
 - `src/` layout. `pythonpath = ["src"]` under `[tool.pytest.ini_options]` makes the suite resolve this checkout instead of another install.
 - `config.json` is the live credential store: account emails, plaintext passwords, bearer tokens, API keys. Gitignored, never committed, never copied into an artifact.
 - `[project] version` in `pyproject.toml` is the only place a version is written. `zourcewell.spec` stamps it into the frozen exe's bundled `_version.txt`, which `src/zourcewell/__init__.py` reads FIRST (then pyproject, installed metadata, `"0.0.0"`), and `cli --version`, `server.py` / `dry_run.py`'s `FastAPI(version=...)` and `server_routes.py`'s `/health` and `/v1/models` all report that one `zourcewell.__version__`; never add a second literal.
@@ -99,9 +99,9 @@ and educational use only.
 
 ## Verification
 
-- `python -m pytest -m "not live" -q` is the gate. Hermetic: no account, no obscura binary, no browser, no secrets. CI runs exactly this on ubuntu-latest and windows-latest, Python 3.11 and 3.13.
+- `python -m pytest -m "not live" -q` is the gate. Hermetic: no account, no obscura binary, no browser, no secrets.
 - `python -m pytest -m live -q` is opt-in and needs a real token plus `obscura` on PATH. Run it when a change touches an upstream wire format. It is the only check in the repo that notices upstream drift.
-- `python scripts/prepare_release.py --check` before packaging. Exit 1 means the check failed — a credential found in `dist/`, or a JSON file it could not read or parse. On a `v*` tag the `release` workflow runs it for you, ahead of the PyPI upload.
+- `python scripts/prepare_release.py --check` before packaging. Exit 1 means the check failed — a credential found in `dist/`, or a JSON file it could not read or parse.
 
 ## Child DOX Index
 
@@ -115,4 +115,4 @@ and educational use only.
 - `tests/AGENTS.md` owns the hermetic suite and the live tier.
 - `scripts/AGENTS.md` owns the release packaging script, `prepare_release.py`.
 
-Deliberately unindexed: `.github/`, whose two workflows (`ci` runs the root command above, `release` publishes on a `v*` tag behind the `prepare_release.py --check` gate), and every gitignored runtime directory.
+Deliberately unindexed: every gitignored runtime directory.
