@@ -26,10 +26,10 @@ import textwrap
 
 import pytest
 
-from deepseaport.core import tools as T
-from deepseaport.core.tools import common as TC
-from deepseaport.providers.deepseek import login_policy as LP
-from deepseaport.providers.qwen import client as QC
+from zourcewell.core import tools as T
+from zourcewell.core.tools import common as TC
+from zourcewell.providers.deepseek import login_policy as LP
+from zourcewell.providers.qwen import client as QC
 
 
 _LT = chr(60)
@@ -132,7 +132,7 @@ def test_param_cap_is_the_documented_hardcoded_64():
 # that could re-grant a native tool: this map is the only authority.
 
 def test_managed_permission_map_keeps_gateway_tools_approval_gated():
-    from deepseaport.providers.opencode import managed_serve as MS
+    from zourcewell.providers.opencode import managed_serve as MS
 
     cfg = json.loads(MS.managed_config_content())
     assert cfg["permission"]["bash"] == "ask"
@@ -167,11 +167,11 @@ def test_snapshot_verdict_is_live_and_shared():
 _SUBPROCESS_PRELUDE = textwrap.dedent(
     """
     import json, os, sys
-    import deepseaport
-    from deepseaport.core.tools import common as TC
-    from deepseaport import config
+    import zourcewell
+    from zourcewell.core.tools import common as TC
+    from zourcewell import config
     print(json.dumps({
-        "tree": os.path.dirname(deepseaport.__file__),
+        "tree": os.path.dirname(zourcewell.__file__),
         "max_args_chars": TC.MAX_ARGS_CHARS,
         "repair_budget": TC._LENIENT_REPAIR_BUDGET,
         "settings": config.load_settings().tool_args_max_chars,
@@ -182,10 +182,10 @@ _SUBPROCESS_PRELUDE = textwrap.dedent(
 
 def _subprocess_env(**overrides):
     """Env for a child that must import THIS checkout's src/."""
-    import deepseaport
+    import zourcewell
 
     src_root = os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.abspath(deepseaport.__file__))))
+        os.path.dirname(os.path.abspath(zourcewell.__file__))))
     env = dict(os.environ)
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = src_root + (os.pathsep + existing if existing else "")
@@ -205,7 +205,7 @@ def _run_probe(**env_overrides):
 
 def test_max_args_chars_snapshots_env_set_before_import():
     """Set before import: the snapshot picks it up (documented semantics)."""
-    data = _run_probe(DEEPSEAPORT_MAX_ARGS_CHARS="12345")
+    data = _run_probe(ZOURCEWELL_MAX_ARGS_CHARS="12345")
     assert data["max_args_chars"] == 12345
     assert data["repair_budget"] == 12345 + 16_384
     # load_settings reads the same variable per call, so the two agree here.
@@ -224,10 +224,10 @@ def test_max_args_chars_ignores_env_set_after_import():
         [sys.executable, "-c", textwrap.dedent(
             """
             import json, os
-            from deepseaport.core.tools import common as TC
+            from zourcewell.core.tools import common as TC
             before = TC.MAX_ARGS_CHARS
-            os.environ["DEEPSEAPORT_MAX_ARGS_CHARS"] = "777"
-            import deepseaport.config as config
+            os.environ["ZOURCEWELL_MAX_ARGS_CHARS"] = "777"
+            import zourcewell.config as config
             print(json.dumps({
                 "before": before,
                 "after": TC.MAX_ARGS_CHARS,
@@ -245,7 +245,7 @@ def test_max_args_chars_ignores_env_set_after_import():
 
 
 def test_max_args_chars_default_when_env_absent():
-    data = _run_probe(DEEPSEAPORT_MAX_ARGS_CHARS="")
+    data = _run_probe(ZOURCEWELL_MAX_ARGS_CHARS="")
     assert data["max_args_chars"] == 200_000
     assert data["settings"] == 200_000
 
@@ -265,6 +265,6 @@ def test_explicit_max_args_chars_wins_over_the_snapshot():
 
 
 def test_max_args_chars_name_is_importable_from_the_public_surface():
-    import deepseaport.core.tools as TS
+    import zourcewell.core.tools as TS
 
     assert TS.MAX_ARGS_CHARS == TC.MAX_ARGS_CHARS

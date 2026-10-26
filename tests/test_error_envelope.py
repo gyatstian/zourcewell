@@ -22,12 +22,12 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from deepseaport.accounts import AccountPool
-from deepseaport.config import AccountConfig
-from deepseaport.dry_run import create_dry_app
-from deepseaport.server import create_app
-from deepseaport.server_concurrency import _acquire_slot_or_499
-from deepseaport.server_routes import MAX_REQUEST_BYTES, error_envelope
+from zourcewell.accounts import AccountPool
+from zourcewell.config import AccountConfig
+from zourcewell.dry_run import create_dry_app
+from zourcewell.server import create_app
+from zourcewell.server_concurrency import _acquire_slot_or_499
+from zourcewell.server_routes import MAX_REQUEST_BYTES, error_envelope
 from support import settings as _settings
 
 AUTH = {"Authorization": "Bearer sk-test"}

@@ -42,14 +42,14 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
-import deepseaport
-import deepseaport.accounts as A
-from deepseaport.accounts import AccountPool, PooledAccount
-from deepseaport.config import AccountConfig, Settings, load_settings
-from deepseaport.core import engine as _engine
-from deepseaport.core import openai as _openai
-from deepseaport.providers.deepseek import real_browser as _rb
-from deepseaport.server_concurrency import _acquire_slot_or_499
+import zourcewell
+import zourcewell.accounts as A
+from zourcewell.accounts import AccountPool, PooledAccount
+from zourcewell.config import AccountConfig, Settings, load_settings
+from zourcewell.core import engine as _engine
+from zourcewell.core import openai as _openai
+from zourcewell.providers.deepseek import real_browser as _rb
+from zourcewell.server_concurrency import _acquire_slot_or_499
 
 
 # --- G1: wrong-source-tree trap ------------------------------------------------
@@ -65,7 +65,7 @@ def test_g1_guard_rejects_foreign_package_location(tmp_path):
     """
     import conftest
 
-    foreign = (tmp_path / "other-clone" / "src" / "deepseaport" / "__init__.py")
+    foreign = (tmp_path / "other-clone" / "src" / "zourcewell" / "__init__.py")
     foreign.parent.mkdir(parents=True)
     foreign.write_text("", encoding="utf-8")
 
@@ -85,7 +85,7 @@ def test_g1_guard_accepts_this_checkout():
     so the configure-time guard never blocks a correct run."""
     import conftest
 
-    resolved = conftest._installed_deepseaport_path()
+    resolved = conftest._installed_zourcewell_path()
     assert conftest._is_local_package_path(resolved) is True
     assert conftest._assert_local_source_tree() == resolved
 
@@ -96,9 +96,9 @@ def test_g1_report_header_states_the_source_tree():
 
     conftest._check_local_source_tree()
     header = "\n".join(conftest.pytest_report_header(config=None))
-    assert "deepseaport source tree =" in header
+    assert "zourcewell source tree =" in header
     assert str(conftest.EXPECTED_SRC) in header
-    assert str(deepseaport.__file__) in header
+    assert str(zourcewell.__file__) in header
 
 
 # Deleted here on purpose: `test_g1_expected_src_is_derived_from_this_file`.
@@ -145,12 +145,12 @@ def test_g2_ban_on_fallback_path_writes_no_config_file(monkeypatch, tmp_path, ca
     marker is still set and a warning says the ban is memory-only.
     """
     path = _operator_config(tmp_path)
-    monkeypatch.setenv("DEEPSEAPORT_CONFIG", str(path))
+    monkeypatch.setenv("ZOURCEWELL_CONFIG", str(path))
     before = (path.read_bytes(), path.stat().st_mtime_ns)
     app = _BareApp()
     item = PooledAccount(cfg=load_settings(str(path)).accounts[0])
 
-    with caplog.at_level("WARNING", logger="deepseaport.core.engine"):
+    with caplog.at_level("WARNING", logger="zourcewell.core.engine"):
         exc = _engine.ban_403_for_item(app, item, time.time() + 86400, "user is muted")
 
     assert exc.status_code == 403
@@ -256,7 +256,7 @@ def test_g3_pool_label_follows_the_member_account_provider():
     """G3: the label comes from the account's own ``provider`` field -- the
     same field ``pools.accounts_for_provider`` built the pool from -- so a
     per-provider pool built by ``pools.make_pool`` needs no extra wiring."""
-    from deepseaport.core import pools
+    from zourcewell.core import pools
 
     settings = Settings(
         accounts=[AccountConfig(email="d@x.com", token="t1", provider="deepseek"),
@@ -396,9 +396,9 @@ def test_g8_live_tier_detection(markexpr, expected):
 
 def test_g8_live_selection_leaves_the_operator_config_and_env_alone(
         monkeypatch, tmp_path):
-    """G8. Pre-change: ``pytest_configure`` rewrote ``DEEPSEAPORT_CONFIG`` to a
+    """G8. Pre-change: ``pytest_configure`` rewrote ``ZOURCEWELL_CONFIG`` to a
     temp config with ``accounts: []`` and stripped every ambient
-    ``DEEPSEAPORT_*``/``DEEPSEEK_*``/``OBSCURA_*`` var, unconditionally. Under
+    ``ZOURCEWELL_*``/``DEEPSEEK_*``/``OBSCURA_*`` var, unconditionally. Under
     ``-m live`` that meant the live tier's readiness check could never find an
     account, so the documented live command could only ever skip.
     """
@@ -409,9 +409,9 @@ def test_g8_live_selection_leaves_the_operator_config_and_env_alone(
         "keys": ["sk-real"],
         "accounts": [{"email": "a@x.com", "token": "tok-real"}],
     }), encoding="utf-8")
-    monkeypatch.setenv("DEEPSEAPORT_CONFIG", str(real_cfg))
-    monkeypatch.setenv("DEEPSEAPORT_PROVIDER", "qwen")
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_BASE", "http://127.0.0.1:4999")
+    monkeypatch.setenv("ZOURCEWELL_CONFIG", str(real_cfg))
+    monkeypatch.setenv("ZOURCEWELL_PROVIDER", "qwen")
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_BASE", "http://127.0.0.1:4999")
     monkeypatch.setenv("OBSCURA_BIN", "C:/oc/obscura.exe")
     # Registered so monkeypatch restores the module global after this test,
     # even though pytest_configure rebinds it directly.
@@ -424,12 +424,12 @@ def test_g8_live_selection_leaves_the_operator_config_and_env_alone(
 
     conftest.pytest_configure(_cfg("live"))
 
-    assert os.environ["DEEPSEAPORT_CONFIG"] == str(real_cfg), \
+    assert os.environ["ZOURCEWELL_CONFIG"] == str(real_cfg), \
         "-m live still rewrote the config path, so the live tier can never run"
     assert created == [], "a temp config tree was created under -m live"
     # The ambient overrides the operator set are part of "the real machine".
-    assert os.environ["DEEPSEAPORT_PROVIDER"] == "qwen"
-    assert os.environ["DEEPSEAPORT_OPENCODE_BASE"] == "http://127.0.0.1:4999"
+    assert os.environ["ZOURCEWELL_PROVIDER"] == "qwen"
+    assert os.environ["ZOURCEWELL_OPENCODE_BASE"] == "http://127.0.0.1:4999"
     assert os.environ["OBSCURA_BIN"] == "C:/oc/obscura.exe"
     # And the accident guard is lifted, or a live test still cannot connect.
     assert conftest._LIVE_TIER is True
@@ -445,8 +445,8 @@ def test_g8_default_run_still_rewrites_the_config_and_strips_the_env(
     above would be satisfied by simply deleting the isolation."""
     import conftest
 
-    monkeypatch.setenv("DEEPSEAPORT_CONFIG", str(tmp_path / "operator.json"))
-    monkeypatch.setenv("DEEPSEAPORT_PROVIDER", "qwen")
+    monkeypatch.setenv("ZOURCEWELL_CONFIG", str(tmp_path / "operator.json"))
+    monkeypatch.setenv("ZOURCEWELL_PROVIDER", "qwen")
     monkeypatch.setenv("DEEPSEEK_TOKEN", "leaked")
     monkeypatch.setenv("OBSCURA_BIN", "C:/oc/obscura.exe")
     monkeypatch.setattr(conftest, "_LIVE_TIER", False)
@@ -458,13 +458,13 @@ def test_g8_default_run_still_rewrites_the_config_and_strips_the_env(
 
     conftest.pytest_configure(_cfg("not live"))
 
-    cfg = Path(os.environ["DEEPSEAPORT_CONFIG"])
+    cfg = Path(os.environ["ZOURCEWELL_CONFIG"])
     assert cfg == temp_root / "config.json"
     written = json.loads(cfg.read_text(encoding="utf-8"))
     assert written["accounts"] == [], "the hermetic config must carry no accounts"
     assert written["keys"] == ["sk-hermetic-test"]
-    assert os.environ["DEEPSEAPORT_DATA"] == str(temp_root / "data")
-    for name in ("DEEPSEAPORT_PROVIDER", "DEEPSEEK_TOKEN", "OBSCURA_BIN"):
+    assert os.environ["ZOURCEWELL_DATA"] == str(temp_root / "data")
+    for name in ("ZOURCEWELL_PROVIDER", "DEEPSEEK_TOKEN", "OBSCURA_BIN"):
         assert name not in os.environ, f"{name} leaked into the hermetic run"
     assert conftest._LIVE_TIER is False
     assert "hermetic config" in "\n".join(conftest.pytest_report_header(config=None))
@@ -495,7 +495,7 @@ def test_g6_launch_args_drop_remote_allow_origins_and_pin_loopback():
         assert "--headless=new" not in args
 
         # Second instance, also closed: RealBrowser.__init__ makes a
-        # deepseaport-browser-* temp profile, so an unclosed one leaks a
+        # zourcewell-browser-* temp profile, so an unclosed one leaks a
         # directory into %TEMP% on every run.
         headless = headless_browser.launch_args()
         assert "--headless=new" in headless
@@ -605,18 +605,18 @@ def test_g7_parameters_are_still_accepted_with_their_historical_names():
 
 def test_g7_server_reexports_keep_their_historical_signatures():
     """G7: the completion/concurrency entry points keep their historical
-    signatures, and ``deepseaport.server`` exposes only what it owns.
+    signatures, and ``zourcewell.server`` exposes only what it owns.
 
     The re-export block is gone: those names are imported from the module that
     defines them (``completion_service`` / ``server_concurrency`` /
     ``server_routes``), so that is where the signatures are pinned. What is
-    still asserted on ``deepseaport.server`` is its own thin surface: the
+    still asserted on ``zourcewell.server`` is its own thin surface: the
     process entry point, the catalogue, and the three monkeypatch seams the
     route layer resolves through it."""
-    from deepseaport import server as _server
-    from deepseaport.providers.deepseek import completion_service as _cs
-    from deepseaport import server_concurrency as _sc
-    from deepseaport import server_routes as _sr
+    from zourcewell import server as _server
+    from zourcewell.providers.deepseek import completion_service as _cs
+    from zourcewell import server_concurrency as _sc
+    from zourcewell import server_routes as _sr
 
     # Historical deepseek adapter signature: (app, pool, prep, first_item,
     # cancel_event, on_content, on_thinking, allow_failover).
@@ -635,7 +635,7 @@ def test_g7_server_reexports_keep_their_historical_signatures():
         assert hasattr(_sc, name), f"{name} is missing from server_concurrency"
     for name in ("_check_auth", "_pool", "_prepare", "register_routes"):
         assert hasattr(_sr, name), f"{name} is missing from server_routes"
-    # What deepseaport.server still owns, plus the three deliberate seams.
+    # What zourcewell.server still owns, plus the three deliberate seams.
     for name in ("MODELS", "active_models", "create_app", "register_routes",
                  "_pool", "_openai_response", "parse_tool_calls",
                  "Settings", "load_settings", "apply_log_level", "lifespan"):

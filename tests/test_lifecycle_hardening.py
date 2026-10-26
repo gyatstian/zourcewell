@@ -110,7 +110,7 @@ def _reader_threads() -> list[threading.Thread]:
 
 def _patch_popen(monkeypatch, child: _FakeChild | None):
     """Point McpClient's Popen at `child`; None means "Popen raises"."""
-    from deepseaport.core import mcp_client as mc
+    from zourcewell.core import mcp_client as mc
 
     if child is None:
         def _boom(*a, **k):
@@ -122,7 +122,7 @@ def _patch_popen(monkeypatch, child: _FakeChild | None):
 
 def test_mcp_failed_handshake_terminates_child_and_joins_readers(monkeypatch):
     """A live child that never answers `initialize` must not be orphaned."""
-    from deepseaport.core import mcp_client as mc
+    from zourcewell.core import mcp_client as mc
 
     before = len(_reader_threads())
     child = _FakeChild(alive=True)
@@ -139,7 +139,7 @@ def test_mcp_failed_handshake_terminates_child_and_joins_readers(monkeypatch):
 
 def test_mcp_child_death_during_handshake_cleans_up(monkeypatch):
     """Child exits on its own (EOF on both pipes) -> readers exit by EOF."""
-    from deepseaport.core import mcp_client as mc
+    from zourcewell.core import mcp_client as mc
 
     before = len(_reader_threads())
     child = _FakeChild(alive=True)
@@ -158,7 +158,7 @@ def test_mcp_child_death_during_handshake_cleans_up(monkeypatch):
 
 
 def test_mcp_close_is_idempotent_and_partial_object_safe():
-    from deepseaport.core import mcp_client as mc
+    from zourcewell.core import mcp_client as mc
 
     child = _FakeChild(alive=True)
     c = mc.McpClient.__new__(mc.McpClient)
@@ -181,7 +181,7 @@ def test_mcp_close_is_idempotent_and_partial_object_safe():
 
 def test_mcp_popen_failure_propagates_without_secondary_error(monkeypatch):
     """A failure BEFORE Popen must surface as itself, not as a cleanup crash."""
-    from deepseaport.core import mcp_client as mc
+    from zourcewell.core import mcp_client as mc
 
     _patch_popen(monkeypatch, None)
     with pytest.raises(FileNotFoundError):
@@ -194,7 +194,7 @@ def test_mcp_popen_failure_propagates_without_secondary_error(monkeypatch):
 
 def _login_browser(monkeypatch, snaps, timeout=5.0):
     """A RealBrowser whose login loop is driven by a snapshot script."""
-    from deepseaport.providers.deepseek import real_browser as rb
+    from zourcewell.providers.deepseek import real_browser as rb
 
     browser = rb.RealBrowser.__new__(rb.RealBrowser)
     browser.timeout = timeout
@@ -293,7 +293,7 @@ class _Resp:
 
 def test_ensure_wasm_concurrent_callers_leave_no_tmp(monkeypatch, tmp_path):
     """Two callers that both pass the exists() check must not share a tmp."""
-    from deepseaport.providers.deepseek import pow as pw
+    from zourcewell.providers.deepseek import pow as pw
 
     blob = b"\x00asm\x01\x00\x00\x00" + b"x" * 4000
     assert len(blob) > 1000
@@ -359,14 +359,14 @@ def test_ensure_wasm_concurrent_callers_leave_no_tmp(monkeypatch, tmp_path):
 
 
 def _bridge(tmp_path, name):
-    from deepseaport.core import obscura_bridge as ob
+    from zourcewell.core import obscura_bridge as ob
 
     return ob.ObscuraBridge(binary="obscura", profile=str(tmp_path / name))
 
 
 def test_follower_wait_budget_covers_the_leader_worst_case():
     """Pass 1 (timeout) + dump_cookies(30) + fetch_ua(30) + slack."""
-    from deepseaport.core import obscura_bridge as ob
+    from zourcewell.core import obscura_bridge as ob
 
     budget = ob._follower_wait_budget(45)
     assert budget >= 45 + 2 * ob.WARMUP_SUBSTEP_TIMEOUT
@@ -382,7 +382,7 @@ def test_follower_waits_for_a_slow_leader_and_gets_the_refreshed_jar(tmp_path):
     timeout <= -4 -- so a negative timeout is how this stays a fast test while
     still putting the leader's work past the old deadline.
     """
-    from deepseaport.core import obscura_bridge as ob
+    from zourcewell.core import obscura_bridge as ob
 
     b = _bridge(tmp_path, "slow-leader")
     b.state = ob.WafState(cookies={"aws-waf-token": "stale"}, user_agent="ua",
@@ -432,7 +432,7 @@ def test_follower_waits_for_a_slow_leader_and_gets_the_refreshed_jar(tmp_path):
 def test_follower_returns_stale_jar_only_when_the_leader_never_finishes(
         monkeypatch, tmp_path, caplog):
     """The bound is still finite: an expired wait is logged, not silent."""
-    from deepseaport.core import obscura_bridge as ob
+    from zourcewell.core import obscura_bridge as ob
 
     monkeypatch.setattr(ob, "_follower_wait_budget", lambda timeout: 0.05)
     b = _bridge(tmp_path, "wedged-leader")
@@ -480,7 +480,7 @@ def test_shared_executor_workers_are_daemon_threads():
     wall time charged at exit (the same trap
     tests/test_engine_retry_gaps.py documents for its ``time.sleep(30)`` fake).
     """
-    from deepseaport import server_concurrency as SC
+    from zourcewell import server_concurrency as SC
 
     for name in ("_CHALLENGE_EXECUTOR", "_CLEANUP_EXECUTOR", "_STREAM_EXECUTOR"):
         pool = getattr(SC, name)
@@ -498,7 +498,7 @@ def test_shared_executor_still_bounds_and_returns_results():
     call sites use (``submit`` -> ``.result`` / ``.cancel``).
     """
     from concurrent.futures import Future
-    from deepseaport import server_concurrency as SC
+    from zourcewell import server_concurrency as SC
 
     pool = SC._DaemonExecutor(max_workers=2, thread_name_prefix="t")
     assert pool._max_workers == 2
@@ -536,9 +536,9 @@ def test_startup_warm_skips_deepseek_for_an_unknown_provider(monkeypatch):
     Neither is visible from a settings object: it only shows up as a startup
     browser/window on a provider that has no accounts and no upstream at all.
     """
-    from deepseaport import server_concurrency as SC
-    from deepseaport.core import registry as reg
-    from deepseaport.accounts import AccountConfig
+    from zourcewell import server_concurrency as SC
+    from zourcewell.core import registry as reg
+    from zourcewell.accounts import AccountConfig
     from support import settings as _mk_settings
 
     real_get = reg.get
@@ -556,7 +556,7 @@ def test_startup_warm_skips_deepseek_for_an_unknown_provider(monkeypatch):
             return ""
 
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.pow.ensure_wasm",
+        "zourcewell.providers.deepseek.pow.ensure_wasm",
         lambda **k: calls.__setitem__("wasm", calls["wasm"] + 1))
 
     s = _mk_settings(provider="glm",
@@ -576,8 +576,8 @@ def test_startup_warm_skips_bridge_warmup_for_qwen_only(monkeypatch):
     jar. ``needs_bridge`` stays True (one-shot chat still builds a bridge), so
     the startup gate is the separate ``needs_waf_jar``.
     """
-    from deepseaport import server_concurrency as SC
-    from deepseaport.providers.qwen.provider import QwenProvider
+    from zourcewell import server_concurrency as SC
+    from zourcewell.providers.qwen.provider import QwenProvider
     from support import settings as _mk_settings
 
     calls = {"bridge": 0, "provider": []}
@@ -605,7 +605,7 @@ def test_effective_log_level_prefers_runtime_override():
     so a missing/None attribute MUST fall back to ``log_level``. No attribute
     at all (odd stand-in settings) falls back to INFO.
     """
-    from deepseaport import server_concurrency as SC
+    from zourcewell import server_concurrency as SC
     from support import settings as _mk_settings
 
     s = _mk_settings(log_level="INFO")

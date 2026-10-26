@@ -27,7 +27,7 @@ dummy-profile/
 
 # --- runtime data ---
 data/
-.deepseaport/
+.zourcewell/
 *obscura-profile*/
 *.log
 logs/

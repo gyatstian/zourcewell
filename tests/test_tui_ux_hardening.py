@@ -18,8 +18,8 @@ import pytest
 
 from functools import partial
 from support import settings
-from deepseaport import tui
-from deepseaport.config import AccountConfig, Settings
+from zourcewell import tui
+from zourcewell.config import AccountConfig, Settings
 
 
 # --- helpers ---------------------------------------------------------------------
@@ -70,7 +70,7 @@ def test_edit_port_declined_busy_port_is_neither_saved_nor_reported_saved(
     """The user said "I'll handle it": the line must not claim the busy port
     was saved.
     """
-    from deepseaport.config import load_settings
+    from zourcewell.config import load_settings
 
     port, holder = _busy_port()
     try:
@@ -95,7 +95,7 @@ def test_edit_port_declined_keeps_the_PREVIOUS_port_on_disk(monkeypatch, capsys,
     """The decline case that actually rewrote config.json: the old port was
     different from the (busy) one the user typed.
     """
-    from deepseaport.config import load_settings
+    from zourcewell.config import load_settings
 
     port, holder = _busy_port()
     try:
@@ -165,7 +165,7 @@ def test_add_token_is_read_through_getpass_on_a_console(monkeypatch):
 
 def test_add_token_y_still_triggers_auto_login_on_a_console(monkeypatch):
     """Hidden entry must not break the "y = auto-token" shortcut."""
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings: "auto-tok-123")
     calls: list[str] = []
 
@@ -281,9 +281,9 @@ def _status_rows(rows):
 
 
 def _draw_accounts(monkeypatch, capsys, s, rows, banned_ident=None):
-    monkeypatch.setattr("deepseaport.accounts.AccountPool.status", _status_rows(rows))
+    monkeypatch.setattr("zourcewell.accounts.AccountPool.status", _status_rows(rows))
     until = time.time() + 30 * 86400
-    monkeypatch.setattr("deepseaport.accounts.get_cached_ban_labels",
+    monkeypatch.setattr("zourcewell.accounts.get_cached_ban_labels",
                         lambda accts: ({banned_ident: until} if banned_ident else {}))
     _script(monkeypatch, ["q"])
     tui.accounts_menu(s)

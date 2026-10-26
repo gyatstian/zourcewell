@@ -8,13 +8,13 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from deepseaport.config import AccountConfig, Settings, load_settings
-from deepseaport.core import pools, registry
-from deepseaport.core.provider import ModelSpec, Provider
-from deepseaport.server import create_app
+from zourcewell.config import AccountConfig, Settings, load_settings
+from zourcewell.core import pools, registry
+from zourcewell.core.provider import ModelSpec, Provider
+from zourcewell.server import create_app
 from support import settings
 from functools import partial
-from deepseaport.server_routes import _pool, _pool_for, _prepare
+from zourcewell.server_routes import _pool, _pool_for, _prepare
 
 
 class _FakeProvider(Provider):
@@ -257,7 +257,7 @@ def test_put_token_scopes_to_the_provider_param():
 
 
 def test_single_provider_pool_for_delegates_to_server_pool(monkeypatch):
-    import deepseaport.server as S
+    import zourcewell.server as S
 
     sentinel = object()
     monkeypatch.setattr(S, "_pool", lambda _app: sentinel)
@@ -340,9 +340,9 @@ def test_the_borrow_never_reaches_the_account_routes():
 
 
 def test_needs_waf_jar_defaults_and_overrides():
-    from deepseaport.providers.deepseek.provider import DeepSeekProvider
-    from deepseaport.providers.opencode.provider import OpencodeProvider
-    from deepseaport.providers.qwen.provider import QwenProvider
+    from zourcewell.providers.deepseek.provider import DeepSeekProvider
+    from zourcewell.providers.opencode.provider import OpencodeProvider
+    from zourcewell.providers.qwen.provider import QwenProvider
 
     assert Provider.needs_waf_jar is True
     assert DeepSeekProvider.needs_waf_jar is True

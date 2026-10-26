@@ -28,7 +28,7 @@ import textwrap
 
 import pytest
 
-from deepseaport.core import tools as T
+from zourcewell.core import tools as T
 
 _LT = chr(60)
 _GT = chr(62)
@@ -233,7 +233,7 @@ def test_streamed_path_agrees_with_the_buffered_parse():
     the streamed path is where a live harness first sees the arguments, so a
     value healed only in the buffered parser would still be cut in practice.
     """
-    from deepseaport.core.engine import parse_stream_calls
+    from zourcewell.core.engine import parse_stream_calls
 
     text = _block([("filePath", ' string="true"', "007"),
                    ("content", ' string="true"', _JSX)])
@@ -251,18 +251,18 @@ def test_streamed_path_agrees_with_the_buffered_parse():
 
 def _canonical_for_hash_seed(seed: int):
     """Canonical name for a ``{"read", "Read"}`` declaration, fresh process."""
-    import deepseaport
+    import zourcewell
 
     # <repo>/src, so the child imports THIS checkout, not an installed copy.
     src_root = os.path.dirname(os.path.dirname(
-        os.path.abspath(deepseaport.__file__)))
+        os.path.abspath(zourcewell.__file__)))
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = str(seed)
     env["PYTHONPATH"] = src_root + os.pathsep + env.get("PYTHONPATH", "")
     code = textwrap.dedent(
         """
         import json
-        from deepseaport.core.tools import common as TC
+        from zourcewell.core.tools import common as TC
         calls, _ = TC._normalize_calls(
             [{"function": {"name": "READ", "arguments": "{}"}}],
             {"read", "Read"})

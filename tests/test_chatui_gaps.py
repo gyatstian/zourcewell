@@ -10,7 +10,7 @@ from support import (AliveThread, DeadThread, FakeUvicornConfig, FakeUvicornServ
 
 
 def _mk_acc(email, token="t1"):
-    from deepseaport.config import AccountConfig
+    from zourcewell.config import AccountConfig
     return AccountConfig(email=email, token=token)
 
 
@@ -18,7 +18,7 @@ def _install_single_fakes(monkeypatch, chat_ui, wait_ret=True, post_ret="hi", de
     monkeypatch.setattr("uvicorn.Config", FakeUvicornConfig)
     monkeypatch.setattr("uvicorn.Server", FakeUvicornServer)
     monkeypatch.setattr("threading.Thread", DeadThread if dead else AliveThread)
-    monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
+    monkeypatch.setattr("zourcewell.server.create_app", lambda st: object())
     monkeypatch.setattr(chat_ui, "_wait_for_server", lambda *a, **k: wait_ret)
     if isinstance(post_ret, Exception):
         def _boom(*a, **k):
@@ -33,35 +33,35 @@ def _install_single_fakes(monkeypatch, chat_ui, wait_ret=True, post_ret="hi", de
 # _first_api_key
 
 def test_first_api_key_empty():
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     assert chat_ui._first_api_key(Settings(keys=[], config_path="")) == ""
 
 
 def test_first_api_key_unreadable():
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
     assert chat_ui._first_api_key(object()) == ""
 
 
 # _model_list
 
 def test_model_list_non_dict():
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
     assert chat_ui._model_list(None) == [chat_ui.DEFAULT_MODEL]
     assert chat_ui._model_list(["a"]) == [chat_ui.DEFAULT_MODEL]
     assert chat_ui._model_list("x") == [chat_ui.DEFAULT_MODEL]
 
 
 def test_model_list_sorted():
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
     assert chat_ui._model_list({"z": 1, "a": 1, "m": 1}) == ["a", "m", "z"]
 
 
 # _remember_chat_model
 
 def test_remember_chat_model_saves_tmp(tmp_path):
-    from deepseaport import chat_ui
-    from deepseaport.config import load_settings
+    from zourcewell import chat_ui
+    from zourcewell.config import load_settings
     cfg = tmp_path / "c.json"
     cfg.write_text(json.dumps({}), encoding="utf-8")
     s = load_settings(str(cfg))
@@ -71,8 +71,8 @@ def test_remember_chat_model_saves_tmp(tmp_path):
 
 
 def test_remember_chat_model_fallback_on_save_error(monkeypatch):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
 
     def _boom(self):
         raise OSError("disk fail")
@@ -86,8 +86,8 @@ def test_remember_chat_model_fallback_on_save_error(monkeypatch):
 # _initial_chat_model
 
 def test_initial_chat_model_case_insensitive():
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     models = ["deepseek-flash", "deepseek-flash-search"]
     s = Settings(chat_model="DEEPSEEK-FLASH-SEARCH", config_path="")
     assert chat_ui._initial_chat_model(s, models) == "deepseek-flash-search"
@@ -96,14 +96,14 @@ def test_initial_chat_model_case_insensitive():
 # _select_usable_accounts_live
 
 def test_select_usable_split(monkeypatch):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     a_ok = _mk_acc("ok@x.com", "tok-ok")
     a_ban = _mk_acc("ban@x.com", "tok-ban")
     a_empty = _mk_acc("empty@x.com", "")
     s = Settings(accounts=[a_ok, a_ban, a_empty], config_path="")
     monkeypatch.setattr(
-        "deepseaport.accounts.collect_ban_labels",
+        "zourcewell.accounts.collect_ban_labels",
         lambda accs, force_refresh=False, **k: {a_ban.identifier: 9999999999.0},
     )
     usable, banned, no_token = chat_ui._select_usable_accounts_live(s)
@@ -113,8 +113,8 @@ def test_select_usable_split(monkeypatch):
 
 
 def test_select_usable_probe_exception_all_usable(monkeypatch):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     a1 = _mk_acc("a1@x.com", "tok-1")
     a2 = _mk_acc("a2@x.com", "tok-2")
     a3 = _mk_acc("a3@x.com", "")
@@ -123,7 +123,7 @@ def test_select_usable_probe_exception_all_usable(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("net down")
 
-    monkeypatch.setattr("deepseaport.accounts.collect_ban_labels", _boom)
+    monkeypatch.setattr("zourcewell.accounts.collect_ban_labels", _boom)
     usable, banned, no_token = chat_ui._select_usable_accounts_live(s)
     assert sorted(a.identifier for a in usable) == sorted([a1.identifier, a2.identifier])
     assert banned == 0
@@ -131,8 +131,8 @@ def test_select_usable_probe_exception_all_usable(monkeypatch):
 
 
 def test_select_usable_empty():
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     assert chat_ui._select_usable_accounts_live(Settings(accounts=[], config_path="")) == ([], 0, 0)
 
 
@@ -143,15 +143,15 @@ def test_select_usable_is_provider_scoped(monkeypatch):
     fallback -- an empty qwen pool is a hard 503 on every request. The tokenless
     count is scoped for the same reason: a foreign record without a token is not
     a reason to tell a qwen operator to go and add one."""
-    from deepseaport import chat_ui
-    from deepseaport.config import AccountConfig, Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import AccountConfig, Settings
     ds = AccountConfig(email="ds@x.com", token="tok-ds", provider="deepseek")
     ds_empty = AccountConfig(email="ds2@x.com", token="", provider="deepseek")
     qw = AccountConfig(email="qw@x.com", token="tok-qw", provider="qwen")
     s = Settings(provider="qwen", providers=[],
                  accounts=[ds, ds_empty, qw], config_path="")
     monkeypatch.setattr(
-        "deepseaport.accounts.collect_ban_labels",
+        "zourcewell.accounts.collect_ban_labels",
         lambda accs, force_refresh=False, **k: {},
     )
 
@@ -164,13 +164,13 @@ def test_select_usable_is_provider_scoped(monkeypatch):
 # _prompt_instance_count
 
 def test_prompt_cancel_empty(monkeypatch):
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
     monkeypatch.setattr("builtins.input", lambda *a, **k: "")
     assert chat_ui._prompt_instance_count(3) is None
 
 
 def test_prompt_eof_none(monkeypatch):
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
 
     def _eof(*a, **k):
         raise EOFError("eof")
@@ -180,14 +180,14 @@ def test_prompt_eof_none(monkeypatch):
 
 
 def test_prompt_nan_retry_then_valid(monkeypatch):
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
     seq = iter(["nan", "2"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(seq))
     assert chat_ui._prompt_instance_count(3) == 2
 
 
 def test_prompt_out_of_range_retry(monkeypatch):
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
     seq = iter(["99", "1"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(seq))
     assert chat_ui._prompt_instance_count(2) == 1
@@ -196,12 +196,12 @@ def test_prompt_out_of_range_retry(monkeypatch):
 # _allocate_sequential_ports
 
 def test_allocate_exhausted_short():
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
     assert chat_ui._allocate_sequential_ports("127.0.0.1", 5001, 2, is_free=lambda h, p: False) == []
 
 
 def test_allocate_skips_busy():
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
     got = chat_ui._allocate_sequential_ports("127.0.0.1", 5001, 2, is_free=lambda h, p: p != 5001)
     assert got == [5002, 5003]
 
@@ -209,8 +209,8 @@ def test_allocate_skips_busy():
 # _build_instance_settings
 
 def test_build_instance_settings_pinned():
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     a1 = _mk_acc("a1@x.com", "tok-1")
     a2 = _mk_acc("a2@x.com", "tok-2")
     a3 = _mk_acc("a3@x.com", "tok-3")
@@ -233,7 +233,7 @@ def test_build_instance_settings_pinned():
 # _stop_all_servers
 
 def test_stop_all_servers_joins_swallows():
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
 
     class BoomSrv:
         def __setattr__(self, name, val):
@@ -265,14 +265,14 @@ def test_stop_all_servers_joins_swallows():
 # run_multi_chat_servers blocked paths
 
 def test_run_multi_no_accounts():
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     assert chat_ui.run_multi_chat_servers(Settings(accounts=[], config_path="")) == 1
 
 
 def test_run_multi_tokenless():
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     s = Settings(accounts=[_mk_acc("a@x.com", "")], config_path="")
     assert chat_ui.run_multi_chat_servers(s) == 1
 
@@ -283,8 +283,8 @@ def test_run_multi_refuses_when_only_another_providers_account_exists(
     DeepSeek account passed it and then 503'd per request (an empty qwen pool
     never borrows another provider's credentials). It must refuse before the
     live ban probe, and say which provider has nothing."""
-    from deepseaport import chat_ui
-    from deepseaport.config import AccountConfig, Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import AccountConfig, Settings
     s = Settings(provider="qwen", providers=[], config_path="", accounts=[
         AccountConfig(email="ds@x.com", token="tok-ds", provider="deepseek")])
 
@@ -301,8 +301,8 @@ def test_run_multi_refuses_when_only_another_providers_account_exists(
 def test_run_multi_refuses_multi_qwen_opencode_with_no_accounts(capsys):
     """Multi [qwen, opencode] with nothing on file: qwen blocks the start and
     is named; opencode needs no account, so it is not named as missing."""
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     s = Settings(provider="qwen", providers=["qwen", "opencode"],
                  accounts=[], config_path="")
 
@@ -323,8 +323,8 @@ def _probe_raises(st):
 def test_run_multi_lets_an_accountless_provider_past_the_gate(monkeypatch, capsys):
     """Control: opencode provisions nothing, so an empty account list is not a
     reason to refuse (the account-needing rule is core.pools' answer)."""
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     s = Settings(provider="opencode", providers=[], accounts=[], config_path="")
     monkeypatch.setattr(chat_ui, "_select_usable_accounts_live", _probe_raises)
 
@@ -336,8 +336,8 @@ def test_run_multi_lets_an_accountless_provider_past_the_gate(monkeypatch, capsy
 def test_run_multi_accepts_an_account_bound_to_the_active_provider(
         monkeypatch, capsys):
     """Control for the refusal: the scope's OWN account still starts the run."""
-    from deepseaport import chat_ui
-    from deepseaport.config import AccountConfig, Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import AccountConfig, Settings
     s = Settings(provider="qwen", providers=[], config_path="", accounts=[
         AccountConfig(email="qw@x.com", token="tok-qw", provider="qwen")])
     monkeypatch.setattr(chat_ui, "_select_usable_accounts_live", _probe_raises)
@@ -348,16 +348,16 @@ def test_run_multi_accepts_an_account_bound_to_the_active_provider(
 
 
 def test_run_multi_all_banned(monkeypatch):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     s = Settings(accounts=[_mk_acc("a@x.com", "tok-1")], config_path="")
     monkeypatch.setattr(chat_ui, "_select_usable_accounts_live", lambda st: ([], 1, 0))
     assert chat_ui.run_multi_chat_servers(s, count=1) == 1
 
 
 def test_run_multi_prompt_cancel(monkeypatch):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     a1, a2 = _mk_acc("a1@x.com", "t1"), _mk_acc("a2@x.com", "t2")
     s = Settings(accounts=[a1, a2], config_path="")
     monkeypatch.setattr(chat_ui, "_select_usable_accounts_live", lambda st: ([a1, a2], 0, 0))
@@ -366,8 +366,8 @@ def test_run_multi_prompt_cancel(monkeypatch):
 
 
 def test_run_multi_bad_count_string(monkeypatch):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     a1 = _mk_acc("a1@x.com", "t1")
     s = Settings(accounts=[a1], config_path="")
     monkeypatch.setattr(chat_ui, "_select_usable_accounts_live", lambda st: ([a1], 0, 0))
@@ -375,8 +375,8 @@ def test_run_multi_bad_count_string(monkeypatch):
 
 
 def test_run_multi_out_of_range_count(monkeypatch):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     a1 = _mk_acc("a1@x.com", "t1")
     s = Settings(accounts=[a1], config_path="")
     monkeypatch.setattr(chat_ui, "_select_usable_accounts_live", lambda st: ([a1], 0, 0))
@@ -384,8 +384,8 @@ def test_run_multi_out_of_range_count(monkeypatch):
 
 
 def test_run_multi_ports_exhausted(monkeypatch):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     a1, a2 = _mk_acc("a1@x.com", "t1"), _mk_acc("a2@x.com", "t2")
     s = Settings(accounts=[a1, a2], port=5011, config_path="")
     monkeypatch.setattr(chat_ui, "_select_usable_accounts_live", lambda st: ([a1, a2], 0, 0))
@@ -394,8 +394,8 @@ def test_run_multi_ports_exhausted(monkeypatch):
 
 
 def test_run_multi_repl_roundrobin_commands(monkeypatch, capsys):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     a1 = _mk_acc("a1@x.com", "tok-a1")
     a2 = _mk_acc("a2@x.com", "tok-a2")
     s = Settings(accounts=[a1, a2], keys=["k"], port=5011, config_path="")
@@ -412,7 +412,7 @@ def test_run_multi_repl_roundrobin_commands(monkeypatch, capsys):
     monkeypatch.setattr("uvicorn.Config", FakeUvicornConfig)
     monkeypatch.setattr("uvicorn.Server", FakeSrv)
     monkeypatch.setattr("threading.Thread", AliveThread)
-    monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
+    monkeypatch.setattr("zourcewell.server.create_app", lambda st: object())
     monkeypatch.setattr(chat_ui, "_wait_for_server", lambda *a, **k: True)
     calls = []
 
@@ -438,10 +438,10 @@ def test_run_multi_repl_roundrobin_commands(monkeypatch, capsys):
 
 
 def test_run_chat_server_fail_dead(monkeypatch):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     s = Settings(port=5001, config_path="", log_level="INFO")
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5098)
+    monkeypatch.setattr("zourcewell.cli._ensure_free_port", lambda st, h, p: 5098)
     _install_single_fakes(monkeypatch, chat_ui, wait_ret=False, dead=True)
     monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no input")))
     assert chat_ui.run_chat_server(s) == 1
@@ -449,10 +449,10 @@ def test_run_chat_server_fail_dead(monkeypatch):
 
 
 def test_run_chat_slow_alive_continues(monkeypatch, capsys):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     s = Settings(port=5001, config_path="", log_level="INFO")
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5098)
+    monkeypatch.setattr("zourcewell.cli._ensure_free_port", lambda st, h, p: 5098)
     _install_single_fakes(monkeypatch, chat_ui, wait_ret=False, post_ret="hi", dead=False)
     monkeypatch.setattr("builtins.input", lambda *a, **k: "/quit")
     assert chat_ui.run_chat_server(s) == 0
@@ -462,14 +462,14 @@ def test_run_chat_slow_alive_continues(monkeypatch, capsys):
 
 def test_run_chat_repl_unknown_history_pop_quit_logs(monkeypatch, capsys):
     import threading  # noqa: F401  (ensures threading patch target exists)
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
     s = Settings(port=5001, config_path="", log_level="INFO")
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5098)
+    monkeypatch.setattr("zourcewell.cli._ensure_free_port", lambda st, h, p: 5098)
     monkeypatch.setattr("uvicorn.Config", FakeUvicornConfig)
     monkeypatch.setattr("uvicorn.Server", FakeUvicornServer)
     monkeypatch.setattr("threading.Thread", AliveThread)
-    monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
+    monkeypatch.setattr("zourcewell.server.create_app", lambda st: object())
     monkeypatch.setattr(chat_ui, "_wait_for_server", lambda *a, **k: True)
     hists = []
     n = {"c": 0}
@@ -500,12 +500,12 @@ def test_run_chat_model_pick_keeps_config_log_level(tmp_path, monkeypatch):
     """#5: a /model pick's save() ran while settings.log_level held "ERROR",
     so config.json came back with log_level "ERROR" and serve/dry-run were
     silent until hand-edited. The override must stay in _runtime_log_level."""
-    from deepseaport import chat_ui
-    from deepseaport.config import load_settings
+    from zourcewell import chat_ui
+    from zourcewell.config import load_settings
 
     cfg = write_config(tmp_path, {"keys": [], "log_level": "INFO"})
     s = load_settings(cfg)
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5097)
+    monkeypatch.setattr("zourcewell.cli._ensure_free_port", lambda st, h, p: 5097)
     _install_single_fakes(monkeypatch, chat_ui, wait_ret=True, post_ret="hi")
     monkeypatch.setattr(chat_ui, "resolve_chat_models", lambda st, instances=None: (
         ["deepseek-flash", "deepseek-flash-search"], "deepseek-flash"))
@@ -531,12 +531,12 @@ def test_run_chat_model_pick_keeps_config_log_level(tmp_path, monkeypatch):
 
 def test_run_chat_restores_prior_runtime_log_level(monkeypatch):
     """The override is put back, not just cleared: a pre-set value survives."""
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
 
     s = Settings(port=5001, config_path="", log_level="INFO")
     s._runtime_log_level = "DEBUG"
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5098)
+    monkeypatch.setattr("zourcewell.cli._ensure_free_port", lambda st, h, p: 5098)
     _install_single_fakes(monkeypatch, chat_ui, wait_ret=True, post_ret="hi")
     monkeypatch.setattr("builtins.input", lambda *a, **k: "/quit")
     assert chat_ui.run_chat_server(s) == 0
@@ -547,7 +547,7 @@ def test_run_chat_restores_prior_runtime_log_level(monkeypatch):
 # #13: the client side dials the host the server actually bound
 
 def test_client_host_maps_wildcards_to_loopback_and_brackets_ipv6():
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
     assert chat_ui._client_host("127.0.0.2") == "127.0.0.2"
     assert chat_ui._client_host("localhost") == "localhost"
     assert chat_ui._client_host("0.0.0.0") == "127.0.0.1"
@@ -566,11 +566,11 @@ def test_client_host_maps_wildcards_to_loopback_and_brackets_ipv6():
 def test_run_chat_server_dials_the_bind_host(monkeypatch, capsys, host, url):
     """#13: `--host 127.0.0.2` bound the server there while the readiness probe
     and every REPL message dialed 127.0.0.1 -> connection refused."""
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
 
     s = Settings(port=5001, config_path="", log_level="INFO")
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: 5099)
+    monkeypatch.setattr("zourcewell.cli._ensure_free_port", lambda st, h, p: 5099)
     _install_single_fakes(monkeypatch, chat_ui, wait_ret=True, post_ret="hi")
     dialed: list[str] = []
     monkeypatch.setattr(chat_ui, "_wait_for_server",
@@ -583,8 +583,8 @@ def test_run_chat_server_dials_the_bind_host(monkeypatch, capsys, host, url):
 
 def test_run_multi_chat_servers_dials_the_bind_host(monkeypatch, capsys):
     """#13, multi: `bases` was built from 127.0.0.1 regardless of `--host`."""
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
 
     a1 = _mk_acc("a1@x.com", "tok-a1")
     s = Settings(accounts=[a1], keys=["k"], port=5011, config_path="")
@@ -594,7 +594,7 @@ def test_run_multi_chat_servers_dials_the_bind_host(monkeypatch, capsys):
     monkeypatch.setattr("uvicorn.Config", FakeUvicornConfig)
     monkeypatch.setattr("uvicorn.Server", FakeUvicornServer)
     monkeypatch.setattr("threading.Thread", AliveThread)
-    monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
+    monkeypatch.setattr("zourcewell.server.create_app", lambda st: object())
     dialed: list[str] = []
     monkeypatch.setattr(chat_ui, "_wait_for_server",
                         lambda target, *a, **k: dialed.append(target) or True)

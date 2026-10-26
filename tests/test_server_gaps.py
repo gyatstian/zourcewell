@@ -1,4 +1,4 @@
-"""Offline gap tests for deepseaport.server (no network, no credentials).
+"""Offline gap tests for zourcewell.server (no network, no credentials).
 
 Covers: _check_auth, _prepare (404/tools/settings=None), _headers,
 _is_invalid_token_error/_is_transient_overload, _ensure_token,
@@ -18,12 +18,12 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from support import FakeBridge, settings
-from deepseaport.accounts import AccountPool, PooledAccount
-from deepseaport.config import AccountConfig, Settings
-from deepseaport.server import _openai_response, create_app
-from deepseaport.server_concurrency import _acquire_slot_or_499
-from deepseaport.providers.deepseek.completion_service import _ban_403_for_item, _ensure_token, _headers, _is_invalid_token_error, _is_transient_overload
-from deepseaport.server_routes import _check_auth, _prepare
+from zourcewell.accounts import AccountPool, PooledAccount
+from zourcewell.config import AccountConfig, Settings
+from zourcewell.server import _openai_response, create_app
+from zourcewell.server_concurrency import _acquire_slot_or_499
+from zourcewell.providers.deepseek.completion_service import _ban_403_for_item, _ensure_token, _headers, _is_invalid_token_error, _is_transient_overload
+from zourcewell.server_routes import _check_auth, _prepare
 
 
 # Default kwargs differ per file; the shared base dict lives in
@@ -173,9 +173,9 @@ class _FakePool:
 
 
 def _chat_post(app, monkeypatch, pool):
-    monkeypatch.setattr("deepseaport.server._pool", lambda _app: pool)
+    monkeypatch.setattr("zourcewell.server._pool", lambda _app: pool)
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.completion_service._complete_with_failover_sync",
+        "zourcewell.providers.deepseek.completion_service._complete_with_failover_sync",
         lambda *a, **k: {"content": "hi", "thinking": "", "usage_total": 5},
     )
     resp = TestClient(app).post("/v1/chat/completions", json={
@@ -233,7 +233,7 @@ def test_health_banned_not_ready():
 
 
 def test_models_lists_four_ids():
-    from deepseaport.server import MODELS
+    from zourcewell.server import MODELS
 
     data = TestClient(create_app(_settings())).get("/v1/models").json()
     assert data["object"] == "list"
@@ -382,7 +382,7 @@ def test_openai_response_usage_and_thinking():
 def test_openai_response_tool_calls_shape(monkeypatch):
     calls = [{"id": "call_1", "type": "function",
               "function": {"name": "get_time", "arguments": "{}"}}]
-    monkeypatch.setattr("deepseaport.server.parse_tool_calls",
+    monkeypatch.setattr("zourcewell.server.parse_tool_calls",
                         lambda content, tools, **kw: (calls, ""))
     prep = _base_prep(tools=[{"function": {"name": "get_time"}}])
     out = _openai_response(prep, {"content": "{}", "thinking": "",
@@ -394,7 +394,7 @@ def test_openai_response_tool_calls_shape(monkeypatch):
 
 def test_openai_response_truncated_tool_attempt_marks_length(monkeypatch):
     monkeypatch.setattr(
-        "deepseaport.server.parse_tool_calls",
+        "zourcewell.server.parse_tool_calls",
         lambda content, tools, **kw: (None, content))
     prep = _base_prep(tools=[{"function": {"name": "get_time"}}])
     out = _openai_response(

@@ -19,10 +19,10 @@ import threading
 
 import pytest
 
-from deepseaport.accounts import AccountPool
-from deepseaport.config import AccountConfig
-from deepseaport.core import engine
-from deepseaport.server_concurrency import _StreamCancelled
+from zourcewell.accounts import AccountPool
+from zourcewell.config import AccountConfig
+from zourcewell.core import engine
+from zourcewell.server_concurrency import _StreamCancelled
 
 _HANDSHAKE = 10.0   # bounded wait, never an assertion bound
 _DEADLINE = 0.05    # the reacquire deadline the give-up tests run under

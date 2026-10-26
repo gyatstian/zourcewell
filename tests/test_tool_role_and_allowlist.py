@@ -14,7 +14,7 @@ No network. Mirrors the idioms of tests/test_tools_gaps.py.
 import json
 import logging
 
-from deepseaport.core import tools as T
+from zourcewell.core import tools as T
 
 
 # --- Task 1: declared-but-malformed tools must not disable the guard ------
@@ -39,7 +39,7 @@ def _reply(name: str, call_id: str | None = "call_001") -> str:
 def test_normalize_calls_empty_allowlist_suppresses_unknown_name(caplog):
     """Declared but unreadable tools: an unverifiable name is dropped."""
     raw = [{"function": {"name": "totally_made_up", "arguments": "{}"}}]
-    with caplog.at_level(logging.WARNING, logger="deepseaport.tools"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.tools"):
         calls, dropped = T._normalize_calls(raw, set())
     assert calls == []
     assert dropped == [0]
@@ -50,7 +50,7 @@ def test_normalize_calls_empty_allowlist_suppresses_unknown_name(caplog):
 def test_malformed_openai_tools_shape_not_forwarded(caplog):
     """`[{"type": "function"}]` declares tools but carries no name."""
     text = _reply("totally_made_up")
-    with caplog.at_level(logging.WARNING, logger="deepseaport.tools"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.tools"):
         calls, rest = T.parse_tool_calls(text, [{"type": "function"}])
     # No tool_calls reach the agent loop; the reply stays a plain answer.
     assert calls is None
@@ -63,7 +63,7 @@ def test_malformed_anthropic_tools_shape_not_forwarded(caplog):
     """Anthropic-shaped entries have no OpenAI `function` wrapper."""
     anthropic = [{"name": "read", "input_schema": {
         "type": "object", "properties": {"path": {"type": "string"}}}}]
-    with caplog.at_level(logging.WARNING, logger="deepseaport.tools"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.tools"):
         calls, rest = T.parse_tool_calls(_reply("read_anything"), anthropic)
     assert calls is None
     assert rest == _reply("read_anything")
@@ -83,7 +83,7 @@ def test_mixed_malformed_tools_keep_the_readable_allowlist(caplog):
 def test_valid_allowlist_drops_unknown_and_keeps_declared(caplog):
     """Unchanged guard behaviour when the schemas are readable."""
     tools = [_READ, {"type": "function", "function": {"name": "write"}}]
-    with caplog.at_level(logging.WARNING, logger="deepseaport.tools"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.tools"):
         ok, _ = T.parse_tool_calls(_reply("read"), tools)
         bad, bad_rest = T.parse_tool_calls(_reply("nope"), tools)
     assert ok is not None and ok[0]["function"]["name"] == "read"

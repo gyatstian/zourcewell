@@ -1,7 +1,7 @@
 import sys
 import traceback
 
-from deepseaport.cli import main
+from zourcewell.cli import main
 
 if __name__ == "__main__":
     try:

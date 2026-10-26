@@ -18,10 +18,10 @@ import json
 import pytest
 
 from support import settings
-from deepseaport.accounts import AccountConfig, AccountPool
-from deepseaport.core import registry
-from deepseaport.core.provider import ModelSpec, Provider
-from deepseaport.server import create_app
+from zourcewell.accounts import AccountConfig, AccountPool
+from zourcewell.core import registry
+from zourcewell.core.provider import ModelSpec, Provider
+from zourcewell.server import create_app
 
 openai = pytest.importorskip("openai")
 httpx2 = pytest.importorskip("httpx2")
@@ -127,7 +127,7 @@ def test_stream_iterates_typed_chunks(app):
 def test_tool_calls_reply_is_typed_and_parsed(app, monkeypatch):
     calls = [{"id": "call_sdk", "type": "function",
               "function": {"name": "get_time", "arguments": '{"tz": "UTC"}'}}]
-    monkeypatch.setattr("deepseaport.server.parse_tool_calls",
+    monkeypatch.setattr("zourcewell.server.parse_tool_calls",
                         lambda content, tools, **kw: (calls, ""))
 
     completion = _run(app, lambda sdk: sdk.chat.completions.create(

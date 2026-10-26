@@ -16,9 +16,9 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
-from deepseaport.core import registry
-from deepseaport.server import create_app
-from deepseaport.server_routes import _extract_passthrough, _prepare
+from zourcewell.core import registry
+from zourcewell.server import create_app
+from zourcewell.server_routes import _extract_passthrough, _prepare
 from support import settings as _settings
 
 MODEL = "deepseek-flash"
@@ -34,7 +34,7 @@ def _body(**kw) -> dict:
 
 
 def _settings_with_account(**kw):
-    from deepseaport.config import AccountConfig
+    from zourcewell.config import AccountConfig
     kw.setdefault("accounts",
                   [AccountConfig(email="a@x.com", token="tok")])
     return _settings(**kw)
@@ -61,7 +61,7 @@ def test_absent_params_are_not_reported():
 
 
 def test_each_is_named_in_the_single_warning(caplog):
-    with caplog.at_level(logging.WARNING, logger="deepseaport.server"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.server"):
         _prepare(_body(**PARAMS), _settings())
 
     lines = [r for r in caplog.records
@@ -76,7 +76,7 @@ def test_the_route_accepts_them_off_the_same_single_warning(monkeypatch, caplog)
     """End to end: a body carrying all four is served, warned about once."""
     _stub_engine(monkeypatch)
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.server"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.server"):
         resp = TestClient(create_app(_settings_with_account())).post(
             "/v1/chat/completions", json=_body(**PARAMS))
 
@@ -91,7 +91,7 @@ def test_the_route_accepts_them_off_the_same_single_warning(monkeypatch, caplog)
 def test_a_clean_body_warns_about_nothing(monkeypatch, caplog):
     _stub_engine(monkeypatch)
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.server"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.server"):
         resp = TestClient(create_app(_settings_with_account())).post(
             "/v1/chat/completions", json=_body())
 

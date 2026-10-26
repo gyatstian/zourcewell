@@ -1,4 +1,4 @@
-"""Offline gap tests for deepseaport.cli (no network, no browser, no server).
+"""Offline gap tests for zourcewell.cli (no network, no browser, no server).
 
 Covers cmd_login / cmd_chat / cmd_waf / cmd_models / cmd_accounts, the port
 helpers (_next_free_port / _ensure_free_port / _run_server, plus the
@@ -18,18 +18,18 @@ import pytest
 
 from support import on_disk, write_config
 
-from deepseaport.cli import (
+from zourcewell.cli import (
     _ensure_free_port,
     _next_free_port,
     _run_server,
     cmd_accounts,
     main as cli_main,
 )
-from deepseaport.server_runner import _scan_free_ports
+from zourcewell.server_runner import _scan_free_ports
 
 
 def _load(path):
-    from deepseaport.config import load_settings
+    from zourcewell.config import load_settings
 
     return load_settings(path)
 
@@ -37,7 +37,7 @@ def _load(path):
 # cmd_login -------------------------------------------------------------------
 
 def test_login_success_saves_token_and_active(tmp_path, monkeypatch):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
@@ -52,8 +52,8 @@ def test_login_success_saves_token_and_active(tmp_path, monkeypatch):
 
 
 def test_login_banned_with_token_returns_3_and_persists_banned(tmp_path, monkeypatch, capsys):
-    import deepseaport.accounts as acc_mod
-    import deepseaport.cli as cli_mod
+    import zourcewell.accounts as acc_mod
+    import zourcewell.cli as cli_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
@@ -71,7 +71,7 @@ def test_login_banned_with_token_returns_3_and_persists_banned(tmp_path, monkeyp
 
 
 def test_login_no_token_returns_3(tmp_path, monkeypatch):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
@@ -82,7 +82,7 @@ def test_login_no_token_returns_3(tmp_path, monkeypatch):
 
 
 def test_login_banned_no_token_returns_3(tmp_path, monkeypatch, capsys):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
@@ -96,7 +96,7 @@ def test_login_banned_no_token_returns_3(tmp_path, monkeypatch, capsys):
 def test_login_no_token_prints_the_ban_wording_hint(tmp_path, monkeypatch, capsys):
     """A single ban-wording sighting no longer sets login_banned, but the driver
     reports it in the detail; the user still has to hear it."""
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     hint = "captcha on the signin page [ban wording seen: 'suspended until']"
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
@@ -111,8 +111,8 @@ def test_login_no_token_prints_the_ban_wording_hint(tmp_path, monkeypatch, capsy
 
 
 def _patch_banned_login(monkeypatch, expires_at: float):
-    import deepseaport.accounts as acc_mod
-    import deepseaport.cli as cli_mod
+    import zourcewell.accounts as acc_mod
+    import zourcewell.cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda email, password, settings: ("tok-banned", True, "suspended"))
@@ -124,7 +124,7 @@ def test_login_expiry_line_omitted_when_formatter_returns_empty(
         tmp_path, monkeypatch, capsys):
     """format_ban_datetime may legitimately have nothing to render (a garbage
     ban timestamp); "Expires:" with an empty tail is not a message."""
-    import deepseaport.providers.deepseek.protocol as proto_mod
+    import zourcewell.providers.deepseek.protocol as proto_mod
 
     _patch_banned_login(monkeypatch, 1789555791.11)
     monkeypatch.setattr(proto_mod, "format_ban_datetime", lambda ts: "")
@@ -140,7 +140,7 @@ def test_login_expiry_line_omitted_when_formatter_returns_empty(
 def test_login_expiry_line_kept_when_formatter_returns_text(
         tmp_path, monkeypatch, capsys):
     """Control: a renderable expiry still prints with the historical wording."""
-    import deepseaport.providers.deepseek.protocol as proto_mod
+    import zourcewell.providers.deepseek.protocol as proto_mod
 
     _patch_banned_login(monkeypatch, 1789555791.11)
     monkeypatch.setattr(proto_mod, "format_ban_datetime",
@@ -162,7 +162,7 @@ def test_login_expiry_line_kept_when_formatter_returns_text(
 
 def test_login_save_failure_reports_and_keeps_the_captured_token(
         tmp_path, monkeypatch, capsys):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     bad = tmp_path / "config.json"
     bad.write_text("{not json", encoding="utf-8")
@@ -206,7 +206,7 @@ def test_accounts_commands_survive_an_unwritable_config(
         tmp_path, monkeypatch, capsys, argv):
     """Every mutating accounts command reports the write failure and exits 1
     instead of raising through the entry point."""
-    from deepseaport.config import Settings
+    from zourcewell.config import Settings
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": [
         {"email": "a@x.com", "token": "tok-a"}]})
@@ -227,10 +227,10 @@ def test_accounts_commands_survive_an_unwritable_config(
 # cmd_chat --------------------------------------------------------------------
 
 def _patch_chat(monkeypatch, thinking="think-stuff", content="hello"):
-    import deepseaport.accounts as acc_mod
-    import deepseaport.core.obscura_bridge as bridge_mod
-    import deepseaport.providers.deepseek.completion_service as ds_cs
-    import deepseaport.server as srv_mod
+    import zourcewell.accounts as acc_mod
+    import zourcewell.core.obscura_bridge as bridge_mod
+    import zourcewell.providers.deepseek.completion_service as ds_cs
+    import zourcewell.server as srv_mod
 
     fake_app = types.SimpleNamespace(state=types.SimpleNamespace(bridge=None))
     monkeypatch.setattr(srv_mod, "create_app", lambda settings=None: fake_app)
@@ -286,12 +286,12 @@ def test_chat_dispatches_through_the_selected_provider_not_deepseeks_engine(
     WHICH callable ran -- each provider's own ``Provider.complete`` -- and
     makes DeepSeek's engine raise if it is entered at all.
     """
-    import deepseaport.accounts as acc_mod
-    import deepseaport.core.obscura_bridge as bridge_mod
-    import deepseaport.providers.deepseek.completion_service as ds_cs
-    import deepseaport.providers.deepseek.provider as ds_prov
-    import deepseaport.providers.qwen.provider as qw_prov
-    import deepseaport.server as srv_mod
+    import zourcewell.accounts as acc_mod
+    import zourcewell.core.obscura_bridge as bridge_mod
+    import zourcewell.providers.deepseek.completion_service as ds_cs
+    import zourcewell.providers.deepseek.provider as ds_prov
+    import zourcewell.providers.qwen.provider as qw_prov
+    import zourcewell.server as srv_mod
 
     monkeypatch.setattr(srv_mod, "create_app",
                         lambda settings=None: types.SimpleNamespace(
@@ -349,10 +349,10 @@ def test_chat_qwen_one_shot_skips_the_deepseek_host_warmup(tmp_path, monkeypatch
     warmup fetches CHAT_HOME -- chat.deepseek.com -- which a qwen-only request
     has no use for: qwen's cookies come from its own acw_tc jar.
     """
-    import deepseaport.accounts as acc_mod
-    import deepseaport.core.obscura_bridge as bridge_mod
-    import deepseaport.providers.qwen.provider as qw_prov
-    import deepseaport.server as srv_mod
+    import zourcewell.accounts as acc_mod
+    import zourcewell.core.obscura_bridge as bridge_mod
+    import zourcewell.providers.qwen.provider as qw_prov
+    import zourcewell.server as srv_mod
 
     monkeypatch.setattr(srv_mod, "create_app",
                         lambda settings=None: types.SimpleNamespace(
@@ -398,10 +398,10 @@ def test_chat_ban_failover_survives_the_provider_dispatch(tmp_path, monkeypatch)
     _complete_with_failover_sync -- so this asserts Qwen's engine, not DeepSeek's,
     is the one that owns the retry.
     """
-    import deepseaport.accounts as acc_mod
-    import deepseaport.core.obscura_bridge as bridge_mod
-    import deepseaport.providers.qwen.completion_service as qw_cs
-    import deepseaport.server as srv_mod
+    import zourcewell.accounts as acc_mod
+    import zourcewell.core.obscura_bridge as bridge_mod
+    import zourcewell.providers.qwen.completion_service as qw_cs
+    import zourcewell.server as srv_mod
 
     monkeypatch.setattr(srv_mod, "create_app",
                         lambda settings=None: types.SimpleNamespace(
@@ -445,10 +445,10 @@ def test_chat_reaches_the_accountless_provider_without_a_pool(tmp_path, monkeypa
     ``chat --provider opencode`` skips the pool entirely. Asserting opencode's
     own provider ran with pool=None/item=None proves both branches dispatch.
     """
-    import deepseaport.core.obscura_bridge as bridge_mod
-    import deepseaport.providers.deepseek.completion_service as ds_cs
-    import deepseaport.providers.opencode.provider as oc_prov
-    import deepseaport.server as srv_mod
+    import zourcewell.core.obscura_bridge as bridge_mod
+    import zourcewell.providers.deepseek.completion_service as ds_cs
+    import zourcewell.providers.opencode.provider as oc_prov
+    import zourcewell.server as srv_mod
 
     monkeypatch.setattr(srv_mod, "create_app",
                         lambda settings=None: types.SimpleNamespace(
@@ -490,10 +490,10 @@ def test_chat_refuses_instead_of_raising_when_no_provider_resolves(
     raw traceback as its whole UX -- so it takes the same _chat_fail path every
     other failure there takes, and exits 1.
     """
-    import deepseaport.accounts as acc_mod
-    import deepseaport.core.obscura_bridge as bridge_mod
-    import deepseaport.core.registry as reg_mod
-    import deepseaport.server as srv_mod
+    import zourcewell.accounts as acc_mod
+    import zourcewell.core.obscura_bridge as bridge_mod
+    import zourcewell.core.registry as reg_mod
+    import zourcewell.server as srv_mod
 
     monkeypatch.setattr(srv_mod, "create_app",
                         lambda settings=None: types.SimpleNamespace(
@@ -542,7 +542,7 @@ class _FakeWafBridge:
 
 
 def _patch_waf(monkeypatch, has_token: bool):
-    import deepseaport.core.obscura_bridge as bridge_mod
+    import zourcewell.core.obscura_bridge as bridge_mod
 
     monkeypatch.setattr(bridge_mod, "ObscuraBridge",
                         lambda binary="", profile="": _FakeWafBridge(has_token))
@@ -564,7 +564,7 @@ def test_waf_no_token_returns_2(tmp_path, monkeypatch):
 
 
 def test_models_prints_4_ids(tmp_path, monkeypatch, capsys):
-    from deepseaport.server import MODELS
+    from zourcewell.server import MODELS
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     assert cli_main(["--config", cfg, "models"]) == 0
@@ -577,7 +577,7 @@ def test_models_prints_4_ids(tmp_path, monkeypatch, capsys):
 # cmd_accounts ------------------------------------------------------------------
 
 def test_accounts_list_ban_label_and_missing_hint(tmp_path, monkeypatch, capsys):
-    import deepseaport.accounts as acc_mod
+    import zourcewell.accounts as acc_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": [
         {"email": "a@x.com", "token": "tok-with-token-1234567890"},
@@ -667,15 +667,15 @@ def test_scan_free_ports_check_raises_skipped():
 
 
 def test_next_free_port_none_when_all_busy(monkeypatch):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "_is_port_free", lambda host, port: False)
     assert _next_free_port("127.0.0.1", 5000, limit=3) is None
 
 
 def test_ensure_free_port_no_free_returns_original(tmp_path, monkeypatch, capsys):
-    import deepseaport.cli as cli_mod
-    from deepseaport.config import Settings
+    import zourcewell.cli as cli_mod
+    from zourcewell.config import Settings
 
     s = Settings(port=5000, config_path=str(tmp_path / "c.json"))
     monkeypatch.setattr(cli_mod, "_is_port_free", lambda host, port: False)
@@ -686,11 +686,11 @@ def test_ensure_free_port_no_free_returns_original(tmp_path, monkeypatch, capsys
 
 def test_run_server_single_worker_uses_uvicorn_run(tmp_path, monkeypatch):
     """The supported path is unchanged: uvicorn.Server on the resolved port."""
-    import deepseaport.cli as cli_mod
-    import deepseaport.server as srv_mod
+    import zourcewell.cli as cli_mod
+    import zourcewell.server as srv_mod
     import uvicorn
 
-    from deepseaport.config import Settings
+    from zourcewell.config import Settings
 
     captured: dict = {}
 
@@ -725,7 +725,7 @@ def test_run_server_single_worker_uses_uvicorn_run(tmp_path, monkeypatch):
 # main dispatch -------------------------------------------------------------------
 
 def test_main_no_subcommand_defaults_to_serve(tmp_path, monkeypatch):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     seen = {}
     def _fake_serve(args):
@@ -738,7 +738,7 @@ def test_main_no_subcommand_defaults_to_serve(tmp_path, monkeypatch):
 
 
 def test_main_login_dispatch(tmp_path, monkeypatch):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "cmd_login", lambda args: 7)
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
@@ -746,7 +746,7 @@ def test_main_login_dispatch(tmp_path, monkeypatch):
 
 
 def test_main_chat_dispatch(tmp_path, monkeypatch):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "cmd_chat", lambda args: 8)
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
@@ -754,7 +754,7 @@ def test_main_chat_dispatch(tmp_path, monkeypatch):
 
 
 def test_main_unknown_cmd_returns_1(monkeypatch):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     monkeypatch.setattr(argparse.ArgumentParser, "parse_args",
                         lambda self, argv=None: argparse.Namespace(config=None, cmd="bogus"))
@@ -766,7 +766,7 @@ def test_main_unknown_cmd_returns_1(monkeypatch):
 
 
 def test_main_waf_models_accounts_dispatch(tmp_path, monkeypatch):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "cmd_waf", lambda args: 11)
@@ -796,7 +796,7 @@ def test_port_flag_rejects_out_of_range_and_zero(tmp_path, capsys):
 
 
 def test_port_flag_accepts_a_bindable_port(tmp_path, monkeypatch):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     seen: dict = {}
     monkeypatch.setattr(cli_mod, "_run_server",
@@ -812,15 +812,15 @@ def test_ensure_free_port_out_of_range_falls_back_to_default(
         bad, tmp_path, monkeypatch, caplog):
     """The guard must never return an out-of-range port: uvicorn's bind dies on
     it with OverflowError, which _run_server does not catch."""
-    import deepseaport.cli as cli_mod
-    from deepseaport.config import Settings
+    import zourcewell.cli as cli_mod
+    from zourcewell.config import Settings
 
     s = Settings(port=5001, config_path=str(tmp_path / "c.json"))
     monkeypatch.setattr(cli_mod, "_is_port_free",
                         lambda host, port: port == 5001)
     monkeypatch.setattr(cli_mod, "_next_free_port",
                         lambda host, port, limit=50: None)
-    with caplog.at_level(logging.WARNING, logger="deepseaport.server_runner"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.server_runner"):
         assert _ensure_free_port(s, "127.0.0.1", bad) == 5001
     assert any("is not a usable listen port" in r.getMessage()
                for r in caplog.records), [r.getMessage() for r in caplog.records]
@@ -829,11 +829,11 @@ def test_ensure_free_port_out_of_range_falls_back_to_default(
 def test_run_server_garbage_settings_port_uses_default(tmp_path, monkeypatch):
     """A hand-built Settings with a non-numeric port must fall back, not raise
     ValueError out of _run_server's pre-flight line."""
-    import deepseaport.cli as cli_mod
-    import deepseaport.server as srv_mod
+    import zourcewell.cli as cli_mod
+    import zourcewell.server as srv_mod
     import uvicorn
 
-    from deepseaport.config import Settings
+    from zourcewell.config import Settings
 
     captured: dict = {}
 
@@ -865,7 +865,7 @@ def test_run_server_garbage_settings_port_uses_default(tmp_path, monkeypatch):
 
 def test_login_upsert_path_uses_tmp_config(tmp_path, monkeypatch):
     """Second login for same email updates token, keeps single account."""
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
@@ -907,7 +907,7 @@ def test_secret_flag_value_warns_about_the_process_list(tmp_path, capsys):
 
 
 def test_login_password_flag_value_warns(tmp_path, monkeypatch, capsys):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
@@ -928,7 +928,7 @@ def test_secret_flags_keep_working_for_scripting(tmp_path):
 
 def test_missing_secret_flag_prompts_without_echo_on_a_tty(tmp_path, monkeypatch):
     """No flag + a console -> getpass, so the secret never hits the process list."""
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     prompted: list[str] = []
     monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: True)
@@ -941,7 +941,7 @@ def test_missing_secret_flag_prompts_without_echo_on_a_tty(tmp_path, monkeypatch
 
 def test_missing_secret_flag_does_not_prompt_when_headless(tmp_path, monkeypatch):
     """Pipes/CI: no flag and no console means no prompt, as before."""
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     called: list[str] = []
     monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: False)
@@ -954,7 +954,7 @@ def test_missing_secret_flag_does_not_prompt_when_headless(tmp_path, monkeypatch
 
 def test_password_and_token_help_mention_the_risk(capsys):
     """--password had no help at all; both must document the exposure."""
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     seen = []
     for argv in (["accounts", "add", "--help"], ["login", "--help"]):
@@ -973,7 +973,7 @@ def test_cmd_serve_survives_missing_stdin(monkeypatch, tmp_path):
     """sys.stdin is None under pythonw.exe: the old bare .isatty() raised."""
     import sys as _sys
 
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": [
         {"email": "a@x.com", "token": "t1"}]})
@@ -996,8 +996,8 @@ def test_cmd_serve_survives_missing_stdin(monkeypatch, tmp_path):
 def test_cmd_serve_still_opens_tui_on_a_real_tty(monkeypatch, tmp_path):
     import sys as _sys
 
-    import deepseaport.cli as cli_mod
-    import deepseaport.tui as tui_mod
+    import zourcewell.cli as cli_mod
+    import zourcewell.tui as tui_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": [
         {"email": "a@x.com", "token": "t1"}]})

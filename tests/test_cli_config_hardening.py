@@ -5,7 +5,7 @@ in the test docstring. The tree under test is this checkout's ``src/`` (see
 ``tests/conftest.py``: ``python -m pytest`` from the repo root).
 
 * **P3-1** ``cli._secret_from_arg`` returned ``""`` for a non-tty stdin, so
-  ``deepseaport login --email a@x.com < password.txt`` (service wrappers, CI,
+  ``zourcewell login --email a@x.com < password.txt`` (service wrappers, CI,
   any piped secret) authenticated with an empty password. The pre-change
   behaviour was ``getpass.getpass`` -> ``getpass.fallback_getpass``, which
   reads ONE LINE from a non-tty stdin. The helper's docstring claimed scripted
@@ -44,9 +44,9 @@ import types
 
 import pytest
 
-import deepseaport.accounts as accounts_mod
-import deepseaport.cli as cli_mod
-from deepseaport.config import (
+import zourcewell.accounts as accounts_mod
+import zourcewell.cli as cli_mod
+from zourcewell.config import (
     MAX_RETRIES_LIMIT,
     AccountConfig,
     Settings,
@@ -54,7 +54,7 @@ from deepseaport.config import (
 )
 from support import write_config, on_disk
 
-from deepseaport.core import registry
+from zourcewell.core import registry
 
 
 class _PipedStdin(io.StringIO):
@@ -87,7 +87,7 @@ def test_login_takes_the_piped_password_from_a_non_tty_stdin(monkeypatch, tmp_pa
     """P3-1. Pre-change: the driver was called with password='' and the
     scripted login silently authenticated as an empty password.
 
-    Reproduces ``deepseaport login --email a@x.com < password.txt``.
+    Reproduces ``zourcewell login --email a@x.com < password.txt``.
     """
     seen: dict = {}
     monkeypatch.setattr(sys, "stdin", _PipedStdin("s3cret\n"))
@@ -200,7 +200,7 @@ def test_max_retries_clamp_is_not_written_back_by_a_save(tmp_path, caplog):
     is what survives to disk.
     """
     cfg = write_config(tmp_path, {"keys": [], "accounts": [], "max_retries": 9})
-    with caplog.at_level(logging.WARNING, logger="deepseaport.config"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.config"):
         settings = load_settings(cfg)
 
     # The clamp is still a real runtime bound...
@@ -258,7 +258,7 @@ def test_save_does_not_warn_about_the_clamp_bookkeeping(tmp_path, caplog):
     assert not set(settings.__dataclass_fields__) & {
         "_raw_persisted_values", "max_retries_raw"}
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.config"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.config"):
         settings.save()
 
     assert [r.getMessage() for r in caplog.records
@@ -274,7 +274,7 @@ def test_unpersisted_field_still_trips_the_mirror_guard(tmp_path, caplog):
     settings.__dataclass_fields__ = dict(settings.__dataclass_fields__,
                                         brand_new_field=object())
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.config"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.config"):
         settings.save()
 
     assert any("brand_new_field" in r.getMessage() for r in caplog.records)
@@ -286,7 +286,7 @@ def test_max_retries_env_override_is_not_recorded_as_a_file_value(monkeypatch,
     recorded. An env override is transient and is not owned by config.json, so
     there is no on-disk number to protect (pre-existing behaviour unchanged)."""
     cfg = write_config(tmp_path, {"keys": [], "accounts": [], "max_retries": 3})
-    monkeypatch.setenv("DEEPSEAPORT_MAX_RETRIES", "99")
+    monkeypatch.setenv("ZOURCEWELL_MAX_RETRIES", "99")
 
     settings = load_settings(cfg)
     assert settings.max_retries == MAX_RETRIES_LIMIT
@@ -305,7 +305,7 @@ def _edit_keys(monkeypatch, settings, answers, secrets):
 
     ``answers`` feeds the menu prompts, ``secrets`` the getpass calls.
     """
-    from deepseaport.tui import _edit_keys as run
+    from zourcewell.tui import _edit_keys as run
 
     answers = iter(answers)
     secrets = iter(secrets)
@@ -435,7 +435,7 @@ def test_usable_provider_survives_an_unimportable_registry(monkeypatch):
     falls back)."""
     # A None entry in sys.modules makes ``from .core import registry`` raise
     # ImportError, which is the failure shape the guard is there for.
-    monkeypatch.setitem(sys.modules, "deepseaport.core.registry", None)
+    monkeypatch.setitem(sys.modules, "zourcewell.core.registry", None)
     assert accounts_mod.usable_provider("qwen") == "qwen"
     assert accounts_mod.usable_provider("") == accounts_mod.DEFAULT_PROVIDER_ID
 
@@ -445,7 +445,7 @@ def test_cli_accounts_add_never_persists_an_unregistered_provider(monkeypatch,
     """P3-4 end-to-end, the reachable door: `accounts add` used to copy
     settings.provider onto the account before add_account saw it, so the
     coercion in accounts never ran."""
-    monkeypatch.setenv("DEEPSEAPORT_PROVIDER", "junk-provider")
+    monkeypatch.setenv("ZOURCEWELL_PROVIDER", "junk-provider")
     cfg = write_config(tmp_path, {"keys": [], "accounts": [], "max_retries": 1})
 
     assert cli_mod.cmd_accounts(argparse.Namespace(
@@ -459,9 +459,9 @@ def test_cli_accounts_add_never_persists_an_unregistered_provider(monkeypatch,
 
 def test_cli_accounts_add_keeps_the_configured_registered_provider(monkeypatch,
                                                                   tmp_path):
-    """P3-4, control on the same door: DEEPSEAPORT_PROVIDER=qwen still binds
+    """P3-4, control on the same door: ZOURCEWELL_PROVIDER=qwen still binds
     the account to qwen (no flattening to the registry default)."""
-    monkeypatch.setenv("DEEPSEAPORT_PROVIDER", "qwen")
+    monkeypatch.setenv("ZOURCEWELL_PROVIDER", "qwen")
     cfg = write_config(tmp_path, {"keys": [], "accounts": [], "max_retries": 1})
 
     assert cli_mod.cmd_accounts(argparse.Namespace(
@@ -485,9 +485,9 @@ def test_cli_accounts_add_keeps_an_explicit_unregistered_provider(tmp_path):
 
 
 def test_login_account_never_inherits_an_unregistered_provider(monkeypatch, tmp_path):
-    """P3-4, the login door: `deepseaport login` created its account through
+    """P3-4, the login door: `zourcewell login` created its account through
     cli._upsert_account, which bound the same unvalidated settings.provider."""
-    monkeypatch.setenv("DEEPSEAPORT_PROVIDER", "junk-provider")
+    monkeypatch.setenv("ZOURCEWELL_PROVIDER", "junk-provider")
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda e, p, s: ("tok-from-login", False, ""))
     cfg = write_config(tmp_path, {"keys": [], "accounts": [], "max_retries": 1})
@@ -501,7 +501,7 @@ def test_login_account_never_inherits_an_unregistered_provider(monkeypatch, tmp_
 def test_tui_ask_account_provider_coerces_an_unregistered_selection(monkeypatch):
     """P3-4, the TUI door: single mode returns the inherited selection, which
     load_settings does not registry-check."""
-    from deepseaport.tui import _ask_account_provider
+    from zourcewell.tui import _ask_account_provider
 
     settings = Settings(provider="junk-provider")
 
@@ -510,7 +510,7 @@ def test_tui_ask_account_provider_coerces_an_unregistered_selection(monkeypatch)
 
 def test_tui_ask_account_provider_keeps_a_registered_selection():
     """P3-4, control on the TUI door."""
-    from deepseaport.tui import _ask_account_provider
+    from zourcewell.tui import _ask_account_provider
 
     assert _ask_account_provider(Settings(provider="qwen")) == "qwen"
 
@@ -520,8 +520,8 @@ def test_tui_ask_account_provider_empty_answer_stays_in_the_active_set(monkeypat
     ``providers=["qwen","opencode"]`` a bare Enter filed the account under a
     provider that is not active -- the ``login --provider glm`` class: an
     account no pool builds from and no request can serve."""
-    from deepseaport.core import pools
-    from deepseaport.tui import _ask_account_provider
+    from zourcewell.core import pools
+    from zourcewell.tui import _ask_account_provider
 
     settings = Settings(providers=["qwen", "opencode"])
     shown: dict = {}
@@ -530,7 +530,7 @@ def test_tui_ask_account_provider_empty_answer_stays_in_the_active_set(monkeypat
         shown["default"] = default
         return ""
 
-    monkeypatch.setattr("deepseaport.tui._ask", _ask)
+    monkeypatch.setattr("zourcewell.tui._ask", _ask)
 
     picked = _ask_account_provider(settings)
 
@@ -542,23 +542,23 @@ def test_tui_ask_account_provider_empty_answer_stays_in_the_active_set(monkeypat
 def test_tui_ask_account_provider_eof_stays_in_the_active_set(monkeypatch):
     """Same guarantee on the EOF/KeyboardInterrupt path, which returns its own
     literal."""
-    from deepseaport.core import pools
-    from deepseaport.tui import _ask_account_provider
+    from zourcewell.core import pools
+    from zourcewell.tui import _ask_account_provider
 
     settings = Settings(providers=["qwen", "opencode"])
 
     def _eof(*a, **k):
         raise EOFError
 
-    monkeypatch.setattr("deepseaport.tui._ask", _eof)
+    monkeypatch.setattr("zourcewell.tui._ask", _eof)
 
     assert _ask_account_provider(settings) in pools.active_provider_ids(settings)
 
 
 def test_tui_ask_account_provider_keeps_deepseek_as_the_default(monkeypatch):
     """Control: while deepseek IS active the historical default is unchanged."""
-    from deepseaport.tui import _ask_account_provider
+    from zourcewell.tui import _ask_account_provider
 
-    monkeypatch.setattr("deepseaport.tui._ask", lambda *a, **k: "")
+    monkeypatch.setattr("zourcewell.tui._ask", lambda *a, **k: "")
 
     assert _ask_account_provider(Settings(providers=["deepseek", "qwen"])) == "deepseek"

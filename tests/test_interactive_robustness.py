@@ -25,8 +25,8 @@ import types
 
 import pytest
 
-from deepseaport import chat_ui
-from deepseaport.config import AccountConfig, Settings
+from zourcewell import chat_ui
+from zourcewell.config import AccountConfig, Settings
 from functools import partial
 
 from support import JoinCountingThread, settings, write_config
@@ -61,8 +61,8 @@ def test_refresh_truncated_config_then_save_keeps_accounts(tmp_path, capsys):
     Pre-change this persisted "accounts": [] -- the whole credential pool gone
     because a transiently truncated file was read as "no accounts".
     """
-    from deepseaport.config import load_settings
-    from deepseaport.tui import _refresh_from_disk
+    from zourcewell.config import load_settings
+    from zourcewell.tui import _refresh_from_disk
 
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({
@@ -94,8 +94,8 @@ def test_refresh_truncated_config_then_save_keeps_accounts(tmp_path, capsys):
 
 def test_refresh_rejects_non_object_json(tmp_path, capsys):
     """A JSON array/string is not a config: keep memory, say why."""
-    from deepseaport.config import load_settings
-    from deepseaport.tui import _refresh_from_disk
+    from zourcewell.config import load_settings
+    from zourcewell.tui import _refresh_from_disk
 
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({"accounts": [{"email": "a@x.com", "token": "t1"}]}),
@@ -109,8 +109,8 @@ def test_refresh_rejects_non_object_json(tmp_path, capsys):
 
 def test_refresh_still_applies_a_valid_file(tmp_path):
     """The non-destructive guard must not stop the API hand-off it exists for."""
-    from deepseaport.config import load_settings
-    from deepseaport.tui import _refresh_from_disk
+    from zourcewell.config import load_settings
+    from zourcewell.tui import _refresh_from_disk
 
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({"accounts": [{"email": "a@x.com", "token": "t1"}]}),
@@ -135,7 +135,7 @@ class _Srv:
 def _fake_server(monkeypatch, srv=None, thr=None):
     srv = srv if srv is not None else _Srv()
     thr = thr if thr is not None else JoinCountingThread()
-    monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
+    monkeypatch.setattr("zourcewell.server.create_app", lambda st: object())
     monkeypatch.setattr(chat_ui, "_start_background_server",
                         lambda app, host, port: (srv, thr))
     return srv, thr
@@ -153,7 +153,7 @@ def test_chat_server_ctrl_c_in_wait_restores_logs_and_stops_server(monkeypatch):
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")],
                log_level="INFO")
     root_level = logging.getLogger().level
-    quiet_level = logging.getLogger("deepseaport").level
+    quiet_level = logging.getLogger("zourcewell").level
 
     with pytest.raises(KeyboardInterrupt):
         chat_ui.run_chat_server(s)
@@ -162,7 +162,7 @@ def test_chat_server_ctrl_c_in_wait_restores_logs_and_stops_server(monkeypatch):
     assert thr.joined == 1
     assert s.log_level == "INFO"
     assert logging.getLogger().level == root_level
-    assert logging.getLogger("deepseaport").level == quiet_level
+    assert logging.getLogger("zourcewell").level == quiet_level
 
 
 def _raise_ctrl_c(*a, **k):
@@ -207,7 +207,7 @@ def test_delete_row_two_keeps_the_same_email_other_provider(monkeypatch, capsys)
     pool.remove()/remove_account(), which match by identifier and take the
     FIRST hit -- so the deepseek account was destroyed instead.
     """
-    from deepseaport.tui import accounts_menu
+    from zourcewell.tui import accounts_menu
 
     s = _fresh(
         accounts=[AccountConfig(email="a@x.com", token="t1", provider="deepseek"),
@@ -225,7 +225,7 @@ def test_delete_row_two_keeps_the_same_email_other_provider(monkeypatch, capsys)
 
 def test_delete_by_identifier_still_works(monkeypatch):
     """The typed-identifier fallback is unchanged: first match goes."""
-    from deepseaport.tui import accounts_menu
+    from zourcewell.tui import accounts_menu
 
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1"),
                          AccountConfig(email="b@x.com", token="t2")])
@@ -236,7 +236,7 @@ def test_delete_by_identifier_still_works(monkeypatch):
 
 def test_delete_shared_email_keeps_active_selection_valid(monkeypatch):
     """Deleting one of two same-email accounts must not orphan CURRENT."""
-    from deepseaport.tui import accounts_menu
+    from zourcewell.tui import accounts_menu
 
     s = _fresh(
         accounts=[AccountConfig(email="a@x.com", token="t1", provider="deepseek"),
@@ -251,7 +251,7 @@ def test_delete_shared_email_keeps_active_selection_valid(monkeypatch):
 
 def test_set_token_row_two_targets_that_provider(monkeypatch):
     """`t` by row number must not overwrite the other provider's token."""
-    from deepseaport.tui import accounts_menu
+    from zourcewell.tui import accounts_menu
 
     s = _fresh(
         accounts=[AccountConfig(email="a@x.com", token="t1", provider="deepseek"),
@@ -268,7 +268,7 @@ def test_main_menu_survives_systemexit_from_serve(monkeypatch, capsys):
     """uvicorn calls sys.exit(3) when bind() fails: a BaseException that killed
     the whole TUI with no menu. Pre-change SystemExit escaped main_menu.
     """
-    from deepseaport.tui import main_menu
+    from zourcewell.tui import main_menu
 
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")],
                provider="deepseek", providers=[])
@@ -286,7 +286,7 @@ def test_main_menu_survives_systemexit_from_serve(monkeypatch, capsys):
 
 def test_main_menu_clean_systemexit_is_not_an_error(monkeypatch, capsys):
     """SystemExit(0) is a normal stop: no error text, no exit code in the log."""
-    from deepseaport.tui import main_menu
+    from zourcewell.tui import main_menu
 
     s = _fresh(accounts=[AccountConfig(email="a@x.com", token="t1")],
                provider="deepseek", providers=[])
@@ -306,7 +306,7 @@ def test_main_menu_systemexit_from_chat_multi_and_dry(monkeypatch, capsys):
 
     Distinct exit codes per block so each guard is proved individually.
     """
-    from deepseaport.tui import main_menu
+    from zourcewell.tui import main_menu
 
     def _mk(code):
         def _fn(_s):
@@ -368,9 +368,9 @@ def test_add_account_persists_ban_reported_by_auto_login(monkeypatch, capsys):
     ban write matched nothing: the UI said "Account list will show the ban"
     while the saved account kept banned=False.
     """
-    from deepseaport.tui import accounts_menu
+    from zourcewell.tui import accounts_menu
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings:
                         ("banned-tok-123", True, "suspended until 16 September 2030"))
     s = _fresh(accounts=[], active_account="", provider="deepseek", providers=[])
@@ -387,10 +387,10 @@ def test_add_account_persists_ban_reported_by_auto_login(monkeypatch, capsys):
 
 def test_add_account_ban_survives_a_save_reload(tmp_path, monkeypatch):
     """The ban has to be on disk, not just in memory."""
-    from deepseaport.config import load_settings
-    from deepseaport.tui import accounts_menu
+    from zourcewell.config import load_settings
+    from zourcewell.tui import accounts_menu
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings:
                         ("banned-tok-123", True, "suspended until 16 September 2030"))
     cfg = tmp_path / "config.json"
@@ -409,8 +409,8 @@ def test_add_account_ban_survives_a_save_reload(tmp_path, monkeypatch):
 
 def _patch_bridge(monkeypatch):
     """No browser: stub the WAF bridge so warmup cannot launch Obscura."""
-    import deepseaport.core.obscura_bridge as bridge_mod
-    import deepseaport.server as srv_mod
+    import zourcewell.core.obscura_bridge as bridge_mod
+    import zourcewell.server as srv_mod
 
     fake_app = types.SimpleNamespace(state=types.SimpleNamespace(bridge=None))
     monkeypatch.setattr(srv_mod, "create_app", lambda settings=None: fake_app)
@@ -432,7 +432,7 @@ def test_chat_empty_pool_reports_short_error_not_traceback(tmp_path, monkeypatch
 
     The frozen exe then appended "Press Enter to close..." to the traceback.
     """
-    from deepseaport.cli import main as cli_main
+    from zourcewell.cli import main as cli_main
 
     _patch_bridge(monkeypatch)
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
@@ -445,7 +445,7 @@ def test_chat_empty_pool_reports_short_error_not_traceback(tmp_path, monkeypatch
 
 def test_chat_unknown_model_reports_http_status(tmp_path, monkeypatch, capsys):
     """_prepare raises HTTPException(404) for an unknown model: also a traceback."""
-    from deepseaport.cli import main as cli_main
+    from zourcewell.cli import main as cli_main
 
     _patch_bridge(monkeypatch)
     cfg = write_config(tmp_path, {"keys": [], "accounts": [
@@ -460,8 +460,8 @@ def test_chat_unknown_model_reports_http_status(tmp_path, monkeypatch, capsys):
 
 def test_chat_acquire_timeout_reports_short_error(tmp_path, monkeypatch, capsys):
     """A TimeoutError from a saturated pool must be a line, not a stack dump."""
-    import deepseaport.accounts as acc_mod
-    from deepseaport.cli import main as cli_main
+    import zourcewell.accounts as acc_mod
+    from zourcewell.cli import main as cli_main
 
     _patch_bridge(monkeypatch)
 
@@ -480,11 +480,11 @@ def test_chat_acquire_timeout_reports_short_error(tmp_path, monkeypatch, capsys)
 
 def test_chat_happy_path_output_is_unchanged(tmp_path, monkeypatch, capsys):
     """The guard must not touch the success output or its return code."""
-    from deepseaport.cli import main as cli_main
+    from zourcewell.cli import main as cli_main
 
     _patch_bridge(monkeypatch)
-    import deepseaport.accounts as acc_mod
-    import deepseaport.providers.deepseek.completion_service as ds_cs
+    import zourcewell.accounts as acc_mod
+    import zourcewell.providers.deepseek.completion_service as ds_cs
 
     monkeypatch.setattr(acc_mod.AccountPool, "acquire",
                         lambda self, timeout=30, allow_failover=True: object())

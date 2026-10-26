@@ -27,11 +27,11 @@ import httpx
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from deepseaport import dry_run as dry_run_mod
-from deepseaport import server_routes
-from deepseaport.config import AccountConfig
-from deepseaport.dry_run import create_dry_app
-from deepseaport.server import MODELS, create_app
+from zourcewell import dry_run as dry_run_mod
+from zourcewell import server_routes
+from zourcewell.config import AccountConfig
+from zourcewell.dry_run import create_dry_app
+from zourcewell.server import MODELS, create_app
 from support import settings as _settings
 
 MSGS = [{"role": "user", "content": "hi"}]

@@ -1,4 +1,4 @@
-# deepseaport architecture & reverse-engineering notes
+# zourcewell architecture & reverse-engineering notes
 
 How the bridge works and everything non-obvious discovered while building it.
 Read this before touching `providers/deepseek/*`, `providers/qwen/*`,
@@ -10,7 +10,7 @@ Read this before touching `providers/deepseek/*`, `providers/qwen/*`,
 harness -> FastAPI (/v1/*, OpenAI-compatible) -> curl_cffi (Chrome TLS) -> chat.deepseek.com
                                                         ^
 Obscura (h4ckf0r0day/obscura, headless browser) ________|
-  - owns persistent profile (~/.deepseaport/obscura-profile)
+  - owns persistent profile (~/.zourcewell/obscura-profile)
   - solves AWS WAF JS challenge, holds `aws-waf-token` cookie
   - used only for WAF/hot-path; not for login
 
@@ -151,7 +151,7 @@ required; `Cookie: token=<jwt>` + solved WAF jar; `Authorization: Bearer`
 kept too) → best-effort `DELETE /api/v2/chats/{id}`. Qwen SSE is
 OpenAI-style JSON per `data:` line (no `{p,v}` protocol); 401s probe
 `GET /api/v2/auths/` first (ban masquerading as 401 → 403 + failover), then
-one direct re-signin. Details in `src/deepseaport/providers/qwen/README.md`.
+one direct re-signin. Details in `src/zourcewell/providers/qwen/README.md`.
 
 Two Qwen-specific rules follow from its credential being a **JWT** rather than
 DeepSeek's opaque 64-char token, and from its chat id being a value the caller
@@ -200,7 +200,7 @@ Qwen SSE differs: OpenAI-style JSON per `data:` line, `delta.phase`
 (`think`/`think_summary` → thinking, `answer`/absent/`tool_call` →
 content), finish on `delta.status == "finished"` / `done:true` /
 `data: [DONE]`, usage from `input_tokens`/`output_tokens`/`total_tokens`.
-See `src/deepseaport/providers/qwen/README.md`.
+See `src/zourcewell/providers/qwen/README.md`.
 
 ### Outbound SSE error frames (the bridge's own, not an upstream's)
 
@@ -265,7 +265,7 @@ never had one (OpenAI types it as optional).
   back to the Obscura driver on it — only a produced token or a confirmed ban
   ends the login attempt.
 - Old/stale tokens fail with `40003 Authorization Failed` at session create.
-- `POST /v1/accounts/unblock` (and `deepseaport accounts unblock [identifier]`)
+- `POST /v1/accounts/unblock` (and `zourcewell accounts unblock [identifier]`)
   clears the in-memory cooldown and the persisted ban marker.
 
 ## Account routes: what `{identifier}` may be
@@ -366,12 +366,12 @@ and fullwidth), `{"tool_calls":[…]}` (balanced-brace scan),
 name+arguments objects, and a last-resort recovery for unescaped
 OpenAI-style `arguments`. Unknown names are dropped, args are normalized to
 JSON strings, ids are `call_001…`. Per-argument size is capped by
-`Settings.tool_args_max_chars` / `DEEPSEAPORT_MAX_ARGS_CHARS` (default
-200000); `DEEPSEAPORT_MAX_BARE_OBJECTS` (default 40,
+`Settings.tool_args_max_chars` / `ZOURCEWELL_MAX_ARGS_CHARS` (default
+200000); `ZOURCEWELL_MAX_BARE_OBJECTS` (default 40,
 `core/tools/common.py:37`) bounds how many JSON objects the parser scans for a
 bare name+arguments call, and `MAX_SCAN_OBJECTS` / `MAX_TOTAL_CALLS` reuse the
 same number so one env knob bounds every scan. Opt-in
-`Settings.forgiving_toolcalls` / `DEEPSEAPORT_FORGIVING_TOOLCALLS` (default off)
+`Settings.forgiving_toolcalls` / `ZOURCEWELL_FORGIVING_TOOLCALLS` (default off)
 enables the forgiving bucket
 (markup repairs: pipe/space/HTML-escaped DSML markers, smart attribute
 delimiters with verbatim values, single-tool missing-name/param inference,
@@ -478,16 +478,16 @@ no search). `/v1/models` serves the union of the active providers.
   `input()` REPL in front posting non-stream completions to
   `127.0.0.1:port` (Bearer = first `settings.keys` entry when set).
   Commands: `/model [name]`, `/clear`, `/quit|/exit`, `/help`.
-- Chat log silence: `_silence_chat_logs()` raises `deepseaport.*`,
+- Chat log silence: `_silence_chat_logs()` raises `zourcewell.*`,
   `uvicorn*` and root to `ERROR` before the server thread starts, and chat mode
   pins the runtime-only `settings._runtime_log_level = "ERROR"` — the lifespan
   reads `_effective_log_level()` as `_runtime_log_level` > `log_level` > INFO —
-  so it stays quiet too (this is what used to spray `deepseaport.obscura`
+  so it stays quiet too (this is what used to spray `zourcewell.obscura`
   warmup INFO across the `You:` line). The saved `log_level` field is never
   touched, so an in-session save (`/model`) cannot persist the override. Levels
   are restored on every exit path, including failed start.
 - Chat model memory: `/model` persists to `settings.chat_model`
-  (`config.json` + `DEEPSEAPORT_CHAT_MODEL` env); unknown/empty values fall
+  (`config.json` + `ZOURCEWELL_CHAT_MODEL` env); unknown/empty values fall
   back to `deepseek-flash` (`_initial_chat_model`).
 - Accounts TUI: `Token (y = auto-token)` — `y` runs provider-specific
   auto-login (`confirmed=True`, no second prompt): DeepSeek via Obscura
@@ -502,7 +502,7 @@ no search). `/v1/models` serves the union of the active providers.
   texts stored but sends nothing); `append_top`/`append_bottom` are free-form
   multi-line strings wrapped around
   every outgoing prompt in `_prepare` (top at the absolute top, bottom at the
-  absolute bottom); `""` disables. Env: `DEEPSEAPORT_ENABLE_APPEND`, `DEEPSEAPORT_APPEND_TOP/BOTTOM`.
+  absolute bottom); `""` disables. Env: `ZOURCEWELL_ENABLE_APPEND`, `ZOURCEWELL_APPEND_TOP/BOTTOM`.
   `AccountConfig.__post_init__` normalizes pasted token JSON (including
   `{"value":null}`) through `tokens.py`, so broken shapes become an empty token
   instead of a mysterious 40003 later. Bans found by the server/login page are
@@ -532,7 +532,7 @@ no search). `/v1/models` serves the union of the active providers.
   is where the rule is documented, but every other env read in `config.py`
   follows it too (the `_bool` / `_int` / `_str` / `_text` closures,
   `active_account`, `browser_bin`, `_providers_list`, the import-time
-  `DEEPSEAPORT_DATA` / `_env_dir`): `os.environ.get(K, raw.get(...))` returns
+  `ZOURCEWELL_DATA` / `_env_dir`): `os.environ.get(K, raw.get(...))` returns
   `""` for `K=`, and an empty string is truthy as far as the rest of the loader
   is concerned, so a shell profile that exports `KEY=` (`set -a; . .env`)
   silently reverted each field to its built-in default — `OBSCURA_BIN=` sent the
@@ -594,15 +594,15 @@ no search). `/v1/models` serves the union of the active providers.
   (`config._app_dir()` → `Path(sys.executable).parent` when frozen, the checkout
   root only when a `pyproject.toml` sits beside it, else the per-user dir —
   `%APPDATA%` / `$XDG_CONFIG_HOME` / `~/.config`, the same base
-  `DEEPSEAPORT_DATA` defaults under), so zipping
+  `ZOURCEWELL_DATA` defaults under), so zipping
   it by hand ships `config.json` — gitignored or not. The script reads `dist/`,
   strips `*.bak`/`*.tmp`/`*.log`/profile dirs, refuses to build when a
   `config.json` or any JSON with non-empty `token`/`password`/`keys` is present,
   and never writes inside the source tree. Guarded by
-  `tests/test_release_guard.py`; `deepseaport.spec` has no `datas` exclusion,
+  `tests/test_release_guard.py`; `zourcewell.spec` has no `datas` exclusion,
   so this script is the packaging step, and `.github/workflows/release.yml`
   runs `--check` as a hard gate on a `v*` tag before it publishes.
-- `data/` (gitignored): PoW wasm. `~/.deepseaport/obscura-profile`: WAF cookies + login localStorage.
+- `data/` (gitignored): PoW wasm. `~/.zourcewell/obscura-profile`: WAF cookies + login localStorage.
 - `providers/deepseek/real_browser.py` drives Helium/Chrome/Edge/Chromium
   login over CDP; `core/browser_paths.py` discovers the binary.
   `providers/deepseek/auth.py` chooses real browser first and falls back to
@@ -651,7 +651,7 @@ no search). `/v1/models` serves the union of the active providers.
   three delegate generic loops to `core/engine.py`.
 - Registry (`core/registry.py:26-27`): lazy discovery via `_BUILTIN_MODULES`
   (`deepseek`, `qwen`, `opencode`) + `create_provider()` factories;
-  failures log and never raise; never imports `deepseaport.server` (no cycle).
+  failures log and never raise; never imports `zourcewell.server` (no cycle).
   The imports run under `_LOAD_LOCK`, and the registry plus the `_LOADED` flag
   are published as one step (`core/registry.py:45-82`), so a concurrent reader
   never sees a half-populated registry (a 404 for a valid model) and a module
@@ -663,7 +663,7 @@ no search). `/v1/models` serves the union of the active providers.
 - Account binding: `AccountConfig.provider` pins an account to one upstream
   (default `deepseek`); TUI/CLI `accounts add` binds the selected provider.
 - Selection: first-menu provider gate + `--provider`/`--providers` flags over
-  `Settings.provider`/`providers` (`config.json`, `DEEPSEAPORT_PROVIDER(S)`).
+  `Settings.provider`/`providers` (`config.json`, `ZOURCEWELL_PROVIDER(S)`).
 - Multi mode: 2+ ids in `Settings.providers`; `/v1/models` serves the union
   catalogue; each provider keeps independent auto-failover (no shared CURRENT).
   A **single** entry is ignored rather than honoured
@@ -675,7 +675,7 @@ no search). `/v1/models` serves the union of the active providers.
   set is process-global because `active_provider_ids` sits on the per-request
   path), naming the entry and the one in effect.
 - Shared shim: `core/openai._openai_response` shapes OpenAI replies for all
-  providers; tool parsing resolves through `deepseaport.server.parse_tool_calls`
+  providers; tool parsing resolves through `zourcewell.server.parse_tool_calls`
   at call time so test monkeypatches keep working.
 - Cross-provider contract that every adapter must keep (see "Request
   lifecycle" for the code citations): a bare 401 is `INVALID_TOKEN` — retry,
@@ -701,7 +701,7 @@ no search). `/v1/models` serves the union of the active providers.
   `core/engine.py` — do NOT copy `completion_service.py`. See `PROVIDERS.md`.
 - Back-compat: the old root paths (`deepseaport.client`, `deepseaport.pow`,
   `deepseaport.tools_support`, ...) are gone — import from where the code lives
-  (`PROVIDERS.md`, "Back-compat notes"). `deepseaport.server` stays thin wiring
+  (`PROVIDERS.md`, "Back-compat notes"). `zourcewell.server` stays thin wiring
   whose `_pool` / `_openai_response` / `parse_tool_calls` attributes remain
   patchable seams.
 
@@ -711,7 +711,7 @@ The third registered provider and the odd one out: it is a **local process**,
 so none of the web-provider machinery applies. It speaks opencode v2's HttpApi
 (every route under `/api`, live-verified against 2.0.29), so the wire notes
 below are v2-specific. Full protocol detail lives in
-`src/deepseaport/providers/opencode/README.md`; this is the shape.
+`src/zourcewell/providers/opencode/README.md`; this is the shape.
 
 - **`requires_accounts = False`** (`providers/opencode/provider.py:31`). No
   tokens, no `AccountPool`, no `AccountConfig`. The route layer reads the flag
@@ -731,8 +731,8 @@ below are v2-specific. Full protocol detail lives in
   instead of talking to whatever the operator happens to be running. The child
   gets child-only env: `XDG_CONFIG_HOME` → an empty dir,
   `OPENCODE_CONFIG_DIR` → a generated dir carrying a `strip-system.js` plugin,
-  `OPENCODE_CONFIG_CONTENT` → a generated `deepseaport-passthrough` text-only
-  agent, plus `DEEPSEAPORT_*`/`DEEPSEEK_*`/`OPENCODE_*` stripped and an
+  `OPENCODE_CONFIG_CONTENT` → a generated `zourcewell-passthrough` text-only
+  agent, plus `ZOURCEWELL_*`/`DEEPSEEK_*`/`OPENCODE_*` stripped and an
   ephemeral basic-auth password. The env strip runs *before* those keys are
   set (`_child_env`), which is the actual security boundary: without it a
   sourced `.env` would land verbatim in a process the model can be talked into
@@ -747,15 +747,15 @@ below are v2-specific. Full protocol detail lives in
   `TerminateProcess`; `kill(pid, 0)` on POSIX), and a dead pid — the normal
   state of `serve.json`, since the atexit kill retires the process and not the
   file — is skipped silently instead of being reported as a stale serve left
-  running. Opt out with `DEEPSEAPORT_OPENCODE_BASE` (use your own serve
-  as-is) or `DEEPSEAPORT_OPENCODE_MANAGED=0`.
+  running. Opt out with `ZOURCEWELL_OPENCODE_BASE` (use your own serve
+  as-is) or `ZOURCEWELL_OPENCODE_MANAGED=0`.
 - **Since v2 the serve always requires HTTP basic auth.** It generates a
   password at boot and prints it unless `OPENCODE_SERVER_PASSWORD` pins one, so
   the managed child sets that env and hands the same value to the client
   (`serve.json` stores it — DPAPI-wrapped for the current user on Windows,
   cleartext under 0700/0600 on POSIX; a probed base must be given the password
   too). An operator's own serve is used with
-  `DEEPSEAPORT_OPENCODE_USERNAME/PASSWORD`; a 401 is terminal and names both.
+  `ZOURCEWELL_OPENCODE_USERNAME/PASSWORD`; a 401 is terminal and names both.
 - **The turn is prompt-then-poll.** v2 has no blocking message endpoint:
   `POST /api/session/:id/prompt {text}` returns at once with the created user
   item while the agent loop runs in the background, so `send_message` polls
@@ -818,7 +818,7 @@ below are v2-specific. Full protocol detail lives in
   `User-Agent` (`opencode/<cli version>`), `x-opencode-client` (default `cli`),
   `x-opencode-project` (default `global`) and `X-Session-ID`. Sessions are
   pinned to the caller's working directory via `location.directory` on session
-  create (`DEEPSEAPORT_OPENCODE_WORKDIR`) so native tools run where the harness
+  create (`ZOURCEWELL_OPENCODE_WORKDIR`) so native tools run where the harness
   expects; v2 has no `?directory=` query. Client failures are `RuntimeError`s
   with a code prefix the classifier reads (`OPENCODE_SERVE_DOWN`,
   `OPENCODE_HTTP_<status>`, `OPENCODE_UPSTREAM`, `OPENCODE_EMPTY`,
@@ -851,7 +851,7 @@ below are v2-specific. Full protocol detail lives in
 
 The default run (`pytest -m "not live" -q`, exactly what CI runs) is fully
 hermetic: `tests/conftest.py` points the config/data at a temp tree, strips
-every `DEEPSEAPORT_*`/`DEEPSEEK_*`/`OBSCURA_*` var, raises on any non-loopback
+every `ZOURCEWELL_*`/`DEEPSEEK_*`/`OBSCURA_*` var, raises on any non-loopback
 socket connect, and asserts the imported package is THIS checkout's `src/`.
 That guard is why the suite is trustworthy — and also why it has a hard limit.
 

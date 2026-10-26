@@ -17,7 +17,7 @@ import argparse
 
 from support import on_disk, write_config
 
-from deepseaport.cli import main as cli_main
+from zourcewell.cli import main as cli_main
 
 
 def _two_provider_config(tmp_path) -> str:
@@ -111,7 +111,7 @@ def test_remove_scope_survives_a_namespace_without_the_provider_attr(
         tmp_path, capsys):
     """Direct callers (tests, embedders) build Namespaces by hand; a missing
     ``provider`` attribute must read as "no flag", not raise."""
-    from deepseaport.cli import cmd_accounts
+    from zourcewell.cli import cmd_accounts
 
     cfg = _two_provider_config(tmp_path)
     args = argparse.Namespace(config=cfg, accounts_action="remove",

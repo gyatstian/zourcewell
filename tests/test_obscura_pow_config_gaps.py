@@ -13,8 +13,8 @@ from subprocess import CompletedProcess
 
 import pytest
 
-from deepseaport.providers.deepseek import pow as PoW
-from deepseaport.config import (
+from zourcewell.providers.deepseek import pow as PoW
+from zourcewell.config import (
     DEFAULT_PORT,
     AccountConfig,
     Settings,
@@ -22,14 +22,14 @@ from deepseaport.config import (
     _default_config_path,
     load_settings,
 )
-from deepseaport.core.obscura_bridge import (
+from zourcewell.core.obscura_bridge import (
     ObscuraBridge,
     WafState,
     _profile_key,
     get_default_bridge,
     register_default_bridge,
 )
-from deepseaport.core.tokens import extract_token
+from zourcewell.core.tokens import extract_token
 
 
 def _bridge(tmp_path, name="prof", **kw):
@@ -45,30 +45,30 @@ _WARMUP_HANDSHAKE_TIMEOUT = 10.0
 
 
 _CONFIG_ENV_KEYS = [
-    "DEEPSEAPORT_CONFIG",
-    "DEEPSEAPORT_KEYS",
-    "DEEPSEAPORT_TOKEN",
+    "ZOURCEWELL_CONFIG",
+    "ZOURCEWELL_KEYS",
+    "ZOURCEWELL_TOKEN",
     "DEEPSEEK_TOKEN",
-    "DEEPSEAPORT_EMAIL",
+    "ZOURCEWELL_EMAIL",
     "DEEPSEEK_EMAIL",
-    "DEEPSEAPORT_PASSWORD",
+    "ZOURCEWELL_PASSWORD",
     "DEEPSEEK_PASSWORD",
-    "DEEPSEAPORT_PORT",
-    "DEEPSEAPORT_ACTIVE_ACCOUNT",
+    "ZOURCEWELL_PORT",
+    "ZOURCEWELL_ACTIVE_ACCOUNT",
     "OBSCURA_BIN",
     "OBSCURA_PROFILE",
-    "DEEPSEAPORT_BROWSER_BIN",
-    "DEEPSEAPORT_BROWSER_HEADLESS",
-    "DEEPSEAPORT_LISTEN",
-    "DEEPSEAPORT_ENABLE_TOOLS",
-    "DEEPSEAPORT_WARMUP_ON_STARTUP",
-    "DEEPSEAPORT_AUTO_DELETE_SESSION",
-    "DEEPSEAPORT_MAX_RETRIES",
-    "DEEPSEAPORT_PARALLEL_FETCH",
-    "DEEPSEAPORT_USE_MULTIPLE_ACCOUNTS",
-    "DEEPSEAPORT_LOG_LEVEL",
-    "DEEPSEAPORT_STREAM_MODE",
-    "DEEPSEAPORT_CHAT_MODEL",
+    "ZOURCEWELL_BROWSER_BIN",
+    "ZOURCEWELL_BROWSER_HEADLESS",
+    "ZOURCEWELL_LISTEN",
+    "ZOURCEWELL_ENABLE_TOOLS",
+    "ZOURCEWELL_WARMUP_ON_STARTUP",
+    "ZOURCEWELL_AUTO_DELETE_SESSION",
+    "ZOURCEWELL_MAX_RETRIES",
+    "ZOURCEWELL_PARALLEL_FETCH",
+    "ZOURCEWELL_USE_MULTIPLE_ACCOUNTS",
+    "ZOURCEWELL_LOG_LEVEL",
+    "ZOURCEWELL_STREAM_MODE",
+    "ZOURCEWELL_CHAT_MODEL",
 ]
 
 
@@ -127,14 +127,14 @@ def test_profile_key_different_profiles_different_keys(tmp_path):
 
 
 def test_discover_path_hit(monkeypatch):
-    monkeypatch.setattr("deepseaport.core.obscura_bridge.shutil.which",
+    monkeypatch.setattr("zourcewell.core.obscura_bridge.shutil.which",
                         lambda name: "/usr/bin/obscura" if name == "obscura" else None)
     assert ObscuraBridge._discover() == "/usr/bin/obscura"
 
 
 def test_discover_local_glob_hit(monkeypatch, tmp_path):
     (tmp_path / "obscura").write_text("x", encoding="utf-8")
-    monkeypatch.setattr("deepseaport.core.obscura_bridge.shutil.which", lambda name: None)
+    monkeypatch.setattr("zourcewell.core.obscura_bridge.shutil.which", lambda name: None)
     monkeypatch.setattr(ObscuraBridge, "_search_roots",
                         staticmethod(lambda: [tmp_path]))
     found = ObscuraBridge._discover()
@@ -142,7 +142,7 @@ def test_discover_local_glob_hit(monkeypatch, tmp_path):
 
 
 def test_discover_fallback(monkeypatch):
-    monkeypatch.setattr("deepseaport.core.obscura_bridge.shutil.which", lambda name: None)
+    monkeypatch.setattr("zourcewell.core.obscura_bridge.shutil.which", lambda name: None)
     monkeypatch.setattr(ObscuraBridge, "_search_roots", staticmethod(lambda: []))
     assert ObscuraBridge._discover() == "obscura"
 
@@ -154,7 +154,7 @@ def test_version_exception_returns_unavailable(monkeypatch, tmp_path):
     b = _bridge(tmp_path, "ver")
     def _boom(*a, **k):
         raise RuntimeError("boom")
-    monkeypatch.setattr("deepseaport.core.obscura_bridge.subprocess.run", _boom)
+    monkeypatch.setattr("zourcewell.core.obscura_bridge.subprocess.run", _boom)
     assert b.version().startswith("unavailable:")
 
 
@@ -270,7 +270,7 @@ def test_warmup_follower_shares_leader(tmp_path, monkeypatch):
     classification. Releasing the leader before the follower signal would be
     the only way this could flake, and the assert stops it there.
     """
-    from deepseaport.core import obscura_bridge as bridge_mod
+    from zourcewell.core import obscura_bridge as bridge_mod
 
     b = _bridge(tmp_path, "single")
     b.state = WafState(cookies={}, user_agent="ua-preset", warmed=False)
@@ -360,7 +360,7 @@ def test_pow_solve_wrong_algorithm_raises():
 def test_pow_solve_propagates_engine_error(monkeypatch):
     def _boom():
         raise FileNotFoundError("no wasm")
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow._get_engine_module", _boom)
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow._get_engine_module", _boom)
     with pytest.raises(FileNotFoundError):
         PoW.solve(PoW.ALGORITHM, "c", "s", 1, 1)
 
@@ -370,7 +370,7 @@ def test_pow_wasm_path_caching_same():
 
 
 def test_pow_wasm_name_traversal_rejected(monkeypatch):
-    """F8: DEEPSEAPORT_WASM_NAME was concatenated onto DATA_DIR unguarded.
+    """F8: ZOURCEWELL_WASM_NAME was concatenated onto DATA_DIR unguarded.
 
     The file is then instantiated and executed by wasmtime, so an env var must
     not be able to point the write outside the data dir. The upstream asset is
@@ -380,7 +380,7 @@ def test_pow_wasm_name_traversal_rejected(monkeypatch):
                 "sub\\dir.wasm", "C:evil.wasm", "", "   ", "a..b.wasm"):
         monkeypatch.setattr(PoW, "WASM_NAME", bad)
         monkeypatch.setattr(PoW, "_WASM_PATH", None)
-        with pytest.raises(RuntimeError, match="unsafe DEEPSEAPORT_WASM_NAME"):
+        with pytest.raises(RuntimeError, match="unsafe ZOURCEWELL_WASM_NAME"):
             PoW.wasm_path()
     # A legitimate hash-named file still resolves inside DATA_DIR.
     monkeypatch.setattr(PoW, "WASM_NAME", "sha3_wasm_bg.7b9ca65ddd.wasm")
@@ -394,7 +394,7 @@ def test_pow_wasm_name_traversal_rejected(monkeypatch):
 
 def test_pow_wasm_url_override_warns_loudly(monkeypatch, tmp_path, caplog):
     """The download is only checked for size + magic, then executed."""
-    monkeypatch.setenv("DEEPSEAPORT_WASM_URL", "https://evil.example/x.wasm")
+    monkeypatch.setenv("ZOURCEWELL_WASM_URL", "https://evil.example/x.wasm")
     monkeypatch.setattr(PoW, "_warned_wasm_url", False)
     existing = tmp_path / "w.wasm"
     existing.write_bytes(b"x" * 2000)
@@ -402,16 +402,16 @@ def test_pow_wasm_url_override_warns_loudly(monkeypatch, tmp_path, caplog):
     monkeypatch.setattr("curl_cffi.requests.get",
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError("existing file must not download")))
-    with caplog.at_level("WARNING", logger="deepseaport.pow"):
+    with caplog.at_level("WARNING", logger="zourcewell.pow"):
         PoW.ensure_wasm()
-    assert any("DEEPSEAPORT_WASM_URL" in r.getMessage()
+    assert any("ZOURCEWELL_WASM_URL" in r.getMessage()
                and "https://evil.example/x.wasm" in r.getMessage()
                for r in caplog.records)
     # No override -> no warning.
     caplog.clear()
-    monkeypatch.delenv("DEEPSEAPORT_WASM_URL", raising=False)
+    monkeypatch.delenv("ZOURCEWELL_WASM_URL", raising=False)
     monkeypatch.setattr(PoW, "_warned_wasm_url", False)
-    with caplog.at_level("WARNING", logger="deepseaport.pow"):
+    with caplog.at_level("WARNING", logger="zourcewell.pow"):
         PoW.ensure_wasm()
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
@@ -419,7 +419,7 @@ def test_pow_wasm_url_override_warns_loudly(monkeypatch, tmp_path, caplog):
 def test_pow_ensure_wasm_skips_download(monkeypatch, tmp_path):
     target = tmp_path / "wasm.bin"
     target.write_bytes(b"x" * 2000)
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.wasm_path", lambda: target)
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.wasm_path", lambda: target)
 
     def _boom(*a, **k):
         raise AssertionError("download must not be called")
@@ -434,7 +434,7 @@ def test_obscura_profile_dir_is_owner_only(tmp_path):
     import os
     import stat
 
-    from deepseaport.core import obscura_bridge as OB
+    from zourcewell.core import obscura_bridge as OB
 
     profile = tmp_path / "prof-0700"
     OB.secure_dir(str(profile), "obscura profile")
@@ -453,7 +453,7 @@ def test_obscura_bridge_constructor_tightens_profile(tmp_path):
     import os
     import stat
 
-    from deepseaport.core import obscura_bridge as OB
+    from zourcewell.core import obscura_bridge as OB
 
     profile = tmp_path / "prof-ctor"
     bridge = _bridge(tmp_path, name="prof-ctor")
@@ -464,7 +464,7 @@ def test_obscura_bridge_constructor_tightens_profile(tmp_path):
 
 
 def test_obscura_secure_dir_never_raises(tmp_path, monkeypatch):
-    from deepseaport.core import obscura_bridge as OB
+    from zourcewell.core import obscura_bridge as OB
 
     monkeypatch.setattr(OB.Path, "mkdir",
                         lambda *a, **k: (_ for _ in ()).throw(PermissionError(
@@ -475,7 +475,7 @@ def test_obscura_secure_dir_never_raises(tmp_path, monkeypatch):
 def test_pow_get_engine_module_cache_hit(monkeypatch, tmp_path):
     wp = tmp_path / "m.wasm"
     wp.write_bytes(b"\x00asm1234")
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.wasm_path", lambda: wp)
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.wasm_path", lambda: wp)
     orig_e, orig_m, orig_k = PoW._ENGINE, PoW._MODULE, PoW._MODULE_KEY
     PoW._ENGINE = None
     PoW._MODULE = None
@@ -600,7 +600,7 @@ def test_save_payload_shape(tmp_path):
 def test_default_config_path_env_wins(monkeypatch, tmp_path):
     _clean_env(monkeypatch)
     custom = tmp_path / "custom.json"
-    monkeypatch.setenv("DEEPSEAPORT_CONFIG", str(custom))
+    monkeypatch.setenv("ZOURCEWELL_CONFIG", str(custom))
     assert _default_config_path() == Path(str(custom))
 
 
@@ -633,7 +633,7 @@ def test_keys_env_override(monkeypatch, tmp_path):
     _clean_env(monkeypatch)
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"keys": ["filekey"]}), encoding="utf-8")
-    monkeypatch.setenv("DEEPSEAPORT_KEYS", " a ,b,, c ")
+    monkeypatch.setenv("ZOURCEWELL_KEYS", " a ,b,, c ")
     assert load_settings(str(p)).keys == ["a", "b", "c"]
 
 
@@ -641,7 +641,7 @@ def test_env_token_replace_when_empty(monkeypatch, tmp_path):
     _clean_env(monkeypatch)
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"accounts": []}), encoding="utf-8")
-    monkeypatch.setenv("DEEPSEAPORT_TOKEN", "envtok1234567890")
+    monkeypatch.setenv("ZOURCEWELL_TOKEN", "envtok1234567890")
     s = load_settings(str(p))
     assert len(s.accounts) == 1
     assert s.accounts[0].token == "envtok1234567890"
@@ -652,7 +652,7 @@ def test_env_token_append_when_nonempty(monkeypatch, tmp_path):
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"accounts": [{"email": "a@x.com", "token": "filetok1234567890"}]}),
                  encoding="utf-8")
-    monkeypatch.setenv("DEEPSEAPORT_TOKEN", "envtok1234567890")
+    monkeypatch.setenv("ZOURCEWELL_TOKEN", "envtok1234567890")
     s = load_settings(str(p))
     assert len(s.accounts) == 2
     assert s.accounts[0].email == "a@x.com"
@@ -663,7 +663,7 @@ def test_bool_invalid_string_fallback(monkeypatch, tmp_path):
     _clean_env(monkeypatch)
     p = tmp_path / "c.json"
     p.write_text(json.dumps({}), encoding="utf-8")
-    monkeypatch.setenv("DEEPSEAPORT_ENABLE_TOOLS", "maybe")
+    monkeypatch.setenv("ZOURCEWELL_ENABLE_TOOLS", "maybe")
     assert load_settings(str(p)).enable_tools is False
 
 
@@ -671,8 +671,8 @@ def test_int_invalid_default(monkeypatch, tmp_path):
     _clean_env(monkeypatch)
     p = tmp_path / "c.json"
     p.write_text(json.dumps({}), encoding="utf-8")
-    monkeypatch.setenv("DEEPSEAPORT_PORT", "not-a-number")
-    monkeypatch.setenv("DEEPSEAPORT_MAX_RETRIES", "bad")
+    monkeypatch.setenv("ZOURCEWELL_PORT", "not-a-number")
+    monkeypatch.setenv("ZOURCEWELL_MAX_RETRIES", "bad")
     s = load_settings(str(p))
     assert s.port == DEFAULT_PORT
     assert s.max_retries == 1
@@ -687,7 +687,7 @@ def test_str_case_insensitive_and_bad_default(monkeypatch, tmp_path):
     assert load_settings(str(p)).log_level == "INFO"
     _clean_env(monkeypatch)
     p.write_text(json.dumps({}), encoding="utf-8")
-    monkeypatch.setenv("DEEPSEAPORT_LOG_LEVEL", "info")
+    monkeypatch.setenv("ZOURCEWELL_LOG_LEVEL", "info")
     assert load_settings(str(p)).log_level == "INFO"
 
 
@@ -695,5 +695,5 @@ def test_chat_model_env_override(monkeypatch, tmp_path):
     _clean_env(monkeypatch)
     p = tmp_path / "c.json"
     p.write_text(json.dumps({}), encoding="utf-8")
-    monkeypatch.setenv("DEEPSEAPORT_CHAT_MODEL", "custom-model")
+    monkeypatch.setenv("ZOURCEWELL_CHAT_MODEL", "custom-model")
     assert load_settings(str(p)).chat_model == "custom-model"

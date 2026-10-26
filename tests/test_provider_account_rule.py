@@ -13,8 +13,8 @@ import inspect
 
 import pytest
 
-from deepseaport.core import pools, registry
-from deepseaport.core.provider import Provider
+from zourcewell.core import pools, registry
+from zourcewell.core.provider import Provider
 
 
 class _Stub(Provider):
@@ -135,7 +135,7 @@ def test_ui_surfaces_delegate_instead_of_copying():
     would still pass every behavioural test above. The point is that there is
     one implementation, so the check has to look at the implementation.
     """
-    from deepseaport import chat_ui, tui
+    from zourcewell import chat_ui, tui
 
     for mod in (tui, chat_ui):
         fn = mod._active_providers_need_accounts

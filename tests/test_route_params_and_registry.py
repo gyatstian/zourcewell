@@ -34,12 +34,12 @@ import threading
 import pytest
 from fastapi.testclient import TestClient
 
-from deepseaport.config import AccountConfig, Settings
-from deepseaport.core import registry
-from deepseaport.core.provider import ModelSpec, Provider
-from deepseaport.server import create_app
+from zourcewell.config import AccountConfig, Settings
+from zourcewell.core import registry
+from zourcewell.core.provider import ModelSpec, Provider
+from zourcewell.server import create_app
 from support import settings as _settings
-from deepseaport.server_routes import (
+from zourcewell.server_routes import (
     _extract_passthrough,
     _parse_reasoning_effort,
     _prepare,
@@ -128,7 +128,7 @@ def test_invalid_reasoning_effort_is_reported_in_unsupported_params(body_patch):
     {"reasoning": {"effort": "ultra"}},
 ])
 def test_invalid_reasoning_effort_logs_the_warning(body_patch, caplog):
-    with caplog.at_level(logging.WARNING, logger="deepseaport.server"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.server"):
         _prepare(_body(**body_patch), _settings())
 
     assert "ignoring unsupported OpenAI params" in caplog.text
@@ -215,7 +215,7 @@ def test_parallel_tool_calls_absent_is_not_reported():
 
 
 def test_parallel_tool_calls_logs_like_the_other_dropped_params(caplog):
-    with caplog.at_level(logging.WARNING, logger="deepseaport.server"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.server"):
         _prepare(_body(parallel_tool_calls=False), _settings())
 
     assert "parallel_tool_calls" in caplog.text
@@ -422,7 +422,7 @@ def test_failed_import_warns_exactly_once_per_process(isolated_registry,
     monkeypatch.setattr(isolated_registry, "importlib",
                         _StubImportlib(always_bad))
 
-    with caplog.at_level(logging.DEBUG, logger="deepseaport.providers"):
+    with caplog.at_level(logging.DEBUG, logger="zourcewell.providers"):
         isolated_registry.registered()
         isolated_registry.registered()
         isolated_registry.registered()
@@ -587,18 +587,18 @@ def test_resolve_model_is_stable_for_every_permutation_of_the_active_set():
 def test_both_public_endpoints_report_the_runtime_version():
     """``openapi_url`` is None, so before this a running server had NO version
     surface at all: a user genuinely could not ask what they were talking to.
-    One source (``deepseaport.__version__``), read from both endpoints.
+    One source (``zourcewell.__version__``), read from both endpoints.
     """
-    import deepseaport
+    import zourcewell
 
     client = TestClient(create_app(_settings()))
     health = client.get("/health").json()
     models = client.get("/v1/models").json()
 
-    assert health["version"] == deepseaport.__version__
-    assert models["version"] == deepseaport.__version__
+    assert health["version"] == zourcewell.__version__
+    assert models["version"] == zourcewell.__version__
     # A source checkout reads pyproject; "0.0.0" is the frozen-exe fallback.
-    assert deepseaport.__version__ not in ("", "0.0.0")
+    assert zourcewell.__version__ not in ("", "0.0.0")
 
 
 def test_the_version_endpoints_keep_their_existing_shape():

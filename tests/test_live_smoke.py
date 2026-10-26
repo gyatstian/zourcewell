@@ -2,7 +2,7 @@
 
 Why this file exists
 --------------------
-``deepseaport`` reverse-engineers **undocumented** web APIs: DeepSeek
+``zourcewell`` reverse-engineers **undocumented** web APIs: DeepSeek
 (``chat.deepseek.com`` behind AWS WAF + a wasm proof-of-work), Qwen
 (``chat.qwen.ai`` behind Aliyun WAF) and a local ``opencode`` CLI.
 Every other test in this repo runs
@@ -22,7 +22,7 @@ Design rules
 * **The three provider probes are ``@pytest.mark.live``; the two meta-tests
   deliberately are not.** ``tests/conftest.py`` skips the live marker unless
   the command line positively selects it, and it rewrites
-  ``DEEPSEAPORT_CONFIG``/``DEEPSEAPORT_DATA`` to a temp tree and installs a
+  ``ZOURCEWELL_CONFIG``/``ZOURCEWELL_DATA`` to a temp tree and installs a
   non-loopback socket guard for every other run. Selecting ``-m live`` lifts
   both and uses the operator's real config, so the probes add zero risk to
   ``python -m pytest -m "not live" -q`` (what CI runs) and zero network to
@@ -86,7 +86,7 @@ import pytest
 # The scrubber is the project's redaction policy for anything an upstream
 # said back to us: two shapes (a long opaque run, a dot-framed JWT), plus a
 # hard length clamp. See core/engine.py:scrub_upstream_text.
-from deepseaport.core.engine import scrub_upstream_text
+from zourcewell.core.engine import scrub_upstream_text
 
 # ---------------------------------------------------------------------------
 # Probe vocabulary
@@ -365,7 +365,7 @@ def _ready_accounts(settings, pid: str):
     cross-provider borrow. That borrow would hand one upstream another's live
     credentials (a Qwen ES256 JWT replayed to chat.deepseek.com).
     """
-    from deepseaport.core import pools
+    from zourcewell.core import pools
 
     bound = pools.accounts_for_provider(settings, pid)
     if not bound:
@@ -374,14 +374,14 @@ def _ready_accounts(settings, pid: str):
     with_token = [a for a in bound if str(getattr(a, "token", "") or "").strip()]
     if not with_token:
         return [], (f"no {pid} account has a token "
-                    f"(run: deepseaport login --provider {pid})")
+                    f"(run: zourcewell login --provider {pid})")
     now = time.time()
     usable = [a for a in with_token
               if not getattr(a, "banned", False)
               or float(getattr(a, "banned_until", 0.0) or 0.0) > now]
     if not usable:
         return [], (f"every {pid} account with a token is currently banned "
-                    f"(deepseaport accounts unblock)")
+                    f"(zourcewell accounts unblock)")
     return usable, ""
 
 
@@ -401,7 +401,7 @@ def _prime_waf(provider, bridge) -> tuple[bool, str]:
     try:
         if pid == "qwen":
             provider.warmup(bridge)
-            from deepseaport.providers.qwen import client as QC
+            from zourcewell.providers.qwen import client as QC
             return (bool(QC.qwen_waf_cookie_header()),
                     "qwen Aliyun jar: no acw_tc after prime_qwen_bridge "
                     "(obscura cannot solve chat.qwen.ai's challenge)")
@@ -420,17 +420,17 @@ def _prime_opencode() -> tuple[bool, str]:
     isolated ``opencode serve`` (its own port, its own generated config), and
     that boot is slow. Doing it here -- once, explicitly -- means the probe
     timeouts measure the model, not the installer. An operator's own serve
-    (``DEEPSEAPORT_OPENCODE_BASE``) is used as-is and needs no binary.
+    (``ZOURCEWELL_OPENCODE_BASE``) is used as-is and needs no binary.
     """
-    from deepseaport.providers.opencode import client as OC
-    from deepseaport.providers.opencode import managed_serve as MS
-    from deepseaport.providers.opencode import protocol as P
+    from zourcewell.providers.opencode import client as OC
+    from zourcewell.providers.opencode import managed_serve as MS
+    from zourcewell.providers.opencode import protocol as P
 
-    own_base = (os.environ.get("DEEPSEAPORT_OPENCODE_BASE", "") or "").strip()
+    own_base = (os.environ.get("ZOURCEWELL_OPENCODE_BASE", "") or "").strip()
     binary = shutil.which("opencode")
     if not own_base and not binary:
         return False, ("the `opencode` binary is not on PATH and "
-                       "DEEPSEAPORT_OPENCODE_BASE is unset")
+                       "ZOURCEWELL_OPENCODE_BASE is unset")
     if OC.health(timeout=10):
         return True, ""
     if own_base or not MS.managed_enabled():
@@ -447,10 +447,10 @@ def _build_gate() -> _Live:
     """Resolve the operator's environment, or explain precisely what is missing."""
     import httpx
 
-    from deepseaport.config import load_settings
-    from deepseaport.core import pools, registry
-    from deepseaport.core.obscura_bridge import ObscuraBridge
-    from deepseaport.server import create_app
+    from zourcewell.config import load_settings
+    from zourcewell.core import pools, registry
+    from zourcewell.core.obscura_bridge import ObscuraBridge
+    from zourcewell.server import create_app
 
     try:
         settings = load_settings()
@@ -521,7 +521,7 @@ def _build_gate() -> _Live:
         # the ban probes resolve it through ``get_default_bridge()``, not from
         # app.state (see server_concurrency.lifespan, which does both).
         app.state.bridge = bridge
-        from deepseaport.core.obscura_bridge import register_default_bridge
+        from zourcewell.core.obscura_bridge import register_default_bridge
         register_default_bridge(bridge)
 
     from fastapi.testclient import TestClient
@@ -1166,7 +1166,7 @@ def test_live_smoke_opencode():
 
     The cheapest and most reliable probe in the file: no account, no browser,
     no WAF -- just a local process. Skips when the binary is absent and no
-    ``DEEPSEAPORT_OPENCODE_BASE`` points at a running serve, or when the
+    ``ZOURCEWELL_OPENCODE_BASE`` points at a running serve, or when the
     managed instance could not be booted.
     """
     _run_provider_suite("opencode")
@@ -1318,7 +1318,7 @@ def test_live_smoke_gate_reasons_are_actionable():
     pure, hermetic, and it must keep running in CI so the skip messages stay
     trustworthy.
     """
-    from deepseaport.config import AccountConfig, Settings
+    from zourcewell.config import AccountConfig, Settings
 
     def _settings(accounts) -> Settings:
         return Settings(keys=["sk-live"], accounts=accounts, config_path="",
@@ -1333,7 +1333,7 @@ def test_live_smoke_gate_reasons_are_actionable():
         ([AccountConfig(email="a@x.com", provider="qwen")],
          "no account is bound", "accounts[].provider"),
         ([AccountConfig(email="a@x.com", provider="deepseek")],
-         "no deepseek account has a token", "deepseaport login"),
+         "no deepseek account has a token", "zourcewell login"),
         ([AccountConfig(email="a@x.com", token="t" * 64, banned=True)],
          "banned", "unblock"),
     ]

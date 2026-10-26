@@ -2,9 +2,9 @@
 
 import json
 
-from deepseaport.providers.deepseek import protocol as P
-from deepseaport.providers.deepseek.sse_parser import StreamParser, parse_sse_line
-from deepseaport.core import tools as T
+from zourcewell.providers.deepseek import protocol as P
+from zourcewell.providers.deepseek.sse_parser import StreamParser, parse_sse_line
+from zourcewell.core import tools as T
 
 
 def test_render_prompt_tool_cycle():
@@ -171,7 +171,7 @@ def test_system_prompt_forbids_dsml_and_lists_names():
 
 
 def test_prepare_appends_reminder_only_with_tools():
-    from deepseaport.server_routes import _prepare
+    from zourcewell.server_routes import _prepare
     body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}]}
     assert "Reminder" not in _prepare(body)["prompt"]
     body_tools = {**body, "tools": [{"type": "function", "function": {"name": "read"}}]}
@@ -188,7 +188,7 @@ def test_prepare_rejects_malformed_messages_as_400():
     import pytest
     from fastapi import HTTPException
 
-    from deepseaport.server_routes import _prepare
+    from zourcewell.server_routes import _prepare
 
     for bad in ({"role": "user"}, ["hi"], "hello", [["x"]], [None], 123):
         with pytest.raises(HTTPException) as exc_info:
@@ -235,7 +235,7 @@ def test_ban_format_day_month():
 
 
 def test_biz_error_includes_ban_expiry():
-    from deepseaport.providers.deepseek.client import _biz_error
+    from zourcewell.providers.deepseek.client import _biz_error
     data = {"code": 0, "msg": "", "data": {"biz_code": 5, "biz_msg": "user is muted",
             "biz_data": {"is_muted": 1, "mute_until": 1789555791.11}}}
     err = _biz_error(data)
@@ -252,8 +252,8 @@ def test_sse_parser_surfaces_ban():
 
 
 def test_ban_check_skips_short_tokens_no_network():
-    from deepseaport.accounts import check_ban_for_token, collect_ban_labels
-    from deepseaport.config import AccountConfig
+    from zourcewell.accounts import check_ban_for_token, collect_ban_labels
+    from zourcewell.config import AccountConfig
     # Short/test tokens never touch network.
     assert check_ban_for_token("t1") == (False, None)
     assert check_ban_for_token("") == (False, None)
@@ -261,14 +261,14 @@ def test_ban_check_skips_short_tokens_no_network():
 
 
 def test_account_config_normalizes_token_at_boundary():
-    from deepseaport.config import AccountConfig
+    from zourcewell.config import AccountConfig
 
     assert AccountConfig(token='{"value":null,"__version":"0"}').token == ""
     assert AccountConfig(token='{"value":"tok64"}').token == "tok64"
 
 
 def test_login_state_uses_visible_text_and_overlay_flag():
-    from deepseaport.providers.deepseek.auth import classify_page_state
+    from zourcewell.providers.deepseek.auth import classify_page_state
 
     # A healthy sign-in page with no visible challenge is not a captcha.
     assert classify_page_state(
@@ -282,7 +282,7 @@ def test_login_state_uses_visible_text_and_overlay_flag():
 
 
 def test_mcp_tool_iserror_becomes_exception():
-    from deepseaport.providers.deepseek.auth import _call
+    from zourcewell.providers.deepseek.auth import _call
 
     class _Fake:
         def call(self, name, arguments):
@@ -300,8 +300,8 @@ def test_parse_ban_until_from_human_login_text():
     import datetime as _dt
     import time as _time
 
-    from deepseaport.providers.deepseek import protocol as P
-    from deepseaport.providers.deepseek.auth import parse_ban_until
+    from zourcewell.providers.deepseek import protocol as P
+    from zourcewell.providers.deepseek.auth import parse_ban_until
 
     # ponytail: year is always relative (now+2) so this never rots like the old hardcoded 2026 date did.
     year = _dt.datetime.now().year + 2
@@ -319,8 +319,8 @@ def test_parse_ban_until_from_human_login_text():
 def test_persisted_banned_account_label_needs_no_token():
     import time as _time
 
-    from deepseaport.accounts import collect_ban_labels
-    from deepseaport.config import AccountConfig
+    from zourcewell.accounts import collect_ban_labels
+    from zourcewell.config import AccountConfig
 
     until = _time.time() + 86400
     acc = AccountConfig(email="banned@x.com", banned=True, banned_until=until)
@@ -331,7 +331,7 @@ def test_persisted_banned_account_label_needs_no_token():
 def test_settings_roundtrips_persisted_ban(tmp_path):
     import time as _time
 
-    from deepseaport.config import AccountConfig, Settings, load_settings
+    from zourcewell.config import AccountConfig, Settings, load_settings
 
     until = _time.time() + 86400
     path = tmp_path / "config.json"
@@ -345,15 +345,15 @@ def test_settings_roundtrips_persisted_ban(tmp_path):
 
 
 def test_real_browser_disabled_without_configuration(monkeypatch):
-    import deepseaport.providers.deepseek.real_browser as rb
-    from deepseaport.config import Settings
+    import zourcewell.providers.deepseek.real_browser as rb
+    from zourcewell.config import Settings
 
     monkeypatch.setattr(rb, "resolve_browser", lambda value: "")
     assert rb.login_with_real_browser("a@x.com", "pw", Settings(browser_bin="")) is None
 
 
 def test_settings_roundtrips_browser_fields(tmp_path):
-    from deepseaport.config import Settings, load_settings
+    from zourcewell.config import Settings, load_settings
 
     path = tmp_path / "config.json"
     settings = Settings(browser_bin="auto", browser_headless=True,
@@ -365,9 +365,9 @@ def test_settings_roundtrips_browser_fields(tmp_path):
 
 
 def test_real_browser_login_token_is_normalized(monkeypatch):
-    import deepseaport.providers.deepseek.real_browser as rb
-    from deepseaport.providers.deepseek.auth import browser_login
-    from deepseaport.config import Settings
+    import zourcewell.providers.deepseek.real_browser as rb
+    from zourcewell.providers.deepseek.auth import browser_login
+    from zourcewell.config import Settings
 
     raw = '{"value":"' + ("x" * 64) + '","__version":"0"}'
     monkeypatch.setattr(rb, "login_with_real_browser",
@@ -378,8 +378,8 @@ def test_real_browser_login_token_is_normalized(monkeypatch):
 
 
 def test_set_account_token_normalizes_json_wrapper():
-    from deepseaport.accounts import set_account_token
-    from deepseaport.config import AccountConfig, Settings
+    from zourcewell.accounts import set_account_token
+    from zourcewell.config import AccountConfig, Settings
 
     settings = Settings(accounts=[AccountConfig(email="a@x.com", token="old")])
     acc = set_account_token(settings, "a@x.com",
@@ -388,7 +388,7 @@ def test_set_account_token_normalizes_json_wrapper():
 
 
 def test_account_config_normalizes_token_on_every_assignment():
-    from deepseaport.config import AccountConfig
+    from zourcewell.config import AccountConfig
 
     acc = AccountConfig(email="a@x.com")
     acc.token = '{"value":"runtime-token","__version":"0"}'

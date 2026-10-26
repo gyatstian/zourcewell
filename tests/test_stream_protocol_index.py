@@ -26,8 +26,8 @@ import time
 
 from fastapi import HTTPException
 
-from deepseaport.core import engine as _engine
-from deepseaport.core import openai as _openai
+from zourcewell.core import engine as _engine
+from zourcewell.core import openai as _openai
 
 # Parser-shaped calls (what ``parse_tool_calls`` returns and what
 # ``_openai_response`` puts in ``message.tool_calls``).
@@ -326,8 +326,8 @@ def test_a_disconnect_is_noticed_inside_the_socket_read():
     is ever yielded, so the per-event cancel check in ``drain_attempt`` never
     runs and the read parks for the whole DEFAULT_TIMEOUT.
     """
-    from deepseaport.core import engine as _engine
-    from deepseaport.providers.deepseek import client as DS
+    from zourcewell.core import engine as _engine
+    from zourcewell.providers.deepseek import client as DS
 
     resp = _SilentStream()
     resp._push(b'data: {"p":"response/content","o":"APPEND","v":"hi"}\n')
@@ -372,7 +372,7 @@ def test_the_300s_budget_is_not_shortened_by_the_bounded_read():
     is built from plus the one that would move if someone "fixed" this by
     lowering the timeout instead.
     """
-    from deepseaport.providers.deepseek import client as DS
+    from zourcewell.providers.deepseek import client as DS
 
     assert DS.DEFAULT_TIMEOUT == 300, "the overall socket budget changed"
     assert 0 < DS._READ_SLICE_SECONDS < DS.DEFAULT_TIMEOUT, (
@@ -385,7 +385,7 @@ def test_drain_attempt_publishes_and_restores_the_cancel_token():
     ``drain_attempt`` runs on a shared producer thread pool, so a leaked token
     would cancel the NEXT request's read; a cleared one would break nesting.
     """
-    from deepseaport.core import engine as _engine
+    from zourcewell.core import engine as _engine
 
     assert _engine.current_cancel_event() is None
 
@@ -421,7 +421,7 @@ def test_cancellable_leaves_a_response_without_a_live_queue_alone():
     else; swapping in a queue proxy there would break them all, and it is also
     pointless -- with no live queue there is no blocked read to bound.
     """
-    from deepseaport.providers.deepseek import client as DS
+    from zourcewell.providers.deepseek import client as DS
 
     class _NoQueue:
         def iter_lines(self):
@@ -436,7 +436,7 @@ def test_cancellable_leaves_a_response_without_a_live_queue_alone():
 
     # Same with a live token in force -- still nothing to bound, because there
     # is no queue to bound.
-    from deepseaport.core import engine as _engine
+    from zourcewell.core import engine as _engine
 
     cancel = threading.Event()
     _engine._CURRENT_CANCEL.event = cancel

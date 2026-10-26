@@ -80,21 +80,22 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ## Project Purpose
 
-deepseaport exposes web and local chat backends as an OpenAI-compatible FastAPI
+zourcewell exposes web and local chat backends as an OpenAI-compatible FastAPI
 API. Supported upstreams: DeepSeek (AWS WAF, PoW, real-browser login), Qwen
 (Aliyun WAF, JWT cookie), opencode (a local CLI over its own HTTP API). Research
 and educational use only.
 
 ## Repo-wide Contracts
 
-- Interpreter: CPython 3.13 is the verified target. `pyproject.toml` declares `requires-python = ">=3.11"`; CI runs the matrix on 3.11 and 3.13. 3.11 is the floor because `deepseaport.spec` reads `pyproject.toml` with stdlib `tomllib`.
+- Interpreter: CPython 3.13 is the verified target. `pyproject.toml` declares `requires-python = ">=3.11"`; CI runs the matrix on 3.11 and 3.13. 3.11 is the floor because `zourcewell.spec` reads `pyproject.toml` with stdlib `tomllib`.
 - `src/` layout. `pythonpath = ["src"]` under `[tool.pytest.ini_options]` makes the suite resolve this checkout instead of another install.
 - `config.json` is the live credential store: account emails, plaintext passwords, bearer tokens, API keys. Gitignored, never committed, never copied into an artifact.
-- `[project] version` in `pyproject.toml` is the only place a version is written. `deepseaport.spec` stamps it into the frozen exe's bundled `_version.txt`, which `src/deepseaport/__init__.py` reads FIRST (then pyproject, installed metadata, `"0.0.0"`), and `cli --version`, `server.py` / `dry_run.py`'s `FastAPI(version=...)` and `server_routes.py`'s `/health` and `/v1/models` all report that one `deepseaport.__version__`; never add a second literal.
+- `[project] version` in `pyproject.toml` is the only place a version is written. `zourcewell.spec` stamps it into the frozen exe's bundled `_version.txt`, which `src/zourcewell/__init__.py` reads FIRST (then pyproject, installed metadata, `"0.0.0"`), and `cli --version`, `server.py` / `dry_run.py`'s `FastAPI(version=...)` and `server_routes.py`'s `/health` and `/v1/models` all report that one `zourcewell.__version__`; never add a second literal.
 - `scripts/prepare_release.py --check` is a hard gate: it runs before every publish step and no workflow step that publishes may carry `continue-on-error`. `dist/` doubles as the frozen app's credential store; full rationale in `ARCHITECTURE.md`.
+- The project name is ONE identity spread over surfaces that must move together: the `src/zourcewell/` package, the `zourcewell` distribution and console script (`pyproject.toml`), the `ZOURCEWELL_*` env prefix, the `zourcewell.*` logger tree, the `zourcewell-passthrough` managed agent and `zourcewell-strip-system` plugin id, the `zourcewell.spec` PyInstaller file and the `zourcewell.exe` it builds, and the `github.com/gyatstian/zourcewell` URLs. A rename changes ALL of them in one change; a partial one strands the rest silently, because each is read by a different consumer.
 - `ARCHITECTURE.md` and `PROVIDERS.md` are the authoritative long-form docs and are owned here: request lifecycle, auth, PoW, SSE shapes, tool calling, environment, the `Provider` ABC contract, and the steps for adding an upstream. Update them in the same change as the behavior they describe.
 - Runtime output (`build/`, `dist/`, `data/`, `dummy-profile/`, `.pi/`, local `obscura*` binaries) is gitignored and owns no docs.
-- No module under `src/deepseaport/core/` or `src/deepseaport/providers/` may import `deepseaport.server` at module scope. Where a seam needs it, late-import inside the function so monkeypatching `deepseaport.server` keeps working.
+- No module under `src/zourcewell/core/` or `src/zourcewell/providers/` may import `zourcewell.server` at module scope. Where a seam needs it, late-import inside the function so monkeypatching `zourcewell.server` keeps working.
 
 ## Verification
 
@@ -104,13 +105,13 @@ and educational use only.
 
 ## Child DOX Index
 
-- `src/deepseaport/AGENTS.md` owns the package itself: config, account pool, server wiring, CLI, and both chat frontends.
-- `src/deepseaport/core/AGENTS.md` owns provider-neutral mechanics: retry engine, transport, OpenAI shaping, pool helpers, registry, Obscura bridge, MCP client, token parsing.
-- `src/deepseaport/core/tools/AGENTS.md` owns tool prompt rendering and the reply parser formats.
-- `src/deepseaport/providers/AGENTS.md` owns the `Provider` contract every upstream implements.
-- `src/deepseaport/providers/deepseek/AGENTS.md` owns the DeepSeek upstream: PoW, WAF, browser login, SSE.
-- `src/deepseaport/providers/qwen/AGENTS.md` owns the Qwen upstream: JWT auth, Aliyun WAF, chat lifecycle.
-- `src/deepseaport/providers/opencode/AGENTS.md` owns the local opencode CLI upstream and its managed serve subprocess.
+- `src/zourcewell/AGENTS.md` owns the package itself: config, account pool, server wiring, CLI, and both chat frontends.
+- `src/zourcewell/core/AGENTS.md` owns provider-neutral mechanics: retry engine, transport, OpenAI shaping, pool helpers, registry, Obscura bridge, MCP client, token parsing.
+- `src/zourcewell/core/tools/AGENTS.md` owns tool prompt rendering and the reply parser formats.
+- `src/zourcewell/providers/AGENTS.md` owns the `Provider` contract every upstream implements.
+- `src/zourcewell/providers/deepseek/AGENTS.md` owns the DeepSeek upstream: PoW, WAF, browser login, SSE.
+- `src/zourcewell/providers/qwen/AGENTS.md` owns the Qwen upstream: JWT auth, Aliyun WAF, chat lifecycle.
+- `src/zourcewell/providers/opencode/AGENTS.md` owns the local opencode CLI upstream and its managed serve subprocess.
 - `tests/AGENTS.md` owns the hermetic suite and the live tier.
 - `scripts/AGENTS.md` owns the release packaging script, `prepare_release.py`.
 

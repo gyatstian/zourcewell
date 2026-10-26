@@ -6,7 +6,7 @@ Without this module the suite's verdict depends on the developer machine:
 * ``load_settings()`` resolves ``./config.json`` — the real credential file.
   Three qwen tests reached ``Settings.save()`` through the
   ``engine.app_settings()`` fallback and rewrote it on every run.
-* ``DEEPSEAPORT_*`` / ``OBSCURA_*`` in the ambient environment override
+* ``ZOURCEWELL_*`` / ``OBSCURA_*`` in the ambient environment override
   ``config.json`` and are captured at import time by several modules
   (``config.DATA_DIR``, ``tools.common.MAX_ARGS_CHARS``, the protocol hosts),
   so a stray export flipped 44 test verdicts before this file existed.
@@ -44,7 +44,7 @@ What this module does, and why it is safe:
   complete would be worse than an honest one: it would stop people from
   looking for the escapes. Anything that legitimately needs the network is a
   ``live`` test, and selecting the live tier lifts the guard entirely.
-* The imported ``deepseaport`` package must live in THIS repository's
+* The imported ``zourcewell`` package must live in THIS repository's
   ``src/``. An editable install of the project can point at a sibling clone;
   ``pyproject.toml``'s ``pythonpath = ["src"]`` makes ``python -m pytest``
   prefer this tree, but a bare ``pytest`` (wrong rootdir/ini), a stale
@@ -54,7 +54,7 @@ What this module does, and why it is safe:
   -time failure naming the path that was actually resolved. This one check is
   NOT lifted in live mode — it has nothing to do with the network.
 * **Selecting the live tier opts out of the hermetic config.** See
-  ``_live_requested``. Rewriting ``DEEPSEAPORT_CONFIG`` to an empty temp
+  ``_live_requested``. Rewriting ``ZOURCEWELL_CONFIG`` to an empty temp
   config under ``-m live`` guaranteed that every live test skipped on its
   readiness check, so the documented live command could never actually run.
 """
@@ -75,7 +75,7 @@ import pytest
 # Prefixes whose ambient values must not reach a test. OBSCURA_* is included
 # because obscura_bridge resolves the binary from it and would otherwise spawn
 # a real browser from a developer's machine.
-_STRIPPED_PREFIXES = ("DEEPSEAPORT_", "DEEPSEEK_", "OBSCURA_")
+_STRIPPED_PREFIXES = ("ZOURCEWELL_", "DEEPSEEK_", "OBSCURA_")
 _STRIPPED_EXACT = ("OBSCURA_BIN", "OBSCURA_PROFILE")
 
 _LOOPBACK_HOSTS = ("127.", "::1", "localhost", "0.0.0.0")
@@ -105,7 +105,7 @@ def _live_requested(config) -> bool:
     """True when the command line positively SELECTS the live tier.
 
     This is the fix for a live tier that could only ever skip: the old
-    ``pytest_configure`` rewrote ``DEEPSEAPORT_CONFIG`` to a temp config with
+    ``pytest_configure`` rewrote ``ZOURCEWELL_CONFIG`` to a temp config with
     ``accounts: []`` unconditionally, so ``pytest -m live`` always found no
     account and every live test skipped on its readiness check. The operator
     asking for the live tier is asking for the real machine.
@@ -137,8 +137,8 @@ def _stripped(name: str) -> bool:
     return name.startswith(_STRIPPED_PREFIXES) or name in _STRIPPED_EXACT
 
 
-def _installed_deepseaport_path() -> str:
-    """Filesystem path the ``deepseaport`` import resolves to right now.
+def _installed_zourcewell_path() -> str:
+    """Filesystem path the ``zourcewell`` import resolves to right now.
 
     ``__file__`` covers a normal package; a namespace/extension-less layout
     falls back to the first ``__path__`` entry. Never raises: a failed import
@@ -146,14 +146,14 @@ def _installed_deepseaport_path() -> str:
     with an unrelated ImportError.
     """
     try:
-        import deepseaport
+        import zourcewell
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed
         return f"<import failed: {type(exc).__name__}: {exc}>"
     try:
-        mod = getattr(deepseaport, "__file__", None)
+        mod = getattr(zourcewell, "__file__", None)
         if mod:
             return str(Path(mod).resolve())
-        for entry in getattr(deepseaport, "__path__", []) or []:
+        for entry in getattr(zourcewell, "__path__", []) or []:
             return str(Path(entry).resolve())
     except Exception:  # noqa: BLE001 - defensive
         pass
@@ -161,7 +161,7 @@ def _installed_deepseaport_path() -> str:
 
 
 def _is_local_package_path(resolved: str) -> bool:
-    """True when ``resolved`` is the deepseaport package inside EXPECTED_SRC."""
+    """True when ``resolved`` is the zourcewell package inside EXPECTED_SRC."""
     if not resolved or resolved.startswith("<"):
         return False
     try:
@@ -171,21 +171,21 @@ def _is_local_package_path(resolved: str) -> bool:
 
 
 def _assert_local_source_tree(resolved: str | None = None) -> str:
-    """Fail loudly unless the imported deepseaport is THIS repo's ``src/``.
+    """Fail loudly unless the imported zourcewell is THIS repo's ``src/``.
 
     Runs from ``pytest_configure`` (before collection) so a wrong-tree run
     never collects a single test. ``resolved`` is injectable purely so the
     guard's own test can simulate a foreign package location without
     uninstalling anything.
     """
-    path = _installed_deepseaport_path() if resolved is None else str(resolved)
+    path = _installed_zourcewell_path() if resolved is None else str(resolved)
     if not _is_local_package_path(path):
         raise pytest.UsageError(
-            "wrong deepseaport source tree: `import deepseaport` resolved to\n"
+            "wrong zourcewell source tree: `import zourcewell` resolved to\n"
             f"  {path}\n"
             f"but these tests must exercise THIS checkout's src/:\n"
             f"  {EXPECTED_SRC}\n"
-            "An editable install of deepseaport points at a different clone, so "
+            "An editable install of zourcewell points at a different clone, so "
             "any ad-hoc script or a bare `pytest` (no rootdir pyproject.toml, "
             "so no `pythonpath = [\"src\"]`) silently tests code nobody edited.\n"
             "Fix: run the suite as `python -m pytest` from "
@@ -212,13 +212,13 @@ def pytest_configure(config: pytest.Config) -> None:
     _LIVE_TIER = _live_requested(config)
     if _LIVE_TIER:
         # The operator asked for the real machine. Do NOT rewrite
-        # DEEPSEAPORT_CONFIG, do NOT create a temp config, and do NOT strip
-        # the ambient DEEPSEAPORT_*/DEEPSEEK_*/OBSCURA_* variables: the live
+        # ZOURCEWELL_CONFIG, do NOT create a temp config, and do NOT strip
+        # the ambient ZOURCEWELL_*/DEEPSEEK_*/OBSCURA_* variables: the live
         # tier needs the operator's real account token, and honouring
-        # DEEPSEAPORT_PROVIDER / DEEPSEAPORT_OPENCODE_BASE / an obscura path
+        # ZOURCEWELL_PROVIDER / ZOURCEWELL_OPENCODE_BASE / an obscura path
         # is the difference between the live tier working and not.
         return
-    root = Path(tempfile.mkdtemp(prefix="deepseaport-tests-"))
+    root = Path(tempfile.mkdtemp(prefix="zourcewell-tests-"))
     _TMP_ROOTS.append(root)
     atexit.register(shutil.rmtree, str(root), ignore_errors=True)
 
@@ -245,27 +245,27 @@ def pytest_configure(config: pytest.Config) -> None:
 
     for name in [n for n in os.environ if _stripped(n)]:
         del os.environ[name]
-    os.environ["DEEPSEAPORT_CONFIG"] = str(cfg)
-    os.environ["DEEPSEAPORT_DATA"] = str(data_dir)
+    os.environ["ZOURCEWELL_CONFIG"] = str(cfg)
+    os.environ["ZOURCEWELL_DATA"] = str(data_dir)
     # The opencode model catalogue BOOTS the managed serve when nothing
     # answers at the configured base, so that a fresh process reports the same
     # ids as the running server. A suite must never spawn that process: every
     # catalogue test fakes `client._request` instead. The socket guard cannot
     # catch it -- it wraps connect(), not subprocesses.
-    os.environ["DEEPSEAPORT_OPENCODE_MANAGED"] = "0"
+    os.environ["ZOURCEWELL_OPENCODE_MANAGED"] = "0"
 
 
 def pytest_report_header(config: pytest.Config) -> list[str]:
     if _LIVE_TIER:
         # Do not claim a hermetic config that is not in effect.
-        return ["deepseaport tests: LIVE TIER selected - the operator's real "
-                "DEEPSEAPORT_CONFIG and ambient DEEPSEAPORT_*/DEEPSEEK_*/"
+        return ["zourcewell tests: LIVE TIER selected - the operator's real "
+                "ZOURCEWELL_CONFIG and ambient ZOURCEWELL_*/DEEPSEEK_*/"
                 "OBSCURA_* environment are in use, NOT a temp config",
-                f"deepseaport source tree = {_RESOLVED_PACKAGE_PATH} "
+                f"zourcewell source tree = {_RESOLVED_PACKAGE_PATH} "
                 f"(expected under {EXPECTED_SRC})"]
-    env = os.environ.get("DEEPSEAPORT_CONFIG", "")
-    return [f"deepseaport tests: hermetic config = {env}",
-            f"deepseaport source tree = {_RESOLVED_PACKAGE_PATH} "
+    env = os.environ.get("ZOURCEWELL_CONFIG", "")
+    return [f"zourcewell tests: hermetic config = {env}",
+            f"zourcewell source tree = {_RESOLVED_PACKAGE_PATH} "
             f"(expected under {EXPECTED_SRC})"]
 
 

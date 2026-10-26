@@ -1,14 +1,14 @@
 ## Setup in simple terms
 - install [obscura](https://github.com/h4ckf0r0day/obscura/releases) (no-render stealth is the one i use)
-- install the newest [release](https://github.com/gyatstian/deepseaport/releases) (TIP: CLICK THE BLUE TEXT)
-- place obscura and deepseaport next to eachother or put obscura in PATH
-- open deepseaport, add account(s) and then start server.
+- install the newest [release](https://github.com/gyatstian/zourcewell/releases) (TIP: CLICK THE BLUE TEXT)
+- place obscura and zourcewell next to eachother or put obscura in PATH
+- open zourcewell, add account(s) and then start server.
 - *optionally play around with settings or/and config.json!*
 - base url: http://127.0.0.1:5001/v1
 
 - app needs https://aka.ms/vs/17/release/vc_redist.x64.exe beacuse of obscura
 
-# deepseaport — DeepSeek + Qwen web2api (multi-provider)
+# zourcewell — DeepSeek + Qwen web2api (multi-provider)
 
 Unofficial, research-only bridge: exposes web chat as an
 OpenAI-compatible API (`/v1/chat/completions`, streaming + `tools`).
@@ -29,7 +29,7 @@ How it works:
   hot-path engine.
 - **Login (Qwen)** is a direct `POST /api/v1/auths/signin` (no browser, no
   captcha); the JWT rides the `token` cookie on every hot-path request (see
-  `src/deepseaport/providers/qwen/README.md`).
+  `src/zourcewell/providers/qwen/README.md`).
 - Hot path is direct HTTP (`curl_cffi`, Chrome TLS impersonation).
   DeepSeek: login → create session → PoW challenge (`DeepSeekHashV1` wasm) →
   `POST /api/v0/chat/completion` (SSE `p`/`v` events) → delete session.
@@ -43,10 +43,10 @@ Agentic-harness support:
   parallel calls, stable `call_xxx` ids, `finish_reason: "tool_calls"`.
 - `role: tool` results are folded back into the web prompt, so multi-step
   tool loops work against a model with no native function calling.
-- Parser bounds: `tool_args_max_chars` / `DEEPSEAPORT_MAX_ARGS_CHARS` (default
+- Parser bounds: `tool_args_max_chars` / `ZOURCEWELL_MAX_ARGS_CHARS` (default
   200000) caps the arguments of one call; `forgiving_toolcalls` /
-  `DEEPSEAPORT_FORGIVING_TOOLCALLS` (default off) enables the markup-repair
-  bucket; `DEEPSEAPORT_MAX_BARE_OBJECTS` (default 40) bounds how many JSON
+  `ZOURCEWELL_FORGIVING_TOOLCALLS` (default off) enables the markup-repair
+  bucket; `ZOURCEWELL_MAX_BARE_OBJECTS` (default 40) bounds how many JSON
   objects the parser scans for a bare name+arguments call, and the
   total-call scan of the forgiving bucket reuses the same number.
 - One in-flight stream per account (DeepSeek limitation) enforced with
@@ -64,7 +64,7 @@ Obscura binary (`h4ckf0r0day/obscura`, i personally use no-render stealth): drop
 **B. python:**
 ```powershell
 pip install -e .
-python -m deepseaport serve                    # :5001
+python -m zourcewell serve                    # :5001
 ```
 
 
@@ -134,7 +134,7 @@ Request limits (server-enforced, no config knob for the first three):
 
 ### `max_retries` — a knob, but clamped
 
-`max_retries` **is** configurable (`DEEPSEAPORT_MAX_RETRIES`, `config.json`, TUI
+`max_retries` **is** configurable (`ZOURCEWELL_MAX_RETRIES`, `config.json`, TUI
 Settings) — not one of the fixed limits above — and clamped to **0–5** at load
 (a larger value warns and becomes 5), because one request costs up to
 `max_retries` session + PoW + stream attempts. With the env var **unset** the
@@ -144,7 +144,7 @@ number to `config.json` — keep the two in sync or drop the env var.
 
 `provider` (single mode) / `providers` (multi mode) select the upstream
 (`Settings.provider`/`providers`, env
-`DEEPSEAPORT_PROVIDER`/`DEEPSEAPORT_PROVIDERS`, or `--provider`/`--providers`;
+`ZOURCEWELL_PROVIDER`/`ZOURCEWELL_PROVIDERS`, or `--provider`/`--providers`;
 TUI shows a provider gate first). Multi mode needs **two or more** ids in
 `providers`; an empty list means "use `provider` only", and a **single** entry
 is ignored — `provider: "deepseek"` + `providers: ["qwen"]` runs deepseek and
@@ -157,24 +157,24 @@ never blocks).
 
 `active_account` is the `CURRENT` selection (`""` = auto-failover over the
 whole pool). `chat_model` remembers the last `/model` pick from server-with-chat
-mode (env: `DEEPSEAPORT_CHAT_MODEL`). All remaining behaviour flags and their
+mode (env: `ZOURCEWELL_CHAT_MODEL`). All remaining behaviour flags and their
 defaults live in `config.example.json`; the TUI Settings screen is authoritative
 for what is editable there, and any persisted field it does not cover is
 `config.json` only. `enable_append` (default `true`, env:
-`DEEPSEAPORT_ENABLE_APPEND`, TUI Settings) gates both: when `false`, stored
+`ZOURCEWELL_ENABLE_APPEND`, TUI Settings) gates both: when `false`, stored
 `append_top` / `append_bottom` texts are kept but nothing is wrapped into
-requests. `append_top` / `append_bottom` (env: `DEEPSEAPORT_APPEND_TOP` /
-`DEEPSEAPORT_APPEND_BOTTOM`, TUI Settings) wrap every outgoing prompt — top
+requests. `append_top` / `append_bottom` (env: `ZOURCEWELL_APPEND_TOP` /
+`ZOURCEWELL_APPEND_BOTTOM`, TUI Settings) wrap every outgoing prompt — top
 text goes at the absolute top, bottom text at the absolute bottom. Both are
 multi-line (`"append_top": "line1\nline2"` in `config.json`); `""` disables.
 `send_dry_run_to_frontend` (default `true`, env:
-`DEEPSEAPORT_SEND_DRY_RUN_TO_FRONTEND`, TUI Settings): when `true`, the Dry run
+`ZOURCEWELL_SEND_DRY_RUN_TO_FRONTEND`, TUI Settings): when `true`, the Dry run
 reply is a normal OpenAI-shaped response whose content is what dry run prints
 (raw body + formatted prompt); when `false`, the content is a short note while
 the terminal still prints everything.
 
 `use_multiple_accounts` (default `true`, env:
-`DEEPSEAPORT_USE_MULTIPLE_ACCOUNTS`): when `true` and `CURRENT` is busy
+`ZOURCEWELL_USE_MULTIPLE_ACCOUNTS`): when `true` and `CURRENT` is busy
 (one in-flight stream per account, enforced by per-account lock), cooling
 down (banned), or auth-broken (missing/invalid token), the request fails over
 to another healthy account — this is what lets parallel subagents /
@@ -194,7 +194,7 @@ shape is normalized to "missing token" instead of causing a later 40003.
 
 When `use_multiple_accounts` is true, an account with a missing/invalid token
 is cooled down briefly and the request fails over to the next account that
-already has a working token. Use `deepseaport login` (or the TUI auto-token
+already has a working token. Use `zourcewell login` (or the TUI auto-token
 flow) to provision password-only accounts; the server does not spawn a login
 browser on the request hot path.
 
@@ -202,7 +202,7 @@ Bans detected by the server or login page are persisted in `accounts[].banned`
 and `accounts[].banned_until`, so the accounts screen keeps showing
 `(BANNED: 16 September)` after restarts and even when the account has no token.
 Clear that state with `POST /v1/accounts/unblock` or
-`python -m deepseaport accounts unblock [identifier]`.
+`python -m zourcewell accounts unblock [identifier]`.
 
 ## Endpoints
 
@@ -260,14 +260,14 @@ the web providers).
 ## Pi harness + opencode (no accounts, tool_calls out of the box)
 
 1. Install the `opencode` binary (on PATH) and start the bridge on the
-   opencode provider: `python -m deepseaport serve --provider opencode`
+   opencode provider: `python -m zourcewell serve --provider opencode`
    (first request auto-boots a managed isolated `opencode serve`; your own
    `~/.config/opencode` is never touched — or set
-   `DEEPSEAPORT_OPENCODE_BASE` to use your own serve as-is).
+   `ZOURCEWELL_OPENCODE_BASE` to use your own serve as-is).
 2. In `config.json` keep `"enable_tools": true` (off strips the tool
    schemas pi sends, so pi never sees `tool_calls` — the server now warns
    when it does this) and `"provider": "opencode"`.
-3. In pi, pick provider `deepseaport` (base `http://127.0.0.1:5001/v1`)
+3. In pi, pick provider `zourcewell` (base `http://127.0.0.1:5001/v1`)
    and model `opencode/muse-spark-1.3-contributor-free`, then work
    normally: pi's tools arrive as DSML text, the model replies with DSML
    `tool_calls`, and the bridge returns OpenAI `tool_calls` for pi to
@@ -276,10 +276,10 @@ the web providers).
    ride the prompt text, not the model's native ones.
 4. opencode v2 requires a basic-auth password on every serve instance. The
    managed one pins a per-boot `OPENCODE_SERVER_PASSWORD` itself, so nothing
-   to do. If you point `DEEPSEAPORT_OPENCODE_BASE` at your own serve, mirror
-   the password it printed at boot in `DEEPSEAPORT_OPENCODE_PASSWORD`.
+   to do. If you point `ZOURCEWELL_OPENCODE_BASE` at your own serve, mirror
+   the password it printed at boot in `ZOURCEWELL_OPENCODE_PASSWORD`.
 5. If pi runs in a different directory than the bridge, set
-   `DEEPSEAPORT_OPENCODE_WORKDIR` to the project dir so sessions pin
+   `ZOURCEWELL_OPENCODE_WORKDIR` to the project dir so sessions pin
    (`location.directory` on session create) where pi expects file tools to run.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for protocol details, auth/PoW/SSE
@@ -289,12 +289,12 @@ adding an upstream.
 ## Building
 
 The release `.exe` is a PyInstaller one-file build driven by
-`deepseaport.spec` (it sets `version` from `pyproject.toml`, and `upx=False` —
+`zourcewell.spec` (it sets `version` from `pyproject.toml`, and `upx=False` —
 no UPX is installed here, and PyInstaller 6 only warns when it is missing):
 
 ```powershell
 pip install -e ".[build]"
-pyinstaller --clean --noconfirm deepseaport.spec
+pyinstaller --clean --noconfirm zourcewell.spec
 python scripts/prepare_release.py --check     # audit, writes nothing
 python scripts/prepare_release.py             # release/ + release/dist.zip
 ```
@@ -313,9 +313,9 @@ means the artifact is clean. Full rationale:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Version.** `pyproject.toml` `[project] version` is the only place a version
-is written. `deepseaport.spec` reads it at build time (so the exe's version
+is written. `zourcewell.spec` reads it at build time (so the exe's version
 resource and a broken pyproject fail the build loudly instead of silently
-stamping `0.0.0`) and bundles it as `_version.txt`, which `deepseaport.__version__`
+stamping `0.0.0`) and bundles it as `_version.txt`, which `zourcewell.__version__`
 reads first — then pyproject, then the installed metadata, then `0.0.0`.
 `cli --version` and both FastAPI apps report that same value. Bump it there and
 nowhere else.
@@ -342,14 +342,14 @@ python -m pytest -q          # hermetic suite, no network
 Two things a new contributor will hit immediately:
 
 1. **Run `pip install -e .` from this checkout**, or the tests import a
-   *different* installed copy of deepseaport and you debug code that is not
+   *different* installed copy of zourcewell and you debug code that is not
    the code in front of you. `pyproject.toml` now pins
    `pythonpath = ["src"]` under `[tool.pytest.ini_options]`, so `pytest`
    always resolves this tree — but keep the editable install anyway so
-   `python -m deepseaport` runs your checkout too.
+   `python -m zourcewell` runs your checkout too.
 2. **`tests/conftest.py` makes the suite hermetic**: it points
-   `DEEPSEAPORT_CONFIG`/`DEEPSEAPORT_DATA` at a temp dir, strips
-   `DEEPSEAPORT_*`/`DEEPSEEK_*`/`OBSCURA_*` from the ambient environment, and
+   `ZOURCEWELL_CONFIG`/`ZOURCEWELL_DATA` at a temp dir, strips
+   `ZOURCEWELL_*`/`DEEPSEEK_*`/`OBSCURA_*` from the ambient environment, and
    raises on any non-loopback socket connect. `live` tests are **skipped**
    unless you ask for them. The network tier is opt-in:
 
@@ -383,7 +383,7 @@ CI: `.github/workflows/ci.yml` runs exactly
 `.[test]` installed **editable** so the install and pytest's `pythonpath = ["src"]`
 agree — a plain install was shadowed by the checkout and proved nothing about
 what was in the wheel. One extra step then installs a real (non-editable) wheel
-and imports `deepseaport.core.tools.parser` and `deepseaport.providers.qwen`
+and imports `zourcewell.core.tools.parser` and `zourcewell.providers.qwen`
 from outside the checkout, which is the only check that notices a package
 directory missing its `__init__.py`. No obscura, no browser, no account, no
 secrets.

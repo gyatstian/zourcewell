@@ -7,9 +7,9 @@ import json
 
 from functools import partial
 from support import settings, write_config
-from deepseaport.accounts import provider_label
-from deepseaport.config import AccountConfig, Settings, load_settings
-from deepseaport.tui import (
+from zourcewell.accounts import provider_label
+from zourcewell.config import AccountConfig, Settings, load_settings
+from zourcewell.tui import (
     _login_banner,
     main_menu,
     provider_menu,
@@ -58,7 +58,7 @@ def test_provider_menu_invalid_reprompts(monkeypatch):
 
 
 def test_provider_menu_multi_select(monkeypatch):
-    from deepseaport.core import registry
+    from zourcewell.core import registry
 
     s = _fresh(provider="deepseek", providers=[])
     ids = sorted(registry.registered().keys())
@@ -80,7 +80,7 @@ def _probe_provider():
     managed serve), so a menu either asks ``models_hint()`` -- the in-process
     view -- or does not ask at all.
     """
-    from deepseaport.core.provider import ModelSpec, Provider
+    from zourcewell.core.provider import ModelSpec, Provider
 
     class _Probe(Provider):
         id = "hintonly"
@@ -105,7 +105,7 @@ def test_provider_menu_row_is_a_label_only(monkeypatch, capsys):
     nobody picks a provider by, and the model count cost a catalogue read
     per row.
     """
-    from deepseaport.core import registry
+    from zourcewell.core import registry
 
     fake = _probe_provider()
     registry._REGISTRY[registry._key(fake)] = fake
@@ -125,8 +125,8 @@ def test_provider_menu_row_is_a_label_only(monkeypatch, capsys):
 def test_cmd_serve_provider_flag_skips_gate_and_saves(tmp_path, monkeypatch, capsys):
     import sys
 
-    import deepseaport.cli as cli_mod
-    import deepseaport.tui as tui_mod
+    import zourcewell.cli as cli_mod
+    import zourcewell.tui as tui_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     calls = {"menu": 0, "gate": 0}
@@ -145,7 +145,7 @@ def test_cmd_serve_provider_flag_skips_gate_and_saves(tmp_path, monkeypatch, cap
 
 
 def test_cmd_serve_unknown_provider_returns_2(tmp_path, capsys):
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     args = argparse.Namespace(config=cfg, host="", port=0,
@@ -158,8 +158,8 @@ def test_cmd_serve_unknown_provider_returns_2(tmp_path, capsys):
 def test_cmd_serve_gate_runs_when_no_flag(tmp_path, monkeypatch):
     import sys
 
-    import deepseaport.cli as cli_mod
-    import deepseaport.tui as tui_mod
+    import zourcewell.cli as cli_mod
+    import zourcewell.tui as tui_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     calls = {"menu": 0, "gate": 0}
@@ -179,8 +179,8 @@ def test_cmd_serve_chooser_quit_exits_cleanly(tmp_path, monkeypatch):
     """The startup chooser's "q. Quit" quits the serve: rc 0, no main menu."""
     import sys
 
-    import deepseaport.cli as cli_mod
-    import deepseaport.tui as tui_mod
+    import zourcewell.cli as cli_mod
+    import zourcewell.tui as tui_mod
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     calls = {"menu": 0}
@@ -198,7 +198,7 @@ def test_cmd_serve_chooser_quit_exits_cleanly(tmp_path, monkeypatch):
 # 4. CLI accounts add binds provider ---------------------------------------------
 
 def test_accounts_add_binds_selected_provider_default(tmp_path):
-    from deepseaport.cli import main as cli_main
+    from zourcewell.cli import main as cli_main
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     assert cli_main(["--config", cfg, "accounts", "add",
@@ -207,7 +207,7 @@ def test_accounts_add_binds_selected_provider_default(tmp_path):
 
 
 def test_accounts_add_provider_flag_unregistered_ok(tmp_path):
-    from deepseaport.cli import main as cli_main
+    from zourcewell.cli import main as cli_main
 
     cfg = write_config(tmp_path, {"keys": [], "accounts": []})
     assert cli_main(["--config", cfg, "accounts", "add",
@@ -219,7 +219,7 @@ def test_accounts_add_provider_flag_unregistered_ok(tmp_path):
 # 5. TUI add binds ----------------------------------------------------------------
 
 def test_tui_add_binds_selected_provider(monkeypatch):
-    from deepseaport.tui import accounts_menu
+    from zourcewell.tui import accounts_menu
 
     s = Settings(accounts=[], active_account="", config_path="",
                  provider="deepseek")
@@ -266,8 +266,8 @@ def test_tui_auto_login_prompt_names_the_selected_provider(monkeypatch, capsys):
     """Pre-change the TUI asked for "DeepSeek password" and printed
     "Running Obscura login (browser, ~30s)" even with --provider qwen.
     """
-    import deepseaport.providers.deepseek.auth as _ds
-    from deepseaport.tui import accounts_menu
+    import zourcewell.providers.deepseek.auth as _ds
+    from zourcewell.tui import accounts_menu
 
     prompts: list[str] = []
 
@@ -295,8 +295,8 @@ def test_tui_auto_login_prompt_names_the_selected_provider(monkeypatch, capsys):
 
 def _run_login(monkeypatch, tmp_path, argv_extra, provider):
     """Drive cmd_login and return (prompts, exit code)."""
-    import deepseaport.cli as cli_mod
-    from deepseaport.core import registry as reg
+    import zourcewell.cli as cli_mod
+    from zourcewell.core import registry as reg
 
     prompts: list[str] = []
 
@@ -354,8 +354,8 @@ def _run_login_unknown_provider(monkeypatch, tmp_path):
     ``_run_login`` above this does NOT stub ``registry.get`` into always
     answering -- the whole point is that it must answer None here.
     """
-    import deepseaport.cli as cli_mod
-    from deepseaport.core import registry as reg
+    import zourcewell.cli as cli_mod
+    from zourcewell.core import registry as reg
 
     prompts: list[str] = []
     monkeypatch.setattr("builtins.input", lambda p="": prompts.append(p) or "a@x.com")
@@ -369,7 +369,7 @@ def _run_login_unknown_provider(monkeypatch, tmp_path):
                         lambda e, p, s: entered.append(("obscura", e, p))
                         or ("deepseek-usertoken", False, ""))
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.auth.obscura_login_token",
+        "zourcewell.providers.deepseek.auth.obscura_login_token",
         lambda e, p, s: entered.append(("real_browser", e, p))
         or ("deepseek-usertoken", False, ""))
 
@@ -395,7 +395,7 @@ def test_cli_login_refuses_an_unregistered_provider(tmp_path, monkeypatch, capsy
     # The available list is what makes the refusal actionable, and it IS
     # `sorted(registered().keys())` (cli._unknown_provider_exit). A hand-copied
     # pair drifts every time a provider lands -- opencode already had.
-    from deepseaport.core import registry
+    from zourcewell.core import registry
 
     known = sorted(registry.registered().keys())
     assert known, "need a registered provider to assert the list against"
@@ -414,8 +414,8 @@ def test_tui_login_refuses_an_unregistered_provider_and_stays_alive(
     "Running glm login (direct API signin, ~5s)". The TUI cannot exit 2, so the
     refusal is in-app: no browser, no token persisted, and the menu stays alive.
     """
-    from deepseaport.core import registry as reg
-    from deepseaport.tui import accounts_menu
+    from zourcewell.core import registry as reg
+    from zourcewell.tui import accounts_menu
 
     # Only "glm" is unknown; everything else resolves normally, so the refusal
     # is about the id and not a stubbed registry.
@@ -425,7 +425,7 @@ def test_tui_login_refuses_an_unregistered_provider_and_stays_alive(
 
     entered: list[tuple] = []
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.auth.obscura_login_token",
+        "zourcewell.providers.deepseek.auth.obscura_login_token",
         lambda e, p, s: entered.append(("real_browser", e, p))
         or ("deepseek-usertoken", False, ""))
 
@@ -464,7 +464,7 @@ def _jwt(exp: int) -> str:
 def _tui_qwen_login(monkeypatch, token: str, banned: bool = False,
                     detail: str = "") -> None:
     """Registry login seam for qwen, with the DeepSeek driver rigged to explode."""
-    import deepseaport.core.registry as reg
+    import zourcewell.core.registry as reg
 
     class _FakeQwen:
         def login(self, email, password, settings):
@@ -474,7 +474,7 @@ def _tui_qwen_login(monkeypatch, token: str, banned: bool = False,
     monkeypatch.setattr(reg, "get",
                         lambda pid: _FakeQwen() if pid == "qwen" else real_get(pid))
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.auth.obscura_login_token",
+        "zourcewell.providers.deepseek.auth.obscura_login_token",
         lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("the DeepSeek driver ran for a qwen login")))
 
@@ -485,7 +485,7 @@ def test_tui_added_qwen_account_keeps_the_signin_expiry(monkeypatch):
     passes it into ``_upsert_account``. The TUI built its AccountConfig without
     it, so a Qwen account added here kept ``token_expires_at`` 0.0 and the
     documented proactive re-signin could never fire for it."""
-    from deepseaport.tui import accounts_menu
+    from zourcewell.tui import accounts_menu
 
     token = _jwt(1789555791)
     _tui_qwen_login(monkeypatch, token)
@@ -502,7 +502,7 @@ def test_tui_added_qwen_account_keeps_the_signin_expiry(monkeypatch):
 
 def test_tui_set_token_qwen_keeps_the_signin_expiry(monkeypatch):
     """The same guarantee on the set-token path, the TUI's other token write."""
-    from deepseaport.tui import accounts_menu
+    from zourcewell.tui import accounts_menu
 
     token = _jwt(1789555791)
     _tui_qwen_login(monkeypatch, token)
@@ -525,8 +525,8 @@ def test_tui_banned_qwen_login_keeps_the_probe_expiry(monkeypatch):
     (Provider.probe_ban, so a Qwen token is probed as Qwen) instead of trusting
     the login page's wording alone. The TUI took only the wording, so a ban with
     no parseable date was persisted with ``banned_until`` 0.0."""
-    import deepseaport.accounts as acc_mod
-    from deepseaport.tui import accounts_menu
+    import zourcewell.accounts as acc_mod
+    from zourcewell.tui import accounts_menu
 
     _tui_qwen_login(monkeypatch, _jwt(1789555791), banned=True,
                     detail="suspended")
@@ -557,8 +557,8 @@ def test_cli_login_still_reaches_deepseek_and_qwen_browsers(
     direct browser path, not a registry entry point -- so the gate must not
     have broken the default that every existing caller uses.
     """
-    import deepseaport.cli as cli_mod
-    from deepseaport.core import registry as reg
+    import zourcewell.cli as cli_mod
+    from zourcewell.core import registry as reg
 
     seen: dict = {}
     monkeypatch.setattr("builtins.input", lambda p="": "a@x.com")
@@ -588,7 +588,7 @@ def test_login_provider_flag_deepseek_pins_the_driver_hint(monkeypatch, tmp_path
     """Pre-change: settings.provider=qwen + ``--provider deepseek`` fell into
     the flag-less branch, ``_obscura_login_token`` resolved settings.provider
     and drove the QWEN signin, then stored the Qwen JWT under deepseek."""
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     seen: list = []
 
@@ -611,12 +611,12 @@ def test_login_provider_flag_deepseek_never_reaches_configured_qwen(
         monkeypatch, tmp_path):
     """The shipped wrapper half: the Qwen registry login must not run for
     ``--provider deepseek`` even when the config selects qwen."""
-    import deepseaport.cli as cli_mod
-    from deepseaport.core import registry as reg
+    import zourcewell.cli as cli_mod
+    from zourcewell.core import registry as reg
 
     calls: list = []
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.auth.obscura_login_token",
+        "zourcewell.providers.deepseek.auth.obscura_login_token",
         lambda e, p, s: calls.append(("deepseek", e, p)) or ("ds-tok", False, ""))
     qwen_calls: list = []
 
@@ -641,8 +641,8 @@ def test_login_provider_flag_deepseek_never_reaches_configured_qwen(
 def test_login_flagless_uses_and_stamps_the_configured_qwen(monkeypatch, tmp_path):
     """Flag-less login resolves settings.provider (qwen) and must persist the
     SAME provider the token came from, not the DeepSeek default."""
-    import deepseaport.cli as cli_mod
-    from deepseaport.core import registry as reg
+    import zourcewell.cli as cli_mod
+    from zourcewell.core import registry as reg
 
     class _FakeQwen:
         def login(self, email, password, settings):
@@ -656,7 +656,7 @@ def test_login_flagless_uses_and_stamps_the_configured_qwen(monkeypatch, tmp_pat
         raise AssertionError("the DeepSeek driver ran for a qwen login")
 
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.auth.obscura_login_token", _no_ds)
+        "zourcewell.providers.deepseek.auth.obscura_login_token", _no_ds)
     cfg = write_config(tmp_path, {"keys": [], "accounts": [], "provider": "qwen"})
 
     assert cli_mod.main(["--config", cfg, "login", "--email", "q@x.com",
@@ -679,7 +679,7 @@ def _two_provider_config(tmp_path) -> str:
 
 
 def _qwen_login(monkeypatch, token: str) -> None:
-    import deepseaport.core.registry as reg
+    import zourcewell.core.registry as reg
 
     class _FakeQwen:
         def login(self, email, password, settings):
@@ -694,7 +694,7 @@ def test_login_provider_flag_qwen_updates_only_the_qwen_record(
         tmp_path, monkeypatch):
     """Pre-change the email-only match stamped the Qwen JWT onto the
     provider:deepseek record -- a token the DeepSeek pool would then replay."""
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     _qwen_login(monkeypatch, "qwen-jwt")
     cfg = _two_provider_config(tmp_path)
@@ -709,7 +709,7 @@ def test_login_provider_flag_qwen_updates_only_the_qwen_record(
 def test_login_provider_flag_deepseek_updates_only_the_deepseek_record(
         tmp_path, monkeypatch):
     """Mirror case: --provider deepseek must not touch the qwen record."""
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda e, p, s, prov=None: ("ds-new", False, ""))
@@ -727,7 +727,7 @@ def test_login_flagless_updates_only_the_settings_provider_record(
     """The flag-less form resolves the configured provider (qwen here), so the
     qwen record is the one it updates -- pinned so the scoping did not simply
     move the bug to the other side."""
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     _qwen_login(monkeypatch, "qwen-jwt")
     cfg = write_config(tmp_path, {"keys": [], "accounts": [

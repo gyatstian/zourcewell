@@ -25,13 +25,13 @@ import pytest
 from fastapi import HTTPException
 
 from support import (FakeBridge, app_with_bridge, cached_wasm, settings)
-from deepseaport.providers.deepseek import protocol as P
-from deepseaport.accounts import AccountPool, PooledAccount
-from deepseaport.config import AccountConfig, Settings
-from deepseaport.server import create_app
-from deepseaport.server_routes import _prepare
-from deepseaport.providers.deepseek.completion_service import _run_completion_core
-from deepseaport.providers.deepseek import pow as PoW
+from zourcewell.providers.deepseek import protocol as P
+from zourcewell.accounts import AccountPool, PooledAccount
+from zourcewell.config import AccountConfig, Settings
+from zourcewell.server import create_app
+from zourcewell.server_routes import _prepare
+from zourcewell.providers.deepseek.completion_service import _run_completion_core
+from zourcewell.providers.deepseek import pow as PoW
 
 
 CHALLENGE = {
@@ -56,10 +56,10 @@ def _settings(**kw) -> Settings:
 
 
 def _stub_session_pow(monkeypatch):
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-1")
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", lambda h: "sess-1")
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
 
 
 # 1. client preserves 422 body even with text/* content-type -------------
@@ -84,7 +84,7 @@ class _FakeResp:
 
 def test_stream_completion_preserves_422_text_body(monkeypatch):
     """text/plain 422 must not become bare 'HTTP_422:' with empty detail."""
-    from deepseaport.providers.deepseek import client as C
+    from zourcewell.providers.deepseek import client as C
 
     body = '{"detail":[{"loc":["body","prompt"],"msg":"field required"}]}'
     monkeypatch.setattr(
@@ -100,7 +100,7 @@ def test_stream_completion_preserves_422_text_body(monkeypatch):
 
 def test_stream_completion_preserves_422_json_detail(monkeypatch):
     """application/json 422 keeps the FastAPI detail payload."""
-    from deepseaport.providers.deepseek import client as C
+    from zourcewell.providers.deepseek import client as C
 
     body = '{"detail":[{"loc":["body","prompt"],"msg":"field required","type":"missing"}]}'
     monkeypatch.setattr(
@@ -126,7 +126,7 @@ def test_run_core_maps_http_422_to_502(monkeypatch, tmp_path, attempt_error):
     cached_wasm(monkeypatch, tmp_path)
     _stub_session_pow(monkeypatch)
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.completion_service._attempt",
+        "zourcewell.providers.deepseek.completion_service._attempt",
         lambda *a, **k: ("", "", attempt_error, 0))
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
@@ -152,7 +152,7 @@ def test_run_core_maps_generic_upstream_to_502_not_500(monkeypatch, tmp_path):
     cached_wasm(monkeypatch, tmp_path)
     _stub_session_pow(monkeypatch)
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.completion_service._attempt",
+        "zourcewell.providers.deepseek.completion_service._attempt",
         lambda *a, **k: ("", "", "HTTP_404: session route moved", 0))
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
@@ -182,7 +182,7 @@ def test_bare_500_is_retried_as_overload_then_surfaces_503(monkeypatch, tmp_path
         return ("", "", "HTTP_500: Internal Server Error", 0)
 
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.completion_service._attempt", _attempt)
+        "zourcewell.providers.deepseek.completion_service._attempt", _attempt)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
@@ -207,11 +207,11 @@ def test_endpoint_returns_502_on_upstream_422(monkeypatch):
         raise HTTPException(status_code=502,
                             detail="DeepSeek rejected the request as invalid (HTTP_422: )")
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._run_completion_core", fake_core)
     # Stub the pool so no real account/network is touched. The pool seam lives
     # on server_routes (the module that owns pool construction); server
     # re-exports it only for the monkeypatch route.
-    from deepseaport import server_routes as SR
+    from zourcewell import server_routes as SR
 
     class _FakePool:
         def __init__(self):

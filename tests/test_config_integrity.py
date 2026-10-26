@@ -31,8 +31,8 @@ import os
 
 import pytest
 
-from deepseaport import config as config_mod
-from deepseaport.config import (
+from zourcewell import config as config_mod
+from zourcewell.config import (
     DEFAULT_PORT,
     PORT_LIMIT,
     AccountConfig,
@@ -41,8 +41,8 @@ from deepseaport.config import (
 )
 from support import settings
 from functools import partial
-from deepseaport.core import pools
-from deepseaport.core import registry as registry_mod
+from zourcewell.core import pools
+from zourcewell.core import registry as registry_mod
 
 _TOKEN = "T" * 64
 
@@ -55,7 +55,7 @@ def _write(path, payload: dict) -> str:
 def _clean_env(monkeypatch) -> None:
     """Drop every env input load_settings reads, so the file is the only source."""
     for name in list(os.environ):
-        if name.startswith(("DEEPSEAPORT_", "DEEPSEEK_")):
+        if name.startswith(("ZOURCEWELL_", "DEEPSEEK_")):
             monkeypatch.delenv(name, raising=False)
 
 
@@ -272,7 +272,7 @@ def test_atomic_save_roundtrips_and_leaves_no_residue(tmp_path):
 def test_port_zero_falls_back_to_default(monkeypatch, tmp_path, caplog):
     _clean_env(monkeypatch)
     p = _write(tmp_path / "c.json", {"port": 0})
-    with caplog.at_level("WARNING", logger="deepseaport.config"):
+    with caplog.at_level("WARNING", logger="zourcewell.config"):
         s = load_settings(p)
     assert s.port == DEFAULT_PORT
     assert any("port" in r.getMessage() for r in caplog.records)
@@ -283,7 +283,7 @@ def test_port_above_range_is_clamped(monkeypatch, tmp_path, caplog):
     OSError and so escapes the bind path's handlers as a traceback."""
     _clean_env(monkeypatch)
     p = _write(tmp_path / "c.json", {"port": 70000})
-    with caplog.at_level("WARNING", logger="deepseaport.config"):
+    with caplog.at_level("WARNING", logger="zourcewell.config"):
         s = load_settings(p)
     assert s.port == PORT_LIMIT == 65535
     assert any("port" in r.getMessage() for r in caplog.records)
@@ -305,9 +305,9 @@ def test_port_valid_values_untouched(monkeypatch, tmp_path):
 def test_port_env_is_range_checked_too(monkeypatch, tmp_path):
     _clean_env(monkeypatch)
     p = _write(tmp_path / "c.json", {"port": 8080})
-    monkeypatch.setenv("DEEPSEAPORT_PORT", "70000")
+    monkeypatch.setenv("ZOURCEWELL_PORT", "70000")
     assert load_settings(p).port == 65535
-    monkeypatch.setenv("DEEPSEAPORT_PORT", "0")
+    monkeypatch.setenv("ZOURCEWELL_PORT", "0")
     assert load_settings(p).port == DEFAULT_PORT
 
 
@@ -381,7 +381,7 @@ def test_load_dedupes_same_identity_and_keeps_first(tmp_path, caplog):
         {"email": "third@x.com", "token": "tok3"},
         {"email": "third@x.com", "token": "tok3"},       # exact repeat
     ]})
-    with caplog.at_level("WARNING", logger="deepseaport.config"):
+    with caplog.at_level("WARNING", logger="zourcewell.config"):
         s = load_settings(p)
     assert [a.email for a in s.accounts] == ["first@x.com", "third@x.com"]
     assert s.accounts[0].token == "tok1", "the FIRST occurrence wins"
@@ -394,7 +394,7 @@ def test_load_dedupes_on_token_identity(tmp_path, caplog):
         {"email": "a@x.com", "token": "shared-token"},
         {"email": "b@x.com", "token": "shared-token"},
     ]})
-    with caplog.at_level("WARNING", logger="deepseaport.config"):
+    with caplog.at_level("WARNING", logger="zourcewell.config"):
         s = load_settings(p)
     assert [a.email for a in s.accounts] == ["a@x.com"]
     assert any("duplicate account" in r.getMessage() for r in caplog.records)
@@ -420,7 +420,7 @@ def test_load_keeps_distinct_accounts(tmp_path):
 def test_pool_rejects_what_load_dedupes(tmp_path):
     """The runtime gate and the load gate must agree on identity, or a
     duplicate walks in through one of them."""
-    from deepseaport.accounts import AccountPool
+    from zourcewell.accounts import AccountPool
     p = _write(tmp_path / "c.json", {"accounts": [
         {"email": "a@x.com", "token": "t1"},
         {"email": "b@x.com", "token": "shared"},
@@ -440,7 +440,7 @@ def test_load_warns_but_does_not_truncate_over_the_account_limit(tmp_path, caplo
     settings.accounts - so an over-limit config is reported, never pruned."""
     p = _write(tmp_path / "c.json", {"accounts": [
         {"email": f"a{i}@x.com", "token": f"t{i}"} for i in range(config_mod.MAX_ACCOUNTS_LIMIT + 3)]})
-    with caplog.at_level("WARNING", logger="deepseaport.config"):
+    with caplog.at_level("WARNING", logger="zourcewell.config"):
         s = load_settings(p)
     assert len(s.accounts) == config_mod.MAX_ACCOUNTS_LIMIT + 3
     assert any(str(config_mod.MAX_ACCOUNTS_LIMIT) in r.getMessage()
@@ -456,7 +456,7 @@ def test_single_provider_entry_is_ignored_and_reported(monkeypatch, caplog):
     the ignored entry is now named instead of silently dropped."""
     monkeypatch.setattr(pools, "_WARNED_IGNORED_PROVIDERS", set())
     s = _settings(provider="deepseek", providers=["qwen"])
-    with caplog.at_level("WARNING", logger="deepseaport.core.pools"):
+    with caplog.at_level("WARNING", logger="zourcewell.core.pools"):
         ids = pools.active_provider_ids(s)
     assert ids == ["deepseek"]
     assert pools.is_multi(s) is False
@@ -469,7 +469,7 @@ def test_provider_list_warns_once(monkeypatch, caplog):
     bury the log."""
     monkeypatch.setattr(pools, "_WARNED_IGNORED_PROVIDERS", set())
     s = _settings(provider="deepseek", providers=["qwen"])
-    with caplog.at_level("WARNING", logger="deepseaport.core.pools"):
+    with caplog.at_level("WARNING", logger="zourcewell.core.pools"):
         for _ in range(5):
             pools.active_provider_ids(s)
     assert sum("single provider" in r.getMessage() for r in caplog.records) == 1
@@ -479,7 +479,7 @@ def test_matching_single_entry_is_not_warned_about(monkeypatch, caplog):
     """providers=[provider] is redundant, not wrong: nothing was ignored, so
     there is nothing to report."""
     monkeypatch.setattr(pools, "_WARNED_IGNORED_PROVIDERS", set())
-    with caplog.at_level("WARNING", logger="deepseaport.core.pools"):
+    with caplog.at_level("WARNING", logger="zourcewell.core.pools"):
         assert pools.active_provider_ids(
             _settings(provider="deepseek", providers=["deepseek"])) == ["deepseek"]
     assert not [r for r in caplog.records if "single provider" in r.getMessage()]
@@ -572,7 +572,7 @@ def test_full_config_round_trip(tmp_path, monkeypatch):
 def test_unknown_provider_ids_are_named_and_replaced_at_load(tmp_path, caplog):
     p = _write(tmp_path / "c.json",
                {"provider": "glm", "providers": ["deepseek", "quwn"]})
-    with caplog.at_level("WARNING", logger="deepseaport.config"):
+    with caplog.at_level("WARNING", logger="zourcewell.config"):
         s = load_settings(p)
 
     assert s.provider == "deepseek"
@@ -590,7 +590,7 @@ def test_unknown_provider_ids_are_named_and_replaced_at_load(tmp_path, caplog):
 def test_an_unknown_provider_is_never_silently_accepted(tmp_path, caplog):
     """The regression itself: no warning means the operator cannot see the typo."""
     p = _write(tmp_path / "c.json", {"provider": "typo"})
-    with caplog.at_level("WARNING", logger="deepseaport.config"):
+    with caplog.at_level("WARNING", logger="zourcewell.config"):
         s = load_settings(p)
 
     assert s.provider == "deepseek"
@@ -600,9 +600,9 @@ def test_an_unknown_provider_is_never_silently_accepted(tmp_path, caplog):
 
 def test_an_unknown_provider_from_the_env_is_named_too(tmp_path, monkeypatch,
                                                         caplog):
-    monkeypatch.setenv("DEEPSEAPORT_PROVIDER", "quwn")
+    monkeypatch.setenv("ZOURCEWELL_PROVIDER", "quwn")
     p = _write(tmp_path / "c.json", {})
-    with caplog.at_level("WARNING", logger="deepseaport.config"):
+    with caplog.at_level("WARNING", logger="zourcewell.config"):
         s = load_settings(p)
 
     assert s.provider == "deepseek"
@@ -620,7 +620,7 @@ def test_registered_providers_are_left_alone(tmp_path):
 def test_an_omitted_provider_is_still_the_documented_default(tmp_path, caplog):
     """Validation must not turn "no provider configured" into an error."""
     p = _write(tmp_path / "c.json", {"accounts": []})
-    with caplog.at_level("WARNING", logger="deepseaport.config"):
+    with caplog.at_level("WARNING", logger="zourcewell.config"):
         s = load_settings(p)
 
     assert s.provider == "deepseek"
@@ -689,7 +689,7 @@ def test_numeric_mobile_serves_the_accounts_route(tmp_path, monkeypatch):
     _clean_env(monkeypatch)
     from fastapi.testclient import TestClient
 
-    from deepseaport.server import create_app
+    from zourcewell.server import create_app
 
     p = _write(tmp_path / "c.json", {"accounts": [
         {"mobile": 13800138000, "token": "t1"}]})

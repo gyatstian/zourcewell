@@ -21,7 +21,7 @@ pre-change code:
   a dotted (JWT-shaped) secret passed through whole: short segments never trip
   a 32-char run rule.
 * P2-4 -- the child env strip was prefix-shaped
-  (DEEPSEAPORT_/DEEPSEEK_/OPENCODE_), so ``ANTHROPIC_API_KEY``,
+  (ZOURCEWELL_/DEEPSEEK_/OPENCODE_), so ``ANTHROPIC_API_KEY``,
   ``OPENAI_API_KEY``, ``GITHUB_TOKEN`` and the AWS pair rode into the agentic
   child.
 * P2-5 -- ``_invalid_token_401_detail`` kept a dead, UNSCRUBBED second return
@@ -32,7 +32,7 @@ pre-change code:
   ``cmd.exe /c .../opencode.CMD serve ...``: argv[0] is ``cmd``, the identity
   gate refused it on every single run ("does not look like 'opencode serve'"),
   and even a signalled wrapper left the real ``opencode.exe`` child holding its
-  port. Every deepseaport restart leaked one.
+  port. Every zourcewell restart leaked one.
 
 No network, no opencode binary, no credentials: every process identity is a
 monkeypatched command line and every "os.kill" is a fake.
@@ -50,10 +50,10 @@ import textwrap
 
 import pytest
 
-from deepseaport.core import engine as engine_mod
-from deepseaport.core import obscura_bridge as OB
-from deepseaport.providers.deepseek import completion_service as CS
-from deepseaport.providers.opencode import managed_serve as MS
+from zourcewell.core import engine as engine_mod
+from zourcewell.core import obscura_bridge as OB
+from zourcewell.providers.deepseek import completion_service as CS
+from zourcewell.providers.opencode import managed_serve as MS
 
 
 # 64 opaque chars, exactly what scrub_upstream_text is meant to catch.
@@ -472,14 +472,14 @@ def test_managed_acl_warning_names_the_password_and_fires_once(tmp_path, caplog,
     monkeypatch.setattr(OB, "_ACL_WARNED_LABELS", set(), raising=False)
     target = tmp_path / "serve.json"
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.obscura"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.obscura"):
         OB.warn_inherited_acl_once(
             target, secret="the per-boot opencode basic-auth password",
             label="managed opencode port file", platform="nt")
         first = [r for r in caplog.records if "inherits the ACL" in r.getMessage()]
         assert len(first) == 1, "no ACL warning for the managed port file"
         caplog.clear()
-        # Once per store, not once per call: every deepseaport worker that
+        # Once per store, not once per call: every zourcewell worker that
         # boots a serve re-enters here.
         OB.warn_inherited_acl_once(
             target, secret="the per-boot opencode basic-auth password",
@@ -490,7 +490,7 @@ def test_managed_acl_warning_names_the_password_and_fires_once(tmp_path, caplog,
     assert str(target) in message
     assert "0600" in message, "the warning must say the chmod does not apply"
     assert "basic-auth password" in message, "the warning must name the secret"
-    assert "DEEPSEAPORT_DATA" in message, "the warning must give the mitigation"
+    assert "ZOURCEWELL_DATA" in message, "the warning must give the mitigation"
 
 
 def test_managed_acl_warning_is_silent_on_posix(tmp_path, monkeypatch, caplog):
@@ -498,7 +498,7 @@ def test_managed_acl_warning_is_silent_on_posix(tmp_path, monkeypatch, caplog):
     and it must not consume the once-only flag."""
     monkeypatch.setattr(OB, "_ACL_WARNED_LABELS", set(), raising=False)
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.obscura"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.obscura"):
         OB.warn_inherited_acl_once(tmp_path / "serve.json", secret="pw",
                                    label="managed opencode port file",
                                    platform="posix")
@@ -524,7 +524,7 @@ def test_write_isolated_files_warns_only_while_a_cleartext_password_is_on_disk(
     paths = MS.write_isolated_files(base)
     assert seen == [], "a missing serve.json must not warn"
 
-    # An older deepseaport (or a DPAPI-less machine) left it cleartext.
+    # An older zourcewell (or a DPAPI-less machine) left it cleartext.
     paths["port_file"].write_text(json.dumps(
         {"base": "http://127.0.0.1:9", "pid": 1, "password": "pw"}),
         encoding="utf-8")
@@ -551,7 +551,7 @@ def test_windows_port_file_is_dpapi_wrapped_and_only_cleartext_warns(
     monkeypatch.setattr(OB, "_ACL_WARNED_LABELS", set(), raising=False)
     base = tmp_path / "m"
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.obscura"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.obscura"):
         paths = MS.write_isolated_files(base)
         MS._write_port_file(paths["port_file"], "http://127.0.0.1:45999",
                             "pw", 1, "h")
@@ -568,7 +568,7 @@ def test_windows_port_file_is_dpapi_wrapped_and_only_cleartext_warns(
     # warning describes.
     monkeypatch.setattr(MS, "_dpapi_protect", lambda secret: "")
     caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="deepseaport.obscura"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.obscura"):
         MS._write_port_file(paths["port_file"], "http://127.0.0.1:45999",
                             "pw", 1, "h")
 
@@ -649,7 +649,7 @@ THIRD_PARTY = (
 
 
 def test_child_env_drops_wellknown_third_party_credentials():
-    """Pre-change: only the DEEPSEAPORT_/DEEPSEEK_/OPENCODE_ prefixes were
+    """Pre-change: only the ZOURCEWELL_/DEEPSEEK_/OPENCODE_ prefixes were
     stripped, so every one of these rode into the agentic child."""
     parent = {"PATH": "/usr/bin", "HOME": "/home/op", "KEEP_ME": "harmless"}
     parent.update({name: f"value-of-{name}" for name in THIRD_PARTY})
@@ -677,8 +677,8 @@ def test_child_env_deny_list_never_covers_a_key_the_child_needs():
     isolation_keys = {
         "XDG_CONFIG_HOME", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT",
         "OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_DISABLE_CLAUDE_CODE",
-        "OPENCODE_SERVER_PASSWORD", "DEEPSEAPORT_OPENCODE_BASE",
-        "DEEPSEAPORT_OPENCODE_PASSWORD", "DEEPSEAPORT_OPENCODE_MANAGED_BASE",
+        "OPENCODE_SERVER_PASSWORD", "ZOURCEWELL_OPENCODE_BASE",
+        "ZOURCEWELL_OPENCODE_PASSWORD", "ZOURCEWELL_OPENCODE_MANAGED_BASE",
     }
 
     assert isolation_keys & set(MS._CHILD_ENV_DENY_NAMES) == set(), \
@@ -720,11 +720,11 @@ def test_invalid_token_401_detail_scrubs_both_branches(refreshed):
 
 
 def test_explicit_user_base_ignores_the_modules_own_sentinel(monkeypatch):
-    """``DEEPSEAPORT_OPENCODE_MANAGED_BASE`` was written but never read.
+    """``ZOURCEWELL_OPENCODE_MANAGED_BASE`` was written but never read.
 
     After an in-process reload ``_managed_base``/``_managed_password`` are
     empty while the env sentinel survives, so our own (dead) managed serve
-    looked like an operator-pinned ``DEEPSEAPORT_OPENCODE_BASE``: ``ensure()``
+    looked like an operator-pinned ``ZOURCEWELL_OPENCODE_BASE``: ``ensure()``
     no-oped and every request 502'd with a hint telling the operator to set
     the variable that was already set. The sentinel is normalized like BASE.
     """

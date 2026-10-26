@@ -46,13 +46,13 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
-from deepseaport.accounts import AccountPool
-from deepseaport.config import AccountConfig, Settings
-from deepseaport.core import registry
-from deepseaport.dry_run import create_dry_app
-from deepseaport.server import create_app
+from zourcewell.accounts import AccountPool
+from zourcewell.config import AccountConfig, Settings
+from zourcewell.core import registry
+from zourcewell.dry_run import create_dry_app
+from zourcewell.server import create_app
 from support import settings as _settings
-from deepseaport.server_routes import MAX_REQUEST_BYTES
+from zourcewell.server_routes import MAX_REQUEST_BYTES
 
 # 63 chars of the exact shape a real DeepSeek userToken has: [A-Za-z0-9_-].
 LIVE_TOKEN = "sk-deepseek-" + "A1b2C3d4E5f6G7h8" * 3 + "Zz9"
@@ -303,7 +303,7 @@ def test_oversized_body_log_never_records_a_token_path(caplog):
     settings = _settings(keys=["sk-test"],
                         accounts=[AccountConfig(token=LIVE_TOKEN, email="")])
 
-    with caplog.at_level(logging.DEBUG, logger="deepseaport.server"):
+    with caplog.at_level(logging.DEBUG, logger="zourcewell.server"):
         with _client(settings) as client:
             # A lying Content-Length: the fast path rejects it, so this is the
             # exact request that used to log the path before routing/auth.
@@ -332,7 +332,7 @@ def test_streamed_oversized_body_logs_the_route_template(caplog):
     settings = _settings(keys=["sk-test"],
                         accounts=[AccountConfig(token=LIVE_TOKEN, email="")])
 
-    with caplog.at_level(logging.DEBUG, logger="deepseaport.server"):
+    with caplog.at_level(logging.DEBUG, logger="zourcewell.server"):
         resp = asyncio.run(_chunked_request(
             create_app(settings), "PUT",
             f"/v1/accounts/{LIVE_TOKEN}/token",
@@ -355,7 +355,7 @@ def _token_pool_settings() -> Settings:
 
 
 def _pin_pool(monkeypatch, settings) -> None:
-    import deepseaport.server as srv_mod
+    import zourcewell.server as srv_mod
 
     monkeypatch.setattr(srv_mod, "_pool",
                         lambda app: AccountPool(settings.accounts, current=""))
@@ -365,7 +365,7 @@ def test_delete_account_rejects_a_full_token_in_the_path(monkeypatch, caplog):
     settings = _token_pool_settings()
     _pin_pool(monkeypatch, settings)
 
-    with caplog.at_level(logging.DEBUG, logger="deepseaport.server"):
+    with caplog.at_level(logging.DEBUG, logger="zourcewell.server"):
         with _client(settings) as client:
             resp = client.delete(f"/v1/accounts/{LIVE_TOKEN}", headers=AUTH)
 
@@ -464,7 +464,7 @@ def test_jwt_shaped_identifier_is_rejected_on_every_identifier_route(
                          accounts=[AccountConfig(token=jwt, email="")])
     _pin_pool(monkeypatch, settings)
 
-    with caplog.at_level(logging.DEBUG, logger="deepseaport.server"):
+    with caplog.at_level(logging.DEBUG, logger="zourcewell.server"):
         with _client(settings) as client:
             # Ahead of auth: no key presented, and still the 400.
             unauth = client.delete(f"/v1/accounts/{jwt}")
@@ -521,7 +521,7 @@ def test_dry_app_rejects_an_oversized_chunked_body(capsys):
 
 
 def test_add_account_never_persists_an_unregistered_fallback_provider():
-    """DEEPSEAPORT_PROVIDER (and config.json) are not validated on load, so
+    """ZOURCEWELL_PROVIDER (and config.json) are not validated on load, so
     the fallback branch is exactly as reachable as the explicit field."""
     settings = _settings(provider="junk-provider")
 

@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from deepseaport.accounts import AccountPool
-from deepseaport.config import AccountConfig
+from zourcewell.accounts import AccountPool
+from zourcewell.config import AccountConfig
 
 
 def _cfg(email, token="tok"):
@@ -110,8 +110,8 @@ def test_status_shape_and_round_robin():
 
 
 def test_cli_add_remove_syncs_config(tmp_path, monkeypatch):
-    from deepseaport.cli import main as cli_main
-    from deepseaport.config import load_settings
+    from zourcewell.cli import main as cli_main
+    from zourcewell.config import load_settings
 
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps({"keys": [], "accounts": []}), encoding="utf-8")
@@ -130,16 +130,16 @@ def test_cli_add_remove_syncs_config(tmp_path, monkeypatch):
 
 
 def test_extract_token_formats():
-    from deepseaport.accounts import TOKEN_HELP, extract_token
+    from zourcewell.accounts import TOKEN_HELP, extract_token
 
     assert extract_token("abc123") == "abc123"
-    assert "userToken" in TOKEN_HELP and "python -m deepseaport login" in TOKEN_HELP
+    assert "userToken" in TOKEN_HELP and "python -m zourcewell login" in TOKEN_HELP
 
 
 def test_cli_set_token_and_json_token(tmp_path):
     import json as _json
-    from deepseaport.cli import main as cli_main
-    from deepseaport.config import load_settings
+    from zourcewell.cli import main as cli_main
+    from zourcewell.config import load_settings
 
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps({"keys": [], "accounts": []}), encoding="utf-8")
@@ -153,8 +153,8 @@ def test_cli_set_token_and_json_token(tmp_path):
 
 
 def test_login_upsert_preserves_pool(tmp_path):
-    from deepseaport.cli import _upsert_account
-    from deepseaport.config import AccountConfig, Settings
+    from zourcewell.cli import _upsert_account
+    from zourcewell.config import AccountConfig, Settings
 
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1")],
                  config_path=str(tmp_path / "c.json"))
@@ -207,8 +207,8 @@ def test_current_invalid_and_remove_clears():
 
 def test_cli_select_and_clear(tmp_path, capsys):
     import json as _json
-    from deepseaport.cli import main as cli_main
-    from deepseaport.config import load_settings
+    from zourcewell.cli import main as cli_main
+    from zourcewell.config import load_settings
 
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps({"keys": [], "accounts": []}), encoding="utf-8")
@@ -230,8 +230,8 @@ def test_cli_select_and_clear(tmp_path, capsys):
 
 
 def test_api_select_current():
-    from deepseaport.config import AccountConfig, Settings
-    from deepseaport.server import create_app
+    from zourcewell.config import AccountConfig, Settings
+    from zourcewell.server import create_app
     from fastapi.testclient import TestClient
 
     s = Settings(keys=[], accounts=[AccountConfig(email="a@x.com", token="t1"),
@@ -246,8 +246,8 @@ def test_api_select_current():
 
 
 def test_tui_number_selects_not_deletes(monkeypatch):
-    from deepseaport.config import AccountConfig, Settings
-    from deepseaport.tui import accounts_menu
+    from zourcewell.config import AccountConfig, Settings
+    from zourcewell.tui import accounts_menu
 
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1"),
                            AccountConfig(email="b@x.com", token="t2")],
@@ -261,8 +261,8 @@ def test_tui_number_selects_not_deletes(monkeypatch):
 
 
 def test_tui_delete_needs_confirmation(monkeypatch):
-    from deepseaport.config import AccountConfig, Settings
-    from deepseaport.tui import accounts_menu
+    from zourcewell.config import AccountConfig, Settings
+    from zourcewell.tui import accounts_menu
 
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1"),
                            AccountConfig(email="b@x.com", token="t2")],
@@ -280,14 +280,14 @@ def test_tui_delete_needs_confirmation(monkeypatch):
 
 
 def test_tui_add_skip_token_offers_auto_login(monkeypatch):
-    from deepseaport.config import Settings
-    from deepseaport.tui import accounts_menu
+    from zourcewell.config import Settings
+    from zourcewell.tui import accounts_menu
 
     s = Settings(accounts=[], active_account="", config_path="")
     # a -> add flow: email, password, token(y = auto-token).
     inputs = iter(["a", "new@x.com", "pw", "y", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings: "auto-tok-123")
     accounts_menu(s)
     assert len(s.accounts) == 1
@@ -296,8 +296,8 @@ def test_tui_add_skip_token_offers_auto_login(monkeypatch):
 
 
 def test_tui_add_non_y_token_is_literal(monkeypatch):
-    from deepseaport.config import Settings
-    from deepseaport.tui import accounts_menu
+    from zourcewell.config import Settings
+    from zourcewell.tui import accounts_menu
 
     s = Settings(accounts=[], active_account="", config_path="")
     inputs = iter(["a", "new@x.com", "pw", "mytoken123", "q"])
@@ -310,8 +310,8 @@ def test_tui_add_non_y_token_is_literal(monkeypatch):
 
 
 def test_tui_add_second_account_becomes_default(monkeypatch):
-    from deepseaport.config import AccountConfig, Settings
-    from deepseaport.tui import accounts_menu
+    from zourcewell.config import AccountConfig, Settings
+    from zourcewell.tui import accounts_menu
 
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1")],
                  active_account="a@x.com", config_path="")

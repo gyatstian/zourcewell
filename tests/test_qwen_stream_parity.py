@@ -37,15 +37,15 @@ import pytest
 from fastapi import HTTPException
 
 from support import collect_sse, settings, sse_payloads, sse_text
-from deepseaport.accounts import AccountPool
-from deepseaport.config import AccountConfig, Settings
-from deepseaport.core import engine as _engine
-from deepseaport.providers.qwen import auth as QA
-from deepseaport.providers.qwen import client as QC
-from deepseaport.providers.qwen import completion_service as QCS
-from deepseaport.providers.qwen.sse_parser import StreamEvent
-from deepseaport.server import create_app
-from deepseaport.server_routes import _prepare
+from zourcewell.accounts import AccountPool
+from zourcewell.config import AccountConfig, Settings
+from zourcewell.core import engine as _engine
+from zourcewell.providers.qwen import auth as QA
+from zourcewell.providers.qwen import client as QC
+from zourcewell.providers.qwen import completion_service as QCS
+from zourcewell.providers.qwen.sse_parser import StreamEvent
+from zourcewell.server import create_app
+from zourcewell.server_routes import _prepare
 
 # The qwen credential shape: chat.qwen.ai localStorage ``token`` is a JWT (see
 # providers/qwen/README.md "Auth"), so an upstream 401 that echoes the request
@@ -460,7 +460,7 @@ def test_401_detail_source_has_no_unscrubbed_variant(mod, fn, raises):
 
     source = textwrap.dedent(inspect.getsource(
         getattr(importlib.import_module(
-            f"deepseaport.providers.{mod}.completion_service"), fn)))
+            f"zourcewell.providers.{mod}.completion_service"), fn)))
     func = ast.parse(source).body[0]
     assert isinstance(func, ast.FunctionDef)
 

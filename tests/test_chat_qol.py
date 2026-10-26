@@ -16,7 +16,7 @@ def _free_port() -> int:
 
 
 def test_is_port_free_true_then_false():
-    from deepseaport.cli import _is_port_free
+    from zourcewell.cli import _is_port_free
 
     port = _free_port()
     assert _is_port_free("127.0.0.1", port) is True
@@ -31,7 +31,7 @@ def test_is_port_free_true_then_false():
 
 
 def test_next_free_port_skips_busy():
-    from deepseaport.cli import _is_port_free, _next_free_port
+    from zourcewell.cli import _is_port_free, _next_free_port
 
     port = _free_port()
     holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -46,8 +46,8 @@ def test_next_free_port_skips_busy():
 
 
 def test_ensure_free_port_passthrough_when_free():
-    from deepseaport.cli import _ensure_free_port
-    from deepseaport.config import Settings
+    from zourcewell.cli import _ensure_free_port
+    from zourcewell.config import Settings
 
     port = _free_port()
     s = Settings(port=port, config_path="")
@@ -56,8 +56,8 @@ def test_ensure_free_port_passthrough_when_free():
 
 
 def test_ensure_free_port_interactive_accept(monkeypatch):
-    from deepseaport.cli import _ensure_free_port
-    from deepseaport.config import Settings
+    from zourcewell.cli import _ensure_free_port
+    from zourcewell.config import Settings
 
     port = _free_port()
     holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -75,8 +75,8 @@ def test_ensure_free_port_interactive_accept(monkeypatch):
 
 
 def test_ensure_free_port_interactive_decline(monkeypatch):
-    from deepseaport.cli import _ensure_free_port
-    from deepseaport.config import Settings
+    from zourcewell.cli import _ensure_free_port
+    from zourcewell.config import Settings
 
     port = _free_port()
     holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -94,8 +94,8 @@ def test_ensure_free_port_interactive_decline(monkeypatch):
 
 
 def test_ensure_free_port_noninteractive_autopicks_and_saves(tmp_path):
-    from deepseaport.cli import _ensure_free_port
-    from deepseaport.config import Settings, load_settings
+    from zourcewell.cli import _ensure_free_port
+    from zourcewell.config import Settings, load_settings
 
     port = _free_port()
     holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -114,7 +114,7 @@ def test_ensure_free_port_noninteractive_autopicks_and_saves(tmp_path):
 
 
 def test_chat_build_payload_shape():
-    from deepseaport.chat_ui import _build_payload
+    from zourcewell.chat_ui import _build_payload
 
     msgs = [{"role": "user", "content": "hi"}]
     assert _build_payload("deepseek-flash", msgs) == {
@@ -122,8 +122,8 @@ def test_chat_build_payload_shape():
 
 
 def test_chat_resolve_bind_host():
-    from deepseaport.chat_ui import _resolve_bind_host
-    from deepseaport.config import Settings
+    from zourcewell.chat_ui import _resolve_bind_host
+    from zourcewell.config import Settings
 
     assert _resolve_bind_host(Settings(listen=False)) == "127.0.0.1"
     assert _resolve_bind_host(Settings(listen=True)) == "0.0.0.0"
@@ -147,7 +147,7 @@ class _FakeResp:
 
 
 def test_chat_post_completion_ok(monkeypatch):
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
 
     payload = {"choices": [{"message": {"role": "assistant", "content": "hello"}}]}
     monkeypatch.setattr("urllib.request.urlopen",
@@ -156,7 +156,7 @@ def test_chat_post_completion_ok(monkeypatch):
 
 
 def test_chat_post_completion_thinking_fallback(monkeypatch):
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
 
     payload = {"choices": [{"message": {"role": "assistant", "content": "",
                                         "reasoning_content": "hmm"}}]}
@@ -168,7 +168,7 @@ def test_chat_post_completion_thinking_fallback(monkeypatch):
 def test_chat_post_completion_http_error(monkeypatch):
     import io
 
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
 
     def _boom(*a, **k):
         raise urllib.error.HTTPError("http://x", 429, "busy",
@@ -184,7 +184,7 @@ def test_chat_post_completion_http_error(monkeypatch):
 
 
 def test_chat_post_completion_bad_shape(monkeypatch):
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
 
     monkeypatch.setattr("urllib.request.urlopen",
                         lambda *a, **k: _FakeResp({"weird": 1}))
@@ -197,7 +197,7 @@ def test_chat_post_completion_bad_shape(monkeypatch):
 
 
 def test_chat_wait_for_server_ok_and_timeout(monkeypatch):
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
 
     monkeypatch.setattr("urllib.request.urlopen",
                         lambda *a, **k: _FakeResp({"ok": True}))
@@ -213,21 +213,21 @@ def test_chat_wait_for_server_ok_and_timeout(monkeypatch):
 def test_chat_silence_hides_info_and_restores():
     import logging
 
-    from deepseaport import chat_ui
+    from zourcewell import chat_ui
 
-    lg = logging.getLogger("deepseaport.obscura")
+    lg = logging.getLogger("zourcewell.obscura")
     root = logging.getLogger()
     old_level, old_root = lg.level, root.level
     lg.setLevel(logging.INFO)
     root.setLevel(logging.INFO)
     try:
         saved = chat_ui._silence_chat_logs()
-        assert logging.getLogger("deepseaport.obscura").level == logging.ERROR
+        assert logging.getLogger("zourcewell.obscura").level == logging.ERROR
         assert logging.getLogger("uvicorn.access").level == logging.ERROR
         assert root.level == logging.ERROR
         assert lg.isEnabledFor(logging.INFO) is False
         chat_ui._restore_chat_logs(saved)
-        assert logging.getLogger("deepseaport.obscura").level == logging.INFO
+        assert logging.getLogger("zourcewell.obscura").level == logging.INFO
         assert root.level == logging.INFO
     finally:
         lg.setLevel(old_level)
@@ -235,8 +235,8 @@ def test_chat_silence_hides_info_and_restores():
 
 
 def test_preflight_blocks_empty_and_tokenless():
-    from deepseaport.config import AccountConfig, Settings
-    from deepseaport.tui import _preflight_reason
+    from zourcewell.config import AccountConfig, Settings
+    from zourcewell.tui import _preflight_reason
 
     assert _preflight_reason(Settings(accounts=[])) != ""
     reason = _preflight_reason(
@@ -247,8 +247,8 @@ def test_preflight_blocks_empty_and_tokenless():
 
 
 def test_main_menu_guards_start_when_no_accounts(monkeypatch):
-    from deepseaport.config import Settings
-    from deepseaport.tui import main_menu
+    from zourcewell.config import Settings
+    from zourcewell.tui import main_menu
 
     s = Settings(accounts=[], active_account="", config_path="")
     calls = {"serve": 0}
@@ -260,8 +260,8 @@ def test_main_menu_guards_start_when_no_accounts(monkeypatch):
 
 
 def test_main_menu_guards_chat_when_tokenless(monkeypatch):
-    from deepseaport.config import AccountConfig, Settings
-    from deepseaport.tui import main_menu
+    from zourcewell.config import AccountConfig, Settings
+    from zourcewell.tui import main_menu
 
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="")],
                  active_account="", config_path="")
@@ -273,8 +273,8 @@ def test_main_menu_guards_chat_when_tokenless(monkeypatch):
 
 
 def test_main_menu_starts_when_token_present(monkeypatch):
-    from deepseaport.config import AccountConfig, Settings
-    from deepseaport.tui import main_menu
+    from zourcewell.config import AccountConfig, Settings
+    from zourcewell.tui import main_menu
 
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1")],
                  active_account="", config_path="")
@@ -286,7 +286,7 @@ def test_main_menu_starts_when_token_present(monkeypatch):
 
 
 def test_chat_model_memory_roundtrip(tmp_path):
-    from deepseaport.config import load_settings
+    from zourcewell.config import load_settings
 
     cfg = tmp_path / "c.json"
     cfg.write_text(json.dumps({"chat_model": "deepseek-flash-search"}), encoding="utf-8")
@@ -297,8 +297,8 @@ def test_chat_model_memory_roundtrip(tmp_path):
 
 
 def test_chat_initial_model_prefers_stored():
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings
 
     models = ["deepseek-flash", "deepseek-flash-search"]
     assert chat_ui._initial_chat_model(
@@ -309,8 +309,8 @@ def test_chat_initial_model_prefers_stored():
 
 
 def test_chat_remember_model_saves(tmp_path):
-    from deepseaport import chat_ui
-    from deepseaport.config import Settings, load_settings
+    from zourcewell import chat_ui
+    from zourcewell.config import Settings, load_settings
 
     cfg = tmp_path / "c.json"
     cfg.write_text(json.dumps({}), encoding="utf-8")
@@ -321,8 +321,8 @@ def test_chat_remember_model_saves(tmp_path):
 
 
 def test_main_menu_routes_to_chat(monkeypatch):
-    from deepseaport.config import AccountConfig, Settings
-    from deepseaport.tui import main_menu
+    from zourcewell.config import AccountConfig, Settings
+    from zourcewell.tui import main_menu
 
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1")],
                  active_account="", config_path="")
@@ -335,8 +335,8 @@ def test_main_menu_routes_to_chat(monkeypatch):
 
 
 def test_main_menu_serve_still_first(monkeypatch):
-    from deepseaport.config import AccountConfig, Settings
-    from deepseaport.tui import main_menu
+    from zourcewell.config import AccountConfig, Settings
+    from zourcewell.tui import main_menu
 
     s = Settings(accounts=[AccountConfig(email="a@x.com", token="t1")],
                  active_account="", config_path="")
@@ -349,8 +349,8 @@ def test_main_menu_serve_still_first(monkeypatch):
 
 
 def test_settings_menu_groups_options_and_dispatches(monkeypatch, capsys):
-    from deepseaport.config import Settings
-    from deepseaport.tui import settings_menu
+    from zourcewell.config import Settings
+    from zourcewell.tui import settings_menu
 
     s = Settings(config_path="", stream_mode="live")
     inputs = iter(["8", "q"])  # 8 = Reply streaming, q = back
@@ -367,8 +367,8 @@ def test_settings_menu_groups_options_and_dispatches(monkeypatch, capsys):
 
 
 def test_main_menu_flags_incomplete_setup(monkeypatch, capsys):
-    from deepseaport.config import Settings
-    from deepseaport.tui import main_menu
+    from zourcewell.config import Settings
+    from zourcewell.tui import main_menu
 
     s = Settings(accounts=[], active_account="", config_path="")
     # Quit lives in the provider chooser ("q. Go back", then "q. Quit" there).
@@ -382,9 +382,9 @@ def test_main_menu_flags_incomplete_setup(monkeypatch, capsys):
 
 
 def test_load_settings_defaults_browser_bin_to_auto(tmp_path, monkeypatch):
-    from deepseaport.config import load_settings
+    from zourcewell.config import load_settings
 
-    monkeypatch.delenv("DEEPSEAPORT_BROWSER_BIN", raising=False)
+    monkeypatch.delenv("ZOURCEWELL_BROWSER_BIN", raising=False)
     cfg = tmp_path / "c.json"
     cfg.write_text("{}", encoding="utf-8")
     assert load_settings(str(cfg)).browser_bin == "auto"

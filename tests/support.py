@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import json
 
-from deepseaport.accounts import AccountConfig
-from deepseaport.config import Settings
-from deepseaport.server import create_app
+from zourcewell.accounts import AccountConfig
+from zourcewell.config import Settings
+from zourcewell.server import create_app
 
 __all__ = [
     "AccountConfig",
@@ -162,7 +162,7 @@ def cached_wasm(monkeypatch, tmp_path):
     """Point PoW at an existing >1000 byte file so ``ensure_wasm`` is skipped."""
     wp = tmp_path / "wasm.bin"
     wp.write_bytes(b"x" * 2000)
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.wasm_path", lambda: wp)
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.wasm_path", lambda: wp)
     return wp
 
 

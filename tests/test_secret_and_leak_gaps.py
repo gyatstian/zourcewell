@@ -42,16 +42,16 @@ import pytest
 from fastapi import HTTPException
 
 from support import collect_sse, settings, sse_text
-from deepseaport.accounts import AccountPool, PooledAccount
-from deepseaport.config import AccountConfig, Settings
-from deepseaport.core import engine as engine_mod
-from deepseaport.core import transport as transport_mod
-from deepseaport.providers.deepseek import completion_service as CS
-from deepseaport.providers.opencode import completion_service as OCS
-from deepseaport.providers.opencode import managed_serve as MS
-from deepseaport.providers.qwen import completion_service as QCS
-from deepseaport.server import create_app
-from deepseaport.server_routes import _prepare
+from zourcewell.accounts import AccountPool, PooledAccount
+from zourcewell.config import AccountConfig, Settings
+from zourcewell.core import engine as engine_mod
+from zourcewell.core import transport as transport_mod
+from zourcewell.providers.deepseek import completion_service as CS
+from zourcewell.providers.opencode import completion_service as OCS
+from zourcewell.providers.opencode import managed_serve as MS
+from zourcewell.providers.qwen import completion_service as QCS
+from zourcewell.server import create_app
+from zourcewell.server_routes import _prepare
 
 
 # A realistic account token: 64 opaque chars, exactly what the scrubber is
@@ -103,8 +103,8 @@ def test_cancel_during_create_session_aborts_and_deletes_once(monkeypatch):
     approximating), and the session that call still returns afterwards must be
     deleted exactly once.
     """
-    from deepseaport.server_concurrency import _StreamCancelled
-    from deepseaport.providers.deepseek.completion_service import _session_and_challenge
+    from zourcewell.server_concurrency import _StreamCancelled
+    from zourcewell.providers.deepseek.completion_service import _session_and_challenge
 
     started = threading.Event()
     finished = threading.Event()
@@ -136,9 +136,9 @@ def test_cancel_during_create_session_aborts_and_deletes_once(monkeypatch):
         else:
             second_delete.set()
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", _slow_session)
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: {"a": 1})
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.delete_session", _record_delete)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", _slow_session)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow", lambda h: {"a": 1})
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.delete_session", _record_delete)
 
     cancel = threading.Event()
     watcher_errors: list[str] = []
@@ -195,14 +195,14 @@ def test_cancel_during_create_session_aborts_and_deletes_once(monkeypatch):
 def test_cancel_before_create_session_starts_deletes_nothing(monkeypatch):
     """The other half of the same fix: a pre-set cancel event still aborts
     immediately, and a create_session that never ran has no session to leak."""
-    from deepseaport.server_concurrency import _StreamCancelled
-    from deepseaport.providers.deepseek.completion_service import _session_and_challenge
+    from zourcewell.server_concurrency import _StreamCancelled
+    from zourcewell.providers.deepseek.completion_service import _session_and_challenge
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: pytest.fail(
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", lambda h: pytest.fail(
         "a pre-set cancel must not create a session"))
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: pytest.fail(
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow", lambda h: pytest.fail(
         "a pre-set cancel must not fetch a challenge"))
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.delete_session",
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.delete_session",
                         lambda h, sid: pytest.fail("nothing to delete"))
 
     cancel = threading.Event()
@@ -287,7 +287,7 @@ def test_slot_releaser_still_reacquires_an_uncontended_lock():
 
 def test_slot_releaser_still_aborts_on_cancel(monkeypatch):
     """Unchanged: a set cancel event still wins over the reacquire wait."""
-    from deepseaport.server_concurrency import _StreamCancelled
+    from zourcewell.server_concurrency import _StreamCancelled
 
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="t"))
     item.lock.acquire()
@@ -340,8 +340,8 @@ def _install_ban_failover(monkeypatch, settings: Settings) -> AccountPool:
 
 
 def _failover_sync(app, pool, monkeypatch) -> None:
-    from deepseaport.providers.deepseek.completion_service import _complete_with_failover_sync
-    from deepseaport.server_routes import _prepare
+    from zourcewell.providers.deepseek.completion_service import _complete_with_failover_sync
+    from zourcewell.server_routes import _prepare
 
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]},
@@ -365,7 +365,7 @@ def test_ban_failover_current_switch_does_not_write_the_operator_config(
         "keys": ["sk-real"], "accounts": [{"email": "a@x.com", "token": "tok"}],
         "active_account": "a@x.com", "provider": "deepseek",
     }), encoding="utf-8")
-    monkeypatch.setenv("DEEPSEAPORT_CONFIG", str(operator_cfg))
+    monkeypatch.setenv("ZOURCEWELL_CONFIG", str(operator_cfg))
     before = operator_cfg.read_text(encoding="utf-8")
 
     # An app that owns no settings: engine.app_settings() falls back to
@@ -393,7 +393,7 @@ def test_ban_failover_current_switch_persists_when_the_app_owns_settings(
     app = create_app(settings)
     pool = _install_ban_failover(monkeypatch, settings)
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.core.engine"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.core.engine"):
         _failover_sync(app, pool, monkeypatch)
 
     assert pool.current == "b@x.com"
@@ -414,7 +414,7 @@ def _no_signals(monkeypatch) -> list:
     stubbed: an unstubbed ``_kill_tree`` would put a REAL taskkill against the
     fake pid 4242 on the Windows runner.
     """
-    from deepseaport.providers.opencode import managed_serve as ms
+    from zourcewell.providers.opencode import managed_serve as ms
 
     signalled: list[tuple] = []
 
@@ -526,7 +526,7 @@ def test_reaper_skips_a_dead_recorded_pid_without_reading_its_command_line(
                                      or "opencode serve --port 45999"),
                         raising=False)
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.server"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.server"):
         MS._kill_pid(4242)
 
     assert signalled == [], "a dead pid was signalled"
@@ -625,7 +625,7 @@ def test_windows_command_line_reader_strips_the_wmic_header(monkeypatch):
     that has nothing to do with what was being tested. The dispatch is
     platform-honest below instead, and the reader itself is tested here.
     """
-    from deepseaport.providers.opencode import managed_serve as ms
+    from zourcewell.providers.opencode import managed_serve as ms
 
     ran: list[list[str]] = []
 
@@ -667,7 +667,7 @@ def test_process_command_line_dispatch_follows_the_real_platform(monkeypatch):
     Both halves are faked, so this is deterministic on Linux and Windows and
     asserts only that the dispatcher calls the reader its platform names.
     """
-    from deepseaport.providers.opencode import managed_serve as ms
+    from zourcewell.providers.opencode import managed_serve as ms
 
     picked: list[str] = []
     monkeypatch.setattr(ms, "_windows_command_line",
@@ -688,7 +688,7 @@ def test_process_command_line_dispatch_follows_the_real_platform(monkeypatch):
 
 @pytest.mark.skipif(os.name == "nt", reason="/proc/<pid>/cmdline is POSIX only")
 def test_posix_command_line_reads_a_real_process():
-    from deepseaport.providers.opencode import managed_serve as ms
+    from zourcewell.providers.opencode import managed_serve as ms
 
     out = ms._posix_command_line(os.getpid())
     assert "python" in out.lower()
@@ -706,12 +706,12 @@ def test_acl_warning_is_emitted_once_on_windows(tmp_path, monkeypatch, caplog):
     passwords, 64-char bearer tokens) keeps the directory's inherited ACL --
     on a default install ``BUILTIN\\Users`` has read access. The code claimed
     owner-only and the operator was never told otherwise."""
-    from deepseaport import config as cfg_mod
+    from zourcewell import config as cfg_mod
 
     monkeypatch.setattr(cfg_mod, "_ACL_WARNING_EMITTED", False, raising=False)
     target = tmp_path / "config.json"
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.config"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.config"):
         cfg_mod._warn_inherited_acl_once(target, platform="nt")
         first = [r for r in caplog.records if "inherits the ACL" in r.getMessage()]
         assert len(first) == 1, "no ACL warning on a Windows save"
@@ -726,16 +726,16 @@ def test_acl_warning_is_emitted_once_on_windows(tmp_path, monkeypatch, caplog):
     assert "0600" in message, "the warning must say the chmod does not apply"
     assert "bearer token" in message, "the warning must name what is at risk"
     # The concrete mitigation, not a vague "be careful".
-    assert "DEEPSEAPORT_CONFIG" in message
+    assert "ZOURCEWELL_CONFIG" in message
 
 
 def test_acl_warning_is_silent_on_posix(tmp_path, monkeypatch, caplog):
     """POSIX keeps the real 0600, so the warning would be noise there."""
-    from deepseaport import config as cfg_mod
+    from zourcewell import config as cfg_mod
 
     monkeypatch.setattr(cfg_mod, "_ACL_WARNING_EMITTED", False, raising=False)
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.config"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.config"):
         cfg_mod._warn_inherited_acl_once(tmp_path / "config.json", platform="posix")
 
     assert "inherits the ACL" not in caplog.text
@@ -746,7 +746,7 @@ def test_acl_warning_is_silent_on_posix(tmp_path, monkeypatch, caplog):
 def test_config_save_runs_the_acl_check_on_every_write(tmp_path, monkeypatch):
     """Wiring: a successful save must hand the written file to the checker.
     (Both branches themselves are covered above; this is the call site.)"""
-    from deepseaport import config as cfg_mod
+    from zourcewell import config as cfg_mod
 
     checked: list = []
     monkeypatch.setattr(cfg_mod, "_warn_inherited_acl_once",
@@ -766,13 +766,13 @@ def test_config_save_runs_the_acl_check_on_every_write(tmp_path, monkeypatch):
                     reason="the end-to-end case only exists on Windows")
 def test_config_save_on_windows_really_warns(tmp_path, monkeypatch, caplog):
     """End to end on the platform where the no-op chmod actually bites."""
-    from deepseaport import config as cfg_mod
+    from zourcewell import config as cfg_mod
 
     monkeypatch.setattr(cfg_mod, "_ACL_WARNING_EMITTED", False, raising=False)
     path = tmp_path / "config.json"
     settings = Settings(accounts=[AccountConfig(email="a@x.com", token=LIVE_TOKEN)],
                         config_path=str(path))
-    with caplog.at_level(logging.WARNING, logger="deepseaport.config"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.config"):
         settings.save()
     assert "inherits the ACL" in caplog.text, \
         "on Windows the save claimed 0600 protection it does not have"
@@ -808,7 +808,7 @@ def test_scrubber_clamps_the_length():
 def test_upstream_502_detail_and_log_redact_the_token(caplog):
     body = "HTTP_500: internal error, trace=" + LIVE_TOKEN + " (biz_code 1002)"
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.core.engine"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.core.engine"):
         with pytest.raises(HTTPException) as exc_info:
             engine_mod.raise_upstream("DeepSeek", body)
 
@@ -836,7 +836,7 @@ def test_ban_403_detail_redacts_the_login_page_token(monkeypatch):
     """The ban path quotes up to 300 chars of the upstream error text, and the
     Obscura path feeds it scraped login-page DOM (which carries the very
     token the refresh failed on)."""
-    from deepseaport.providers.deepseek.completion_service import _ban_403_for_item
+    from zourcewell.providers.deepseek.completion_service import _ban_403_for_item
 
     settings = _settings(accounts=[AccountConfig(email="b@x.com", token="tok")])
     app = create_app(settings)
@@ -873,10 +873,10 @@ def test_serve_config_keeps_the_access_log_off(monkeypatch, tmp_path):
     import argparse
     import types
 
-    import deepseaport.server as srv_mod
+    import zourcewell.server as srv_mod
     import uvicorn
 
-    from deepseaport import server_runner
+    from zourcewell import server_runner
 
     seen: dict = {}
 
@@ -908,14 +908,14 @@ def test_accounts_route_rejects_a_full_token_identifier(monkeypatch):
     """A follow-up closed the leak at the route, not only at the log.
 
     ``accounts._matches`` still matches a full token, because the CLI
-    (``deepseaport accounts delete <token>``) and the TUI need it. Over HTTP a
+    (``zourcewell accounts delete <token>``) and the TUI need it. Over HTTP a
     URL is the wrong place for a credential: paths land in access logs, proxy
     logs and ``Referer`` headers, so the edge refuses a token-shaped segment
     with a 400 that never echoes the value back.
     """
     from fastapi.testclient import TestClient
 
-    import deepseaport.server as srv_mod
+    import zourcewell.server as srv_mod
 
     settings = _settings(accounts=[AccountConfig(token=LIVE_TOKEN, email="")],
                          keys=["sk-test"])
@@ -961,7 +961,7 @@ _PRODUCER_TAILS = {
 def test_producer_tail_table_covers_every_registered_provider():
     """A new upstream must not silently skip the table above: the tail is
     shared, so a provider missing from it would be untested rather than red."""
-    from deepseaport.core import registry
+    from zourcewell.core import registry
 
     assert set(_PRODUCER_TAILS) == set(registry.registered())
 
@@ -1052,7 +1052,7 @@ def test_non_200_completion_log_does_not_carry_the_token_it_was_given(caplog):
         headers = {"content-type": "application/json"}
         text = "HTTP_403: " + RAW_UPSTREAM_BODY
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.client"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.client"):
         event = transport_mod.build_http_error_event(
             _Resp(), {"prompt": "hi", "model": "deepseek-flash"})
 
@@ -1076,7 +1076,7 @@ def test_recovery_failure_log_is_scrubbed_and_traceback_free(caplog):
     """
     boom = RuntimeError(f"pow challenge: bad shape: {RAW_UPSTREAM_BODY}")
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.core.engine"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.core.engine"):
         ok = engine_mod._run_recovery(
             "pow", lambda: (_ for _ in ()).throw(boom))
 
@@ -1103,7 +1103,7 @@ def test_recovery_failure_log_is_scrubbed_and_traceback_free(caplog):
 
 
 def test_qwen_headers_never_ship_the_bridge_jar(monkeypatch):
-    from deepseaport.providers.qwen import client as QC
+    from zourcewell.providers.qwen import client as QC
 
     QC._clear_waf_cache()
     try:
@@ -1122,7 +1122,7 @@ def test_qwen_headers_never_ship_the_bridge_jar(monkeypatch):
         class _App:
             state = _St()
 
-        monkeypatch.setattr("deepseaport.core.obscura_bridge.get_default_bridge",
+        monkeypatch.setattr("zourcewell.core.obscura_bridge.get_default_bridge",
                             lambda: _Bridge())
 
         h = QCS._headers(_App(), "jwtLEAK")

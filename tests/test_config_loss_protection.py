@@ -21,8 +21,8 @@ import threading
 
 import pytest
 
-from deepseaport import config as cfg
-from deepseaport.config import AccountConfig, Settings, load_settings
+from zourcewell import config as cfg
+from zourcewell.config import AccountConfig, Settings, load_settings
 
 
 def _write(path, obj):

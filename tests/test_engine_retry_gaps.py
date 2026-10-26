@@ -37,15 +37,15 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from support import cached_wasm, collect_sse, settings, sse_text
-from deepseaport.providers.deepseek import pow as PoW
-from deepseaport.accounts import AccountPool, PooledAccount
-from deepseaport.config import AccountConfig, Settings
-from deepseaport.core import engine as _engine
-from deepseaport.providers.deepseek import client as DS
-from deepseaport.providers.deepseek import completion_service as CS
-from deepseaport.providers.qwen import completion_service as QCS
-from deepseaport.server import create_app
-from deepseaport.server_routes import _prepare
+from zourcewell.providers.deepseek import pow as PoW
+from zourcewell.accounts import AccountPool, PooledAccount
+from zourcewell.config import AccountConfig, Settings
+from zourcewell.core import engine as _engine
+from zourcewell.providers.deepseek import client as DS
+from zourcewell.providers.deepseek import completion_service as CS
+from zourcewell.providers.qwen import completion_service as QCS
+from zourcewell.server import create_app
+from zourcewell.server_routes import _prepare
 
 CHALLENGE = {
     "algorithm": PoW.ALGORITHM,
@@ -105,7 +105,7 @@ def _stub_session(monkeypatch) -> None:
     monkeypatch.setattr(CS, "_delete_session_bg", lambda *a, **k: None)
     monkeypatch.setattr(DS, "create_session", lambda h: "sess-1")
     monkeypatch.setattr(DS, "fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.solve", lambda *a, **k: 42)
 
 
 def _boom(exc: BaseException):
@@ -246,7 +246,7 @@ def test_drive_retries_contains_non_status_recovery_failure(caplog):
             return e == overload and name == "overload"
         return _pred
 
-    with caplog.at_level("WARNING", logger="deepseaport.core.engine"):
+    with caplog.at_level("WARNING", logger="zourcewell.core.engine"):
         _engine.drive_retries(
             3, lambda: False, lambda: overload,
             (
@@ -287,7 +287,7 @@ def test_app_settings_fallback_does_not_memoize_onto_app_state(monkeypatch, tmp_
     hand-built app ended up holding a Settings bound to the on-disk
     config.json that any later provider `save()` rewrote."""
     path = _operator_config(tmp_path)
-    monkeypatch.setenv("DEEPSEAPORT_CONFIG", str(path))
+    monkeypatch.setenv("ZOURCEWELL_CONFIG", str(path))
     before = (path.read_bytes(), path.stat().st_mtime_ns)
     app = _BareApp()
 
@@ -312,10 +312,10 @@ def test_app_settings_fallback_does_not_memoize_onto_app_state(monkeypatch, tmp_
 def test_ban_persist_path_leaves_bare_app_without_operator_settings(monkeypatch, tmp_path):
     """E2b. Same leak through the real caller: the ban 403 persists, but the
     operator-bound Settings must not stay attached to the app afterwards."""
-    from deepseaport.config import load_settings
+    from zourcewell.config import load_settings
 
     path = _operator_config(tmp_path)
-    monkeypatch.setenv("DEEPSEAPORT_CONFIG", str(path))
+    monkeypatch.setenv("ZOURCEWELL_CONFIG", str(path))
     app = _BareApp()
     item = PooledAccount(cfg=load_settings(str(path)).accounts[0])
     until = time.time() + 86400
@@ -472,7 +472,7 @@ def test_every_registered_provider_classifies_the_shared_status_shapes():
     """
     import importlib
 
-    from deepseaport.core import registry
+    from zourcewell.core import registry
 
     cases = {
         "HTTP_502: ": "OVERLOAD",
@@ -484,7 +484,7 @@ def test_every_registered_provider_classifies_the_shared_status_shapes():
     assert provider_ids, "registry imported no providers"
     for pid in provider_ids:
         mod = importlib.import_module(
-            f"deepseaport.providers.{pid.replace('-', '_')}.completion_service")
+            f"zourcewell.providers.{pid.replace('-', '_')}.completion_service")
         for text, kind_name in cases.items():
             got = mod.classify_error(text)
             assert got is getattr(mod.RetryKind, kind_name), (
@@ -803,8 +803,8 @@ def test_no_qwen_retry_row_re_attempts_after_a_partial_live_emit(
     only, so a WAF challenge or a 401 arriving after a delta re-POSTed on the
     same chat. ``overload`` is not repeated here: it is one row of one factory
     and DeepSeek's case above already pins that factory's shared guard."""
-    from deepseaport.providers.qwen import client as QC
-    from deepseaport.providers.qwen import completion_service as QCS
+    from zourcewell.providers.qwen import client as QC
+    from zourcewell.providers.qwen import completion_service as QCS
 
     st = settings(provider="qwen", max_retries=1,
                   accounts=[AccountConfig(email="a@x.com", token="tok")])

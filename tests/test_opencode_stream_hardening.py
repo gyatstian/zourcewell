@@ -13,7 +13,7 @@ Six defects, each pinned by a test that fails on the pre-change code:
   contract; DeepSeek honours it (providers/deepseek/completion_service.py:1157)
   and opencode did not. The budget was also sized off the raw
   ``OC.DEFAULT_TIMEOUT`` while the producer honoured
-  ``DEEPSEAPORT_OPENCODE_TIMEOUT``, so a raised knob reopened the same hole.
+  ``ZOURCEWELL_OPENCODE_TIMEOUT``, so a raised knob reopened the same hole.
 * **The SSE reader busy-spun on a mid-stream socket error.** ``resp.read(1)``
   was wrapped in ``except Exception: continue``, so a connection reset after
   the tail started was retried instantly at 100% CPU and the wait loop below
@@ -67,16 +67,16 @@ import urllib.parse
 import pytest
 
 from support import collect_sse, settings, sse_deltas, sse_text
-from deepseaport.config import Settings
-from deepseaport.core import engine as _engine
-from deepseaport.providers.opencode import client as OC
-from deepseaport.providers.opencode import completion_service as OCS
-from deepseaport.providers.opencode import managed_serve as MS
-from deepseaport.providers.opencode.models import DEFAULT_MODEL
-from deepseaport.server import create_app
-from deepseaport.server_concurrency import _CONSUMER_GRACE_SECONDS
+from zourcewell.config import Settings
+from zourcewell.core import engine as _engine
+from zourcewell.providers.opencode import client as OC
+from zourcewell.providers.opencode import completion_service as OCS
+from zourcewell.providers.opencode import managed_serve as MS
+from zourcewell.providers.opencode.models import DEFAULT_MODEL
+from zourcewell.server import create_app
+from zourcewell.server_concurrency import _CONSUMER_GRACE_SECONDS
 from functools import partial
-from deepseaport.server_routes import _prepare
+from zourcewell.server_routes import _prepare
 
 SESSION = "ses_live"
 # The id the prompt POST answers with: it anchors the poll to THIS turn.
@@ -196,7 +196,7 @@ def _fake_serve(monkeypatch, *, messages: list, sse: str | None = None,
     ``order=desc``, so the client's own re-reverse is what these tests read.
     Anything else is a test bug and raises.
     """
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_USER_AGENT", "opencode/1.18.32")
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_USER_AGENT", "opencode/1.18.32")
     seen: list[str] = []
 
     def _urlopen(req, timeout=None):
@@ -285,7 +285,7 @@ def test_live_turn_rejects_permission_requests(monkeypatch):
 
 
 def _assistant_item(text: str, thinking: str = "", usage: int = 11) -> dict:
-    return {"id": "msg_a", "type": "assistant", "agent": "deepseaport-passthrough",
+    return {"id": "msg_a", "type": "assistant", "agent": "zourcewell-passthrough",
             "model": {"providerID": "opencode",
                       "modelID": "muse-spark-1.3-contributor-free"},
             "time": {"created": 1.0, "streamed": 2.0, "completed": 3.0},
@@ -381,14 +381,14 @@ def test_live_mode_watchdog_stays_exactly_one_read(monkeypatch):
 
 
 def test_watchdog_budget_follows_the_timeout_env_knob(monkeypatch):
-    """DEEPSEAPORT_OPENCODE_TIMEOUT must size the producer AND the watchdog.
+    """ZOURCEWELL_OPENCODE_TIMEOUT must size the producer AND the watchdog.
 
     Pre-change the producer honoured the env knob while the consumer stayed at
     the raw 180 s default, so a raised knob (600) answered a healthy slow
     model with the watchdog's ``upstream timed out`` and threw the fully
     assembled reply away.
     """
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_TIMEOUT", "600")
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_TIMEOUT", "600")
     env_seconds = 600.0
 
     seen = _spy_stream_context(monkeypatch)
@@ -679,8 +679,8 @@ def _managed_state(proc=None, base: str = "", password: str = ""):
 
 def _stub_managed_boot(monkeypatch, tmp_path, healthy_bases=(), proc=None) -> dict:
     """Stub every side effect of a boot; returns the Popen capture dict."""
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_BASE", "")
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_MANAGED", "1")
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_BASE", "")
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_MANAGED", "1")
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
     monkeypatch.setattr(MS, "_find_free_port", lambda: NEW_PORT)
     monkeypatch.setattr(MS, "_probe",
@@ -713,7 +713,7 @@ def test_boot_reaps_the_child_it_replaces(monkeypatch, tmp_path):
     only ever knew ``_proc``, so the previous ``opencode serve`` kept its
     port, its ``work/`` cwd and its per-boot basic-auth password forever.
     """
-    monkeypatch.setenv("DEEPSEAPORT_KEYS", "sk-parent-secret")
+    monkeypatch.setenv("ZOURCEWELL_KEYS", "sk-parent-secret")
     old = _FakeProc(pid=1111)
     trees = _posix_reap(monkeypatch)
     captured = _stub_managed_boot(monkeypatch, tmp_path,
@@ -728,7 +728,7 @@ def test_boot_reaps_the_child_it_replaces(monkeypatch, tmp_path):
 
     # The reap must not have disturbed the child env boundary: the parent
     # secret is still stripped and the per-boot keys still set after it.
-    assert "DEEPSEAPORT_KEYS" not in captured["env"]
+    assert "ZOURCEWELL_KEYS" not in captured["env"]
     assert captured["env"]["OPENCODE_SERVER_PASSWORD"]
     assert captured["env"]["OPENCODE_CONFIG_DIR"].endswith("cfg")
 
@@ -777,8 +777,8 @@ def test_one_missed_probe_is_not_proof_of_death(monkeypatch, tmp_path):
     ensure() must retry before treating the recorded base as dead, or it ends
     every in-flight turn on that serve (and orphans their SSE readers).
     """
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_BASE", "")
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_MANAGED", "1")
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_BASE", "")
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_MANAGED", "1")
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
     answers = [False, True]
 
@@ -814,8 +814,8 @@ def test_a_missed_probe_on_the_port_file_base_is_retried_too(monkeypatch, tmp_pa
     busy to answer. A provably dead one narrows to a single attempt
     (``test_a_dead_recorded_pid_narrows_the_reuse_probe_to_one_attempt``).
     """
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_BASE", "")
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_MANAGED", "1")
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_BASE", "")
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_MANAGED", "1")
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
     monkeypatch.setattr(MS, "_pid_alive", lambda pid: True, raising=False)
     (tmp_path / "m").mkdir(parents=True, exist_ok=True)

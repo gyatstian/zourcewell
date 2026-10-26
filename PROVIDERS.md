@@ -15,8 +15,8 @@ status *means* — see the per-provider 403 split below.
 ## Layout
 
 ```
-src/deepseaport/
-  core/                  provider-neutral: never imports deepseaport.server at top
+src/zourcewell/
+  core/                  provider-neutral: never imports zourcewell.server at top
     provider.py          Provider ABC + ModelSpec
     registry.py          lazy discovery via _BUILTIN_MODULES + create_provider()
     pools.py             active_provider_ids / accounts_for_provider / make_pool
@@ -47,7 +47,7 @@ src/deepseaport/
                          login (`requires_accounts = False`; a session per
                          request against a managed isolated serve, or
                          user-managed `opencode serve` via
-                         DEEPSEAPORT_OPENCODE_BASE). Speaks the opencode v2
+                         ZOURCEWELL_OPENCODE_BASE). Speaks the opencode v2
                          HttpApi (all routes under `/api`); a turn is
                          prompt-then-poll because v2 has no blocking message
                          endpoint, and the model, its `variant` and the agent
@@ -90,8 +90,8 @@ App shell (`server.py`, `server_routes.py`, `server_concurrency.py`, `tui.py`,
   never merged. Cached process-wide: a success for five minutes, a failure
   for thirty. When nothing answers at the configured base the read boots the
   managed serve and retries, so the ids do not depend on which process asks;
-  both opt-outs (an operator-pinned `DEEPSEAPORT_OPENCODE_BASE`, and
-  `DEEPSEAPORT_OPENCODE_MANAGED=0`, which the hermetic tier sets) are honored.
+  both opt-outs (an operator-pinned `ZOURCEWELL_OPENCODE_BASE`, and
+  `ZOURCEWELL_OPENCODE_MANAGED=0`, which the hermetic tier sets) are honored.
   A blank model id resolves to the explicit
   `opencode/muse-spark-1.3-contributor-free` (`models.DEFAULT_MODEL`), NOT
   the first catalogue key — the live catalogue is in upstream order and
@@ -106,7 +106,7 @@ App shell (`server.py`, `server_routes.py`, `server_concurrency.py`, `tui.py`,
 
 1. Select at serve: TUI first-menu provider gate, `--provider`/`--providers`
    CLI flags, or `Settings.provider`/`Settings.providers` (`config.json` +
-   `DEEPSEAPORT_PROVIDER`/`DEEPSEAPORT_PROVIDERS`).
+   `ZOURCEWELL_PROVIDER`/`ZOURCEWELL_PROVIDERS`).
 2. Scoped pools: `core.pools.make_pool(settings, pid)` builds one
    `AccountPool` per active provider from its bound accounts
    (`AccountConfig.provider`).
@@ -161,7 +161,7 @@ All three completion seams **raise `NotImplementedError` on the ABC** —
 `core/provider.py` holds no default engine and no `_server()` reference to
 late-bind. An override is therefore not optional: a provider that ships without
 one answers its first request with a 500, not a fallback. The module docstring
-and `src/deepseaport/providers/AGENTS.md` say the same thing; if you find a
+and `src/zourcewell/providers/AGENTS.md` say the same thing; if you find a
 fourth seam, give it a caller or do not add it.
 
 ## Add a new provider in 4 steps
@@ -191,7 +191,7 @@ The three finished providers are all available as references and they are
       `stream_response` — in `providers/<name>/provider.py`, reusing
       `core.engine`, `core.tools`, `core.transport`,
       `core.openai._openai_response` and `core.pools.make_pool`
-      (`deepseaport.accounts` pool). None has a default; see the ABC table
+      (`zourcewell.accounts` pool). None has a default; see the ABC table
       above. Each delegates to its own `completion_service`.
       Every row of the retry table must go through the local
       `_retryable(kind)` predicate, which ANDs `not tracker.emitted` — a
@@ -201,15 +201,15 @@ The three finished providers are all available as references and they are
       still ends in `[DONE]`. The rule and its reasoning are
       `core/AGENTS.md`'s.
 - [ ] 4. Register + select: extend the exact line in
-       `src/deepseaport/core/registry.py`
+       `src/zourcewell/core/registry.py`
         ```python
-        _BUILTIN_MODULES = ("deepseaport.providers.deepseek", "deepseaport.providers.qwen",
-                            "deepseaport.providers.opencode")
+        _BUILTIN_MODULES = ("zourcewell.providers.deepseek", "zourcewell.providers.qwen",
+                            "zourcewell.providers.opencode")
         ```
         to e.g.
          ```python
-         _BUILTIN_MODULES = ("deepseaport.providers.deepseek", "deepseaport.providers.qwen",
-                             "deepseaport.providers.opencode", "deepseaport.providers.<name>")
+         _BUILTIN_MODULES = ("zourcewell.providers.deepseek", "zourcewell.providers.qwen",
+                             "zourcewell.providers.opencode", "zourcewell.providers.<name>")
          ```
        then pick the provider in the TUI provider menu
        (`Settings.provider` / `--provider`). Local providers
@@ -251,9 +251,9 @@ auto-register until it is implemented and its line is added.
 | completion engine | `core/engine.py` | Reuse: `drive_retries`, `run_with_failover`, `complete_with_failover_sync`, `drain_attempt`, `slot_releaser` (its give-up is published through `consume_slot_abandoned`, and every release site routes through `run_with_failover`'s `_release_slot`), `ban_403_for_item`, `switch_current_after_ban_failover`, `LiveEmitTracker` / `live_retry_predicate`, the `TRANSIENT_OVERLOAD_MARKERS` / `RATE_LIMIT_MARKERS` / `UPSTREAM_INVALID_MARKERS` tuples, terminal raisers, `drain_stream_queue`, and the whole `_stream_completion` skeleton via `stream_producer` / `new_producer_context` / `consume_stream`. Providers keep only `classify_error` (composing its own extras onto the neutral tuples), session/chat setup, PoW solve, WAF warmup body, the invalid-token terminal, and their own timeout/grace globals. Do NOT copy `completion_service.py` for a new provider — write a thin adapter over `core.engine` and keep the same monkeypatch names (`_attempt`, `_run_completion_core`, `_complete_with_failover_sync`, `_stream_completion`). |
 | prompt + tool parsing | `core.tools` | Reuse: `render_prompt`, `parse_tool_calls`. |
 | SSE drain helpers | `core.transport` | Reuse. |
-| OpenAI response shim | `core.openai._openai_response` | Reuse: tool parsing resolves via `deepseaport.server.parse_tool_calls` at call time. |
+| OpenAI response shim | `core.openai._openai_response` | Reuse: tool parsing resolves via `zourcewell.server.parse_tool_calls` at call time. |
 | token normalization | `core.tokens.extract_token` | Reuse: generic JSON/raw shapes. |
-| account pool | `deepseaport.accounts` via `core.pools.make_pool` | Reuse: one pool instance per provider. |
+| account pool | `zourcewell.accounts` via `core.pools.make_pool` | Reuse: one pool instance per provider. |
 | concurrency / executors | `server_concurrency.py` | Reuse (shared executors). |
 | HTTP routes | `server_routes.py` | Reuse: provider-agnostic endpoints. |
 
@@ -275,7 +275,7 @@ auto-register until it is implemented and its line is added.
   `providers.deepseek.completion_service`, `providers.deepseek.client`,
   `core.openai`, `core.tools`. The old root paths (`deepseaport.client`,
   `deepseaport.pow`, `deepseaport.tools_support`, ...) are gone.
-- `deepseaport.server` is thin wiring only: `create_app`, `MODELS`,
+- `zourcewell.server` is thin wiring only: `create_app`, `MODELS`,
   `active_models`, `configure_logging`. Three names stay reachable as
   attributes of it on purpose — `_pool`, `_openai_response`,
   `parse_tool_calls` — because `server_routes` resolves them through this

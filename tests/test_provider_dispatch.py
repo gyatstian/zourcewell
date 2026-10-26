@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from deepseaport.config import AccountConfig, Settings
-from deepseaport.core import registry
-from deepseaport.core.provider import ModelSpec, Provider
+from zourcewell.config import AccountConfig, Settings
+from zourcewell.core import registry
+from zourcewell.core.provider import ModelSpec, Provider
 from support import settings
 from functools import partial
-from deepseaport.server import create_app
+from zourcewell.server import create_app
 
 
 class _FakeProvider(Provider):
@@ -53,7 +53,7 @@ def _register_fake() -> None:
 
 
 def test_nonstream_dispatches_through_provider(monkeypatch):
-    import deepseaport.providers.deepseek.completion_service as CS
+    import zourcewell.providers.deepseek.completion_service as CS
 
     _register_fake()
     try:
@@ -82,7 +82,7 @@ def test_stream_dispatches_through_provider():
 
 
 def test_default_deepseek_honors_engine_monkeypatch(monkeypatch):
-    import deepseaport.providers.deepseek.completion_service as CS
+    import zourcewell.providers.deepseek.completion_service as CS
 
     app = create_app(_settings(accounts=[AccountConfig(email="a@x.com", token="tok")]))
     monkeypatch.setattr(
@@ -111,8 +111,8 @@ def test_pool_never_borrows_accounts_for_an_unregistered_provider():
     construction itself must never re-open the borrow for a caller that skips
     that normalization.
     """
-    from deepseaport.server import MODELS
-    from deepseaport.server_routes import _pool_for, _prepare
+    from zourcewell.server import MODELS
+    from zourcewell.server_routes import _pool_for, _prepare
 
     s = _settings(provider="nope",
                   accounts=[AccountConfig(email="a@x.com", token="t")])

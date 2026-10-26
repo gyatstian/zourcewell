@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-import deepseaport.core.browser_paths as bp
+import zourcewell.core.browser_paths as bp
 
 
 def _windows_env_unset(monkeypatch) -> None:

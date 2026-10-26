@@ -5,13 +5,13 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from deepseaport.core import registry
-from deepseaport.core.provider import ModelSpec, Provider
-from deepseaport.providers.deepseek import completion_service as DSCS
-from deepseaport.providers.deepseek.models import DEFAULT_MODEL, MODELS_SPEC
-from deepseaport.providers.deepseek.provider import DeepSeekProvider
-from deepseaport.server import MODELS
-from deepseaport.server_routes import _prepare
+from zourcewell.core import registry
+from zourcewell.core.provider import ModelSpec, Provider
+from zourcewell.providers.deepseek import completion_service as DSCS
+from zourcewell.providers.deepseek.models import DEFAULT_MODEL, MODELS_SPEC
+from zourcewell.providers.deepseek.provider import DeepSeekProvider
+from zourcewell.server import MODELS
+from zourcewell.server_routes import _prepare
 
 
 def _body(model: str = "deepseek-flash") -> dict:

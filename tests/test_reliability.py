@@ -1,7 +1,7 @@
 """Offline regression tests for the high-value reliability fixes.
 
 Covers: session cleanup on PoW failure, atomic config writes, serialized
-obscura warmups, safe DEEPSEAPORT_PORT parsing, fresh PoW on session retry,
+obscura warmups, safe ZOURCEWELL_PORT parsing, fresh PoW on session retry,
 and wasm magic validation. No network, no credentials.
 """
 
@@ -15,14 +15,14 @@ from subprocess import CompletedProcess
 import pytest
 
 from support import (FakeBridge, app_with_bridge, cached_wasm, settings)
-from deepseaport.providers.deepseek import pow as PoW
-from deepseaport.accounts import PooledAccount
-from deepseaport.config import DEFAULT_PORT, AccountConfig, Settings
-from deepseaport.core.obscura_bridge import ObscuraBridge
-from deepseaport.providers.deepseek.protocol import StreamEvent
-from deepseaport.server import create_app
-from deepseaport.providers.deepseek.completion_service import _attempt, _run_completion_core, _session_and_challenge, _stream_completion
-from deepseaport.server_routes import _prepare
+from zourcewell.providers.deepseek import pow as PoW
+from zourcewell.accounts import PooledAccount
+from zourcewell.config import DEFAULT_PORT, AccountConfig, Settings
+from zourcewell.core.obscura_bridge import ObscuraBridge
+from zourcewell.providers.deepseek.protocol import StreamEvent
+from zourcewell.server import create_app
+from zourcewell.providers.deepseek.completion_service import _attempt, _run_completion_core, _session_and_challenge, _stream_completion
+from zourcewell.server_routes import _prepare
 
 CHALLENGE = {
     "algorithm": PoW.ALGORITHM,
@@ -84,11 +84,11 @@ def test_session_cleaned_up_when_pow_solve_raises(monkeypatch, tmp_path):
     app = app_with_bridge(_settings())
     cached_wasm(monkeypatch, tmp_path)
     deleted: list = []
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg",
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._delete_session_bg",
                         lambda *a, **k: deleted.append(a))
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-1")
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: None)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", lambda h: "sess-1")
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.solve", lambda *a, **k: None)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
@@ -102,10 +102,10 @@ def test_session_cleaned_up_when_pow_solve_raises(monkeypatch, tmp_path):
 
 def test_session_and_challenge_deletes_on_pow_fetch_failure(monkeypatch):
     deleted: list = []
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-X")
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow",
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", lambda h: "sess-X")
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow",
                         lambda h: (_ for _ in ()).throw(RuntimeError("pow fetch failed")))
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.delete_session",
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.delete_session",
                         lambda h, sid: deleted.append(sid))
 
     with pytest.raises(RuntimeError):
@@ -115,10 +115,10 @@ def test_session_and_challenge_deletes_on_pow_fetch_failure(monkeypatch):
 
 def test_session_and_challenge_deletes_on_fetch_failure_sequential(monkeypatch):
     deleted: list = []
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-Y")
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow",
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", lambda h: "sess-Y")
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow",
                         lambda h: (_ for _ in ()).throw(RuntimeError("pow fetch failed")))
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.delete_session",
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.delete_session",
                         lambda h, sid: deleted.append(sid))
 
     with pytest.raises(RuntimeError):
@@ -197,7 +197,7 @@ def test_bridges_on_same_profile_share_lock(tmp_path):
     per-profile lock they could spawn obscura concurrently with an app-bridge
     warmup and corrupt the cookie jar.
     """
-    from deepseaport.core.obscura_bridge import profile_lock
+    from zourcewell.core.obscura_bridge import profile_lock
 
     prof = str(tmp_path / "prof")
     a = ObscuraBridge(binary="fake-obscura", profile=prof)
@@ -211,9 +211,9 @@ def test_bridges_on_same_profile_share_lock(tmp_path):
 
 def test_obscura_login_token_holds_profile_lock(monkeypatch, tmp_path):
     """Login's MCP subprocess must run under the shared profile lock."""
-    from deepseaport import cli
-    from deepseaport.config import Settings
-    from deepseaport.core.obscura_bridge import profile_lock
+    from zourcewell import cli
+    from zourcewell.config import Settings
+    from zourcewell.core.obscura_bridge import profile_lock
 
     prof = str(tmp_path / "login-prof")
     settings = Settings(obscura_profile=prof, config_path="")
@@ -234,7 +234,7 @@ def test_obscura_login_token_holds_profile_lock(monkeypatch, tmp_path):
         def close(self):
             pass
 
-    monkeypatch.setattr("deepseaport.core.mcp_client.McpClient", FakeClient)
+    monkeypatch.setattr("zourcewell.core.mcp_client.McpClient", FakeClient)
 
     def run():
         try:
@@ -255,16 +255,16 @@ def test_obscura_login_token_holds_profile_lock(monkeypatch, tmp_path):
     assert result["locked"] is True
 
 
-# 4. malformed DEEPSEAPORT_PORT --------------------------------------------
+# 4. malformed ZOURCEWELL_PORT --------------------------------------------
 
 
 def test_malformed_port_env_falls_back(monkeypatch, tmp_path):
-    from deepseaport.config import load_settings
+    from zourcewell.config import load_settings
 
     cfg = tmp_path / "c.json"
-    monkeypatch.setenv("DEEPSEAPORT_PORT", "not-a-number")
+    monkeypatch.setenv("ZOURCEWELL_PORT", "not-a-number")
     assert load_settings(str(cfg)).port == DEFAULT_PORT
-    monkeypatch.setenv("DEEPSEAPORT_PORT", "7000")
+    monkeypatch.setenv("ZOURCEWELL_PORT", "7000")
     assert load_settings(str(cfg)).port == 7000
 
 
@@ -274,12 +274,12 @@ def test_malformed_port_env_falls_back(monkeypatch, tmp_path):
 def test_session_retry_refreshes_pow_header(monkeypatch, tmp_path):
     app = app_with_bridge(_settings())
     cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
     sessions = iter(["sess-1", "sess-2"])
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: next(sessions))
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._solve",
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", lambda h: next(sessions))
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._solve",
                         lambda a, token: {"X-DS-PoW-Response": "FRESH"})
 
     seen: list = []
@@ -293,7 +293,7 @@ def test_session_retry_refreshes_pow_header(monkeypatch, tmp_path):
             return "", "", "INVALID_SESSION_ID: gone", 0
         return "hi", "", None, 5
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._attempt", fake_attempt)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._attempt", fake_attempt)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
@@ -318,7 +318,7 @@ class _FakeResp:
 
 def test_ensure_wasm_rejects_non_wasm(monkeypatch, tmp_path):
     target = tmp_path / "sha3.wasm"
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.wasm_path", lambda: target)
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.wasm_path", lambda: target)
     monkeypatch.setattr("curl_cffi.requests.get",
                         lambda *a, **k: _FakeResp(b"<!doctype html><html>nope</html>"))
 
@@ -330,7 +330,7 @@ def test_ensure_wasm_rejects_non_wasm(monkeypatch, tmp_path):
 def test_ensure_wasm_accepts_valid_module(monkeypatch, tmp_path):
     target = tmp_path / "sha3.wasm"
     payload = b"\x00asm\x01\x00\x00\x00" + b"z" * 2000
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.wasm_path", lambda: target)
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.wasm_path", lambda: target)
     monkeypatch.setattr("curl_cffi.requests.get", lambda *a, **k: _FakeResp(payload))
 
     path = PoW.ensure_wasm()
@@ -365,7 +365,7 @@ def test_attempt_stops_when_cancel_event_set(monkeypatch):
         finally:
             release.set()
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.stream_completion", fake_stream)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.stream_completion", fake_stream)
     cancel = threading.Event()
     watcher_errors: list[str] = []
 
@@ -391,14 +391,14 @@ def test_generator_close_releases_account_lock(monkeypatch, tmp_path):
     """Closing the SSE generator early must release the account lock."""
     import asyncio
 
-    from deepseaport.accounts import AccountPool
+    from zourcewell.accounts import AccountPool
 
     app = app_with_bridge(_settings(stream_mode="live", auto_delete_session=False,
                                      max_retries=0))
     cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-1")
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", lambda h: "sess-1")
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.solve", lambda *a, **k: 42)
 
     state = {"closed": False, "emitted": 0}
     lock_released = threading.Event()
@@ -427,7 +427,7 @@ def test_generator_close_releases_account_lock(monkeypatch, tmp_path):
         finally:
             state["closed"] = True
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.stream_completion", fake_stream)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.stream_completion", fake_stream)
 
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
     pool = AccountPool([], provider="deepseek")
@@ -467,16 +467,16 @@ def test_banned_error_raises_403_with_expiry(monkeypatch, tmp_path):
 
     app = app_with_bridge(_settings(max_retries=0))
     cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-ban")
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", lambda h: "sess-ban")
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
     ban_until = _time.time() + 86400
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.completion_service._attempt",
+        "zourcewell.providers.deepseek.completion_service._attempt",
         lambda *a, **k: ("", "", "5: user is muted (suspended until 16 September 2026 12:49)", 0),
     )
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.check_ban", lambda h, timeout=15: (True, ban_until))
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.check_ban", lambda h, timeout=15: (True, ban_until))
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(email="banned@x.com", token="tok"))
@@ -503,7 +503,7 @@ def _ban_403(account: str) -> object:
 
 
 def _two_account_app():
-    from deepseaport.accounts import AccountPool
+    from zourcewell.accounts import AccountPool
 
     settings = _settings(
         accounts=[AccountConfig(email="a@x.com", token="tok-a-1234567890"),
@@ -517,8 +517,8 @@ def _two_account_app():
 
 def test_ban_failover_uses_next_account_and_switches_current(monkeypatch):
     """Banned CURRENT must transparently retry on the next unbanned account."""
-    from deepseaport.accounts import AccountPool
-    from deepseaport.providers.deepseek.completion_service import _complete_with_failover_sync
+    from zourcewell.accounts import AccountPool
+    from zourcewell.providers.deepseek.completion_service import _complete_with_failover_sync
 
     app, settings, pool = _two_account_app()
     used: list = []
@@ -530,7 +530,7 @@ def test_ban_failover_uses_next_account_and_switches_current(monkeypatch):
             raise _ban_403("a@x.com")
         return {"content": "hi from b", "thinking": "", "usage_total": 5}
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._run_completion_core", fake_core)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     first = pool.acquire(timeout=1)
@@ -551,8 +551,8 @@ def test_ban_failover_all_banned_raises_403(monkeypatch):
     """No healthy account left -> the ban 403 (with expiry) surfaces."""
     from fastapi import HTTPException
 
-    from deepseaport.accounts import AccountPool
-    from deepseaport.providers.deepseek.completion_service import _complete_with_failover_sync
+    from zourcewell.accounts import AccountPool
+    from zourcewell.providers.deepseek.completion_service import _complete_with_failover_sync
 
     app, settings, pool = _two_account_app()
     used: list = []
@@ -562,7 +562,7 @@ def test_ban_failover_all_banned_raises_403(monkeypatch):
         AccountPool.mark_bad(item_, seconds=86400)
         raise _ban_403(item_.cfg.email)
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._run_completion_core", fake_core)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     first = pool.acquire(timeout=1)
@@ -578,8 +578,8 @@ def test_ban_failover_all_banned_raises_403(monkeypatch):
 
 def test_non_ban_error_does_not_failover(monkeypatch):
     """Generic failures must propagate without touching the next account."""
-    from deepseaport.accounts import AccountPool
-    from deepseaport.providers.deepseek.completion_service import _complete_with_failover_sync
+    from zourcewell.accounts import AccountPool
+    from zourcewell.providers.deepseek.completion_service import _complete_with_failover_sync
 
     app, settings, pool = _two_account_app()
     used: list = []
@@ -588,7 +588,7 @@ def test_non_ban_error_does_not_failover(monkeypatch):
         used.append(item_.cfg.email)
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._run_completion_core", fake_core)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     first = pool.acquire(timeout=1)
@@ -617,13 +617,13 @@ def test_precancelled_event_aborts_session_setup_fast(monkeypatch):
     after dispatch) is pinned in
     tests/test_secret_and_leak_gaps.py::test_cancel_during_create_session_aborts_and_deletes_once.
     """
-    from deepseaport.server_concurrency import _StreamCancelled
-    from deepseaport.providers.deepseek.completion_service import _session_and_challenge
+    from zourcewell.server_concurrency import _StreamCancelled
+    from zourcewell.providers.deepseek.completion_service import _session_and_challenge
 
     dispatched: list[str] = []
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session",
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session",
                         lambda h: dispatched.append("create_session"))
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow",
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow",
                         lambda h: dispatched.append("fetch_pow"))
     cancel = threading.Event()
     cancel.set()
@@ -640,7 +640,7 @@ def test_nonstream_endpoint_takes_request_param():
     """Fix 2: POST /v1/chat/completions must accept Request for polling."""
     import inspect
 
-    from deepseaport.server import create_app
+    from zourcewell.server import create_app
 
     app = create_app(_settings())
     route = next(r for r in app.routes
@@ -652,8 +652,8 @@ def test_nonstream_disconnect_while_queued_returns_499(monkeypatch):
     """Fix 2: disconnect during the account-queue wait -> fast 499, no slot."""
     import asyncio
 
-    from deepseaport.accounts import AccountPool
-    from deepseaport.server_concurrency import _acquire_slot_or_499
+    from zourcewell.accounts import AccountPool
+    from zourcewell.server_concurrency import _acquire_slot_or_499
     from fastapi import HTTPException
 
     pool = AccountPool([AccountConfig(email="a@x.com", token="tok")],
@@ -688,9 +688,9 @@ def test_stream_producer_uses_bounded_executor():
     import importlib
     import inspect
 
-    from deepseaport import server_concurrency as SC
-    from deepseaport.core import engine as engine_mod
-    from deepseaport.core import registry
+    from zourcewell import server_concurrency as SC
+    from zourcewell.core import engine as engine_mod
+    from zourcewell.core import registry
 
     engine_src = inspect.getsource(engine_mod.stream_producer)
     assert "_STREAM_EXECUTOR.submit" in engine_src, \
@@ -701,7 +701,7 @@ def test_stream_producer_uses_bounded_executor():
     assert provider_ids, "registry imported no providers"
     for pid in provider_ids:
         mod = importlib.import_module(
-            f"deepseaport.providers.{pid.replace('-', '_')}.completion_service")
+            f"zourcewell.providers.{pid.replace('-', '_')}.completion_service")
         src = inspect.getsource(mod._stream_completion)
         assert "stream_producer" in src, (
             f"{pid}._stream_completion does not delegate to "
@@ -713,11 +713,11 @@ def test_no_bridge_surfaces_real_error(monkeypatch, tmp_path):
     app = create_app(_settings())
     assert not hasattr(app.state, "bridge")
     cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg",
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._delete_session_bg",
                         lambda *a, **k: None)
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-1")
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: None)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", lambda h: "sess-1")
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.solve", lambda *a, **k: None)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(email="a@x.com", token="tok"))
@@ -729,7 +729,7 @@ def test_endpoint_failover_banned_current_serves_from_healthy(monkeypatch):
     """POST /v1/chat/completions with banned CURRENT returns 200 via next."""
     from fastapi.testclient import TestClient
 
-    from deepseaport.accounts import AccountPool
+    from zourcewell.accounts import AccountPool
 
     app, settings, pool = _two_account_app()
     app.state.pool = pool  # endpoint reuses this pool (syncs CURRENT from settings)
@@ -740,7 +740,7 @@ def test_endpoint_failover_banned_current_serves_from_healthy(monkeypatch):
             raise _ban_403("a@x.com")
         return {"content": "served by b", "thinking": "", "usage_total": 3}
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._run_completion_core", fake_core)
     resp = TestClient(app).post("/v1/chat/completions", json={
         "model": "deepseek-flash", "messages": [{"role": "user", "content": "hi"}]})
     assert resp.status_code == 200, resp.text
@@ -760,11 +760,11 @@ def test_completion_40003_refreshes_token_and_retries(monkeypatch, tmp_path):
     """A 40003 error event must trigger one Obscura refresh + retry."""
     app = app_with_bridge(_token_settings())
     cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-1")
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._solve",
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", lambda h: "sess-1")
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._solve",
                         lambda a, token: {"Authorization": f"Bearer {token}"})
 
     calls = {"n": 0, "refresh": 0}
@@ -780,8 +780,8 @@ def test_completion_40003_refreshes_token_and_retries(monkeypatch, tmp_path):
         calls["refresh"] += 1
         return "fresh-token-1234567890"
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._attempt", fake_attempt)
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token", fake_login)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._attempt", fake_attempt)
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token", fake_login)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     item = PooledAccount(cfg=AccountConfig(
@@ -802,15 +802,15 @@ def test_completion_40003_after_refresh_surfaces_401(monkeypatch, tmp_path):
 
     app = app_with_bridge(_token_settings())
     cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", lambda h: "sess-1")
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._solve",
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", lambda h: "sess-1")
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._solve",
                         lambda a, token: {"Authorization": f"Bearer {token}"})
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._attempt",
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._attempt",
                         lambda *a, **k: ("", "", "40003: Authorization Failed (invalid token)", 0))
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings: "fresh-token-1234567890")
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
@@ -827,7 +827,7 @@ def test_session_create_40003_refreshes_token(monkeypatch, tmp_path):
     """40003 raised at session create must refresh and retry, not 500."""
     app = app_with_bridge(_token_settings())
     cached_wasm(monkeypatch, tmp_path)
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._delete_session_bg", lambda *a, **k: None)
 
     sessions = {"n": 0}
 
@@ -838,14 +838,14 @@ def test_session_create_40003_refreshes_token(monkeypatch, tmp_path):
                                "Authorization Failed (invalid token)")
         return "sess-fresh"
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.create_session", fake_create)
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
-    monkeypatch.setattr("deepseaport.providers.deepseek.pow.solve", lambda *a, **k: 42)
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._solve",
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.create_session", fake_create)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.fetch_pow", lambda h: dict(CHALLENGE))
+    monkeypatch.setattr("zourcewell.providers.deepseek.pow.solve", lambda *a, **k: 42)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._solve",
                         lambda a, token: {"Authorization": f"Bearer {token}"})
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._attempt",
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._attempt",
                         lambda *a, **k: ("hi", "", None, 5))
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings: "fresh-token-1234567890")
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
@@ -864,8 +864,8 @@ def test_auth_failover_uses_next_token_account_and_switches_current(monkeypatch)
     """Missing/invalid-token CURRENT must fail over to a healthy account."""
     from fastapi import HTTPException
 
-    from deepseaport.accounts import AccountPool
-    from deepseaport.providers.deepseek.completion_service import _complete_with_failover_sync
+    from zourcewell.accounts import AccountPool
+    from zourcewell.providers.deepseek.completion_service import _complete_with_failover_sync
 
     app, settings, pool = _two_account_app()
     used: list = []
@@ -877,7 +877,7 @@ def test_auth_failover_uses_next_token_account_and_switches_current(monkeypatch)
                                 detail="account a@x.com has no token.")
         return {"content": "hi from b", "thinking": "", "usage_total": 5}
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._run_completion_core", fake_core)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     first = pool.acquire(timeout=1)
@@ -899,8 +899,8 @@ def test_auth_failover_all_invalid_raises_original_401(monkeypatch):
     """When every account rejects auth, surface the original 401, not a loop."""
     from fastapi import HTTPException
 
-    from deepseaport.accounts import AccountPool
-    from deepseaport.providers.deepseek.completion_service import _complete_with_failover_sync
+    from zourcewell.accounts import AccountPool
+    from zourcewell.providers.deepseek.completion_service import _complete_with_failover_sync
 
     app, settings, pool = _two_account_app()
     used: list = []
@@ -910,7 +910,7 @@ def test_auth_failover_all_invalid_raises_original_401(monkeypatch):
         raise HTTPException(status_code=401,
                             detail=f"account {item_.cfg.email} has no token.")
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.completion_service._run_completion_core", fake_core)
+    monkeypatch.setattr("zourcewell.providers.deepseek.completion_service._run_completion_core", fake_core)
     prep = _prepare({"model": "deepseek-flash",
                      "messages": [{"role": "user", "content": "hi"}]})
     first = pool.acquire(timeout=1)
@@ -925,8 +925,8 @@ def test_ban_403_persists_banned_state_for_account_list(tmp_path):
     """Server-detected bans must survive in config for CLI/TUI labels."""
     import time as _time
 
-    from deepseaport.config import load_settings
-    from deepseaport.providers.deepseek.completion_service import _ban_403_for_item
+    from zourcewell.config import load_settings
+    from zourcewell.providers.deepseek.completion_service import _ban_403_for_item
 
     path = tmp_path / "config.json"
     settings = _settings(
@@ -950,7 +950,7 @@ def test_ban_403_persists_banned_state_for_account_list(tmp_path):
 
 def test_token_refresh_normalizes_json_wrapper(monkeypatch):
     """Real-browser login returns localStorage JSON; never store it verbatim."""
-    from deepseaport.providers.deepseek.completion_service import _refresh_token_via_obscura
+    from zourcewell.providers.deepseek.completion_service import _refresh_token_via_obscura
 
     settings = _settings(accounts=[AccountConfig(email="a@x.com", password="pw",
                                                  token="stale-token-1234567890")],
@@ -958,7 +958,7 @@ def test_token_refresh_normalizes_json_wrapper(monkeypatch):
     app = app_with_bridge(settings)
     item = PooledAccount(cfg=settings.accounts[0])
     raw = '{"value":"' + ("x" * 64) + '","__version":"0"}'
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings_: raw)
 
     token, banned, detail = _refresh_token_via_obscura(app, item)
@@ -978,7 +978,7 @@ def test_token_refresh_releases_slot_during_browser_run(monkeypatch):
     """
     import threading as _threading
 
-    from deepseaport.providers.deepseek.completion_service import _refresh_token_via_obscura
+    from zourcewell.providers.deepseek.completion_service import _refresh_token_via_obscura
 
     settings = _settings(accounts=[AccountConfig(email="a@x.com", password="pw",
                                                  token="stale-token-1234567890")],
@@ -995,7 +995,7 @@ def test_token_refresh_releases_slot_during_browser_run(monkeypatch):
             item.lock.release()
         return "fresh-token-1234567890"
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token",
                         fake_login)
 
     token, banned, detail = _refresh_token_via_obscura(app, item)
@@ -1007,7 +1007,7 @@ def test_token_refresh_releases_slot_during_browser_run(monkeypatch):
 
 def test_invalid_token_401_detail_shared(monkeypatch):
     """Finding 2 (partial): both invalid-token 401s share one message."""
-    from deepseaport.providers.deepseek.completion_service import (
+    from zourcewell.providers.deepseek.completion_service import (
         _invalid_token_401_detail,
     )
 

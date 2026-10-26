@@ -16,12 +16,12 @@ import sys
 import textwrap
 from pathlib import Path
 
-from deepseaport.core import transport as T
-from deepseaport.core.openai import build_usage, estimate_tokens
-from deepseaport.providers.deepseek import client as DS
-from deepseaport.providers.qwen import client as QC
-from deepseaport.providers.qwen import completion_service as QCS
-from deepseaport.providers.qwen import sse_parser as QSP
+from zourcewell.core import transport as T
+from zourcewell.core.openai import build_usage, estimate_tokens
+from zourcewell.providers.deepseek import client as DS
+from zourcewell.providers.qwen import client as QC
+from zourcewell.providers.qwen import completion_service as QCS
+from zourcewell.providers.qwen import sse_parser as QSP
 
 
 # --- F2: the usage number a provider reports must be COMPLETION tokens ------
@@ -57,7 +57,7 @@ def test_qwen_live_sample_builds_approx_one_completion_token():
 
 def test_stream_usage_chunk_reports_completion_count():
     """Same numbers on the streaming path (stream_options.include_usage)."""
-    from deepseaport.core import engine
+    from zourcewell.core import engine
 
     prep = {"prompt": "y" * 40, "model": "qwen3.7-plus"}
     raw = engine.usage_chunk(
@@ -101,7 +101,7 @@ def test_qwen_usage_all_three_key_shapes():
 def test_deepseek_usage_still_feeds_accumulated_total():
     """DeepSeek reports an accumulated output total, so it passes its own
     usage_total straight through — unchanged by the Qwen-side fix."""
-    from deepseaport.providers.deepseek import sse_parser as DSP
+    from zourcewell.providers.deepseek import sse_parser as DSP
 
     line = 'data: {"p":"response/accumulated_token_usage","v":99}'
     kinds = [e for e in DSP.StreamParser().feed(line) if e.kind == "usage"]
@@ -221,9 +221,9 @@ def test_qwen_provider_reads_its_own_models_module(monkeypatch):
     """
     import importlib
 
-    from deepseaport.core.provider import ModelSpec
+    from zourcewell.core.provider import ModelSpec
 
-    mod = importlib.import_module("deepseaport.providers.qwen.provider")
+    mod = importlib.import_module("zourcewell.providers.qwen.provider")
     prov = mod.create_provider()
     assert prov.id == "qwen"
     spec = ModelSpec(id="qwen-probe", thinking=True, search=False,
@@ -255,14 +255,14 @@ def test_provider_modules_are_import_safe():
         def _boom(self, *a, **k):
             raise AssertionError("import must not open a socket")
         socket.socket.connect = _boom
-        import deepseaport.providers.qwen.provider as q
-        import deepseaport.providers.qwen.models as qm
-        import deepseaport.providers.deepseek.provider as d
-        import deepseaport.providers.deepseek.models as dm
-        import deepseaport.providers.qwen.protocol
-        import deepseaport.providers.qwen.sse_parser
-        import deepseaport.providers.qwen.client
-        import deepseaport.providers.qwen.completion_service
+        import zourcewell.providers.qwen.provider as q
+        import zourcewell.providers.qwen.models as qm
+        import zourcewell.providers.deepseek.provider as d
+        import zourcewell.providers.deepseek.models as dm
+        import zourcewell.providers.qwen.protocol
+        import zourcewell.providers.qwen.sse_parser
+        import zourcewell.providers.qwen.client
+        import zourcewell.providers.qwen.completion_service
         socket.socket.connect = real_conn
         assert q.QwenProvider().models() == dict(qm.MODELS_SPEC)
         assert d.DeepSeekProvider().models() == dict(dm.MODELS_SPEC)
@@ -281,8 +281,8 @@ def test_importing_registry_does_not_pull_in_server():
         """
         import sys
         sys.path.insert(0, %r)
-        import deepseaport.core.registry  # noqa: F401
-        print("deepseaport.server" in sys.modules)
+        import zourcewell.core.registry  # noqa: F401
+        print("zourcewell.server" in sys.modules)
         """
     ) % str(_SRC_DIR)
     out = _run_py(code)
@@ -297,11 +297,11 @@ def test_server_reexports_still_resolve():
     thin surface still resolves, that the three seams the route layer looks up
     through this module are the REAL objects (not copies), and that the
     F11c logging move did not shadow anything."""
-    import deepseaport.core.openai as core_openai
-    import deepseaport.core.tools as core_tools
-    import deepseaport.providers.deepseek.completion_service as ds_completion
-    import deepseaport.server as S
-    import deepseaport.server_routes as sr
+    import zourcewell.core.openai as core_openai
+    import zourcewell.core.tools as core_tools
+    import zourcewell.providers.deepseek.completion_service as ds_completion
+    import zourcewell.server as S
+    import zourcewell.server_routes as sr
 
     for name in ("MODELS", "active_models", "create_app",
                  "register_routes", "_pool", "_openai_response",
@@ -324,7 +324,7 @@ _IMPORT_SIDE_EFFECT_PROBE = textwrap.dedent(
     sys.path.insert(0, %r)
     root = logging.getLogger()
     before = (root.level, len(root.handlers))
-    import deepseaport.server  # noqa: F401
+    import zourcewell.server  # noqa: F401
     after = (root.level, len(root.handlers))
     print(before)
     print(after)
@@ -346,8 +346,8 @@ def test_creating_app_leaves_root_logger_level_untouched(monkeypatch):
     """create_app calls basicConfig, which no-ops once the root is configured,
     so an embedding host (or chat_ui, which forces the root to ERROR) keeps its
     own level. The caller can still opt in explicitly."""
-    from deepseaport.server import configure_logging, create_app
-    from deepseaport.config import Settings
+    from zourcewell.server import configure_logging, create_app
+    from zourcewell.config import Settings
 
     root = logging.getLogger()
     saved_level, saved_handlers = root.level, list(root.handlers)
@@ -373,9 +373,9 @@ def test_creating_app_leaves_root_logger_level_untouched(monkeypatch):
 
 def test_chat_log_survives_app_creation(monkeypatch):
     """chat_ui silences the root BEFORE create_app; that must still hold."""
-    from deepseaport import chat_repl
-    from deepseaport.config import Settings
-    from deepseaport.server import create_app
+    from zourcewell import chat_repl
+    from zourcewell.config import Settings
+    from zourcewell.server import create_app
 
     root = logging.getLogger()
     saved_level, saved_handlers = root.level, list(root.handlers)
@@ -404,7 +404,7 @@ def test_configure_logging_is_a_noop_on_a_configured_root(monkeypatch):
     silently skipped instead of failing, and the property it names (a no-op
     `configure_logging` on a configured root) would go unpinned.
     """
-    from deepseaport import server as S
+    from zourcewell import server as S
 
     root = logging.getLogger()
     saved_level, saved_handlers = root.level, list(root.handlers)
@@ -454,7 +454,7 @@ def _stdlib_basic_config(**kw) -> None:
 def test_engine_wants_usage_is_the_usage_consumer():
     """F11b: `openai.should_emit_usage` was a duplicate of this predicate; the
     consumer is core.engine.wants_usage and it must keep reading the request."""
-    from deepseaport.core import engine
+    from zourcewell.core import engine
     assert engine.wants_usage({"stream_options": {"include_usage": True}}) is True
     assert engine.wants_usage({}) is False
 
@@ -462,7 +462,7 @@ def test_engine_wants_usage_is_the_usage_consumer():
 def test_openai_response_usage_is_built_once():
     """F11a: build_usage recomputes both counts; the duplicate pt/ct locals
     were dead stores."""
-    from deepseaport.core.openai import _openai_response
+    from zourcewell.core.openai import _openai_response
 
     prep = {"model": "deepseek-flash", "prompt": "z" * 40, "tools": None}
     out = _openai_response(prep, {"content": "hello", "thinking": "",

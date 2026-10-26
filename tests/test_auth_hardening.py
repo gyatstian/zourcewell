@@ -4,7 +4,7 @@ Every test here fails on the pre-fix code. The defects are grouped by the
 blast radius they remove:
 
 * ``load_settings`` kept blank API keys (``"keys": [""]``) and let a
-  ``DEEPSEAPORT_KEYS=","`` override wipe the file's keys, so the server ran
+  ``ZOURCEWELL_KEYS=","`` override wipe the file's keys, so the server ran
   with an empty (i.e. open) key list that looked configured.
 * ``_check_auth`` compared keys with ``in`` (timing- and blank-key friendly).
 * ``/health`` served the account identifier, ``/v1/waf/status`` served the
@@ -40,22 +40,22 @@ import uvicorn
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from deepseaport import dry_run as dry_run_mod
-from deepseaport import server_runner
-from deepseaport.accounts import AccountPool
-from deepseaport.config import (
+from zourcewell import dry_run as dry_run_mod
+from zourcewell import server_runner
+from zourcewell.accounts import AccountPool
+from zourcewell.config import (
     MAX_RETRIES_LIMIT,
     AccountConfig,
     Settings,
     load_settings,
 )
-from deepseaport.core import registry
-from deepseaport.core.provider import ModelSpec, Provider
-from deepseaport.server import create_app
+from zourcewell.core import registry
+from zourcewell.core.provider import ModelSpec, Provider
+from zourcewell.server import create_app
 from support import settings as _settings, write_config
 
-from deepseaport.server_routes import _check_auth, _prepare
-from deepseaport.server_routes import (
+from zourcewell.server_routes import _check_auth, _prepare
+from zourcewell.server_routes import (
     MAX_ACCOUNTS,
     MAX_IDENTIFIER_CHARS,
     MAX_REQUEST_BYTES,
@@ -63,7 +63,7 @@ from deepseaport.server_routes import (
     MAX_TOOLS_PER_REQUEST,
     _key_matches,
 )
-from deepseaport.server_runner import (
+from zourcewell.server_runner import (
     UVICORN_LIMIT_CONCURRENCY,
     UVICORN_TIMEOUT_KEEP_ALIVE,
     lan_exposure_notice,
@@ -121,17 +121,17 @@ def test_blank_key_next_to_a_real_one_keeps_the_gate(tmp_path):
 
 def test_env_keys_parsing_to_zero_keeps_file_keys_and_warns(tmp_path, caplog):
     cfg = write_config(tmp_path, {"keys": ["filekey"]})
-    with caplog.at_level(logging.WARNING, logger="deepseaport.config"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.config"):
         import os
 
-        os.environ["DEEPSEAPORT_KEYS"] = ","
+        os.environ["ZOURCEWELL_KEYS"] = ","
         try:
             settings = load_settings(str(cfg))
         finally:
-            del os.environ["DEEPSEAPORT_KEYS"]
+            del os.environ["ZOURCEWELL_KEYS"]
     assert settings.keys == ["filekey"]
     warned = " ".join(r.getMessage() for r in caplog.records)
-    assert "DEEPSEAPORT_KEYS" in warned
+    assert "ZOURCEWELL_KEYS" in warned
     assert "AUTH DISABLED" in warned
 
 
@@ -139,11 +139,11 @@ def test_env_keys_parsing_to_zero_still_enforces_file_key(tmp_path):
     cfg = write_config(tmp_path, {"keys": ["filekey"]})
     import os
 
-    os.environ["DEEPSEAPORT_KEYS"] = " , "
+    os.environ["ZOURCEWELL_KEYS"] = " , "
     try:
         client = _client(load_settings(str(cfg)))
     finally:
-        del os.environ["DEEPSEAPORT_KEYS"]
+        del os.environ["ZOURCEWELL_KEYS"]
     assert client.get("/v1/accounts").status_code == 401
     ok = client.get("/v1/accounts", headers={"Authorization": "Bearer filekey"})
     assert ok.status_code == 200
@@ -152,7 +152,7 @@ def test_env_keys_parsing_to_zero_still_enforces_file_key(tmp_path):
 def test_env_keys_clean_parse_still_overrides(monkeypatch, tmp_path):
     """The override keeps working when it parses to at least one key."""
     cfg = write_config(tmp_path, {"keys": ["filekey"]})
-    monkeypatch.setenv("DEEPSEAPORT_KEYS", " a ,b,, c ")
+    monkeypatch.setenv("ZOURCEWELL_KEYS", " a ,b,, c ")
     assert load_settings(str(cfg)).keys == ["a", "b", "c"]
 
 
@@ -209,7 +209,7 @@ def test_max_retries_clamps_to_documented_range(tmp_path, raw, expected):
 
 def test_max_retries_env_also_clamped(monkeypatch, tmp_path):
     cfg = write_config(tmp_path, {})
-    monkeypatch.setenv("DEEPSEAPORT_MAX_RETRIES", "99")
+    monkeypatch.setenv("ZOURCEWELL_MAX_RETRIES", "99")
     assert load_settings(str(cfg)).max_retries == MAX_RETRIES_LIMIT
 
 
@@ -701,7 +701,7 @@ def test_dry_run_config_carries_limits_and_keeps_access_log_off(monkeypatch,
                         lambda app, **kw: seen.update(kw) or types.SimpleNamespace())
     monkeypatch.setattr(uvicorn, "Server", lambda config: types.SimpleNamespace(
         run=lambda: None))
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port",
+    monkeypatch.setattr("zourcewell.cli._ensure_free_port",
                         lambda s, h, p: p)
     monkeypatch.setattr(server_runner, "_watch_stop_keys", lambda *a, **k: None)
     assert dry_run_mod.run_dry_run(
@@ -760,11 +760,11 @@ def test_blank_config_keys_warn_that_auth_is_disabled(tmp_path, caplog):
     import json
     import logging
 
-    from deepseaport.config import load_settings
+    from zourcewell.config import load_settings
 
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({"keys": ["", "   "], "accounts": []}), encoding="utf-8")
-    with caplog.at_level(logging.WARNING, logger="deepseaport.config"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.config"):
         settings = load_settings(str(cfg))
     assert settings.keys == []
     assert "AUTH DISABLED" in caplog.text
@@ -781,7 +781,7 @@ def test_blank_config_keys_warn_that_auth_is_disabled(tmp_path, caplog):
         other.write_text(json.dumps({"keys": [""] * n, "accounts": []}),
                          encoding="utf-8")
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="deepseaport.config"):
+        with caplog.at_level(logging.WARNING, logger="zourcewell.config"):
             assert load_settings(str(other)).keys == []
         assert f"has {n} API key entr(y/ies)" in caplog.text, caplog.text
 
@@ -791,11 +791,11 @@ def test_absent_keys_stay_silent(tmp_path, caplog):
     import json
     import logging
 
-    from deepseaport.config import load_settings
+    from zourcewell.config import load_settings
 
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({"accounts": []}), encoding="utf-8")
-    with caplog.at_level(logging.WARNING, logger="deepseaport.config"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.config"):
         assert load_settings(str(cfg)).keys == []
     assert "AUTH DISABLED" not in caplog.text
 
@@ -804,10 +804,10 @@ def test_real_keys_stay_silent(tmp_path, caplog):
     import json
     import logging
 
-    from deepseaport.config import load_settings
+    from zourcewell.config import load_settings
 
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({"keys": ["sk-ok", ""], "accounts": []}), encoding="utf-8")
-    with caplog.at_level(logging.WARNING, logger="deepseaport.config"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.config"):
         assert load_settings(str(cfg)).keys == ["sk-ok"]
     assert "AUTH DISABLED" not in caplog.text

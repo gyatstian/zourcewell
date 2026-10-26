@@ -25,8 +25,8 @@ from __future__ import annotations
 from functools import partial
 
 from support import AccountConfig, settings
-from deepseaport import tui, tui_editor
-from deepseaport.config import Settings, load_settings
+from zourcewell import tui, tui_editor
+from zourcewell.config import Settings, load_settings
 
 
 _fresh = partial(settings, config_path="", log_level="INFO",
@@ -187,14 +187,14 @@ def test_token_auto_login_typed_email_uses_the_scoped_record(monkeypatch):
     produced was then written onto the qwen record -- a deepseek credential in
     a qwen row.
     """
-    from deepseaport.core import registry as _reg
+    from zourcewell.core import registry as _reg
 
     qwen_seen: list[tuple[str, str]] = []
     deepseek_seen: list[str] = []
     monkeypatch.setattr(_reg.get("qwen"), "login",
                         lambda email, password, settings:
                         (qwen_seen.append((email, password)) or ("tok-q", False, "")))
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token",
                         lambda email, password, settings:
                         (deepseek_seen.append(email) or ("tok-ds", False, "")))
     s = _fresh(
@@ -216,7 +216,7 @@ def test_token_auto_login_typed_email_uses_the_scoped_record(monkeypatch):
 
 def _banned_login(monkeypatch, token="banned-tok-9"):
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.auth.obscura_login_token",
+        "zourcewell.providers.deepseek.auth.obscura_login_token",
         lambda email, password, settings:
         (token, True, "suspended until 16 September 2030"))
 
@@ -247,7 +247,7 @@ def test_set_token_unbanned_auto_login_says_nothing_about_unblock(
                                        token="", provider="deepseek")],
                provider="deepseek", providers=[])
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.auth.obscura_login_token",
+        "zourcewell.providers.deepseek.auth.obscura_login_token",
         lambda email, password, settings: ("tok-fresh", False, ""))
     _answers(monkeypatch, ["t", "a@x.com", "", "y", "q"])
 

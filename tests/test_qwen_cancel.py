@@ -72,8 +72,8 @@ class _SilentJsonStream(_SilentStream):
 
 
 _CLIENTS = [
-    pytest.param("deepseaport.providers.qwen.client", id="qwen"),
-    pytest.param("deepseaport.providers.deepseek.client", id="deepseek"),
+    pytest.param("zourcewell.providers.qwen.client", id="qwen"),
+    pytest.param("zourcewell.providers.deepseek.client", id="deepseek"),
 ]
 
 
@@ -93,8 +93,8 @@ def test_a_disconnect_ends_the_stream_during_a_silent_read(monkeypatch, mod):
     ``queue.get`` stays untimed, so the per-event cancel check in
     ``drain_attempt`` is never reached and the read parks for DEFAULT_TIMEOUT.
     """
-    from deepseaport.core import engine as _engine
-    from deepseaport.core import transport as T
+    from zourcewell.core import engine as _engine
+    from zourcewell.core import transport as T
 
     client = importlib.import_module(mod)
     monkeypatch.setattr(T, "_READ_SLICE_SECONDS", 0.1)
@@ -142,8 +142,8 @@ def test_a_disconnect_ends_a_silent_non_sse_drain(monkeypatch, mod):
     expired, so the account lock and its worker stayed held. The cancel must
     end the drain within a read slice.
     """
-    from deepseaport.core import engine as _engine
-    from deepseaport.core import transport as T
+    from zourcewell.core import engine as _engine
+    from zourcewell.core import transport as T
 
     client = importlib.import_module(mod)
     monkeypatch.setattr(T, "_READ_SLICE_SECONDS", 0.1)
@@ -188,7 +188,7 @@ def test_without_a_token_the_read_is_left_exactly_as_it_was(monkeypatch, mod):
     ``data: [DONE]`` is the one line both wire parsers finish on, so the same
     control works for each provider.
     """
-    from deepseaport.core import transport as T
+    from zourcewell.core import transport as T
 
     client = importlib.import_module(mod)
     monkeypatch.setattr(T, "_READ_SLICE_SECONDS", 0.1)
@@ -213,8 +213,8 @@ def test_deepseek_reexports_the_shared_bounded_read():
     ``_READ_SLICE_SECONDS`` off the DeepSeek client, and its stream path must
     keep calling the module-global name so a patch there still wins.
     """
-    from deepseaport.core import transport as T
-    from deepseaport.providers.deepseek import client as DS
+    from zourcewell.core import transport as T
+    from zourcewell.providers.deepseek import client as DS
 
     assert DS._cancellable is T._cancellable
     assert DS._ClientGone is T._ClientGone

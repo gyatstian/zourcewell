@@ -25,10 +25,10 @@ import time
 import pytest
 
 from support import FakeBridge, settings
-from deepseaport.providers.deepseek import client as DS
-from deepseaport.providers.deepseek import pow as PoW
-from deepseaport.config import AccountConfig, Settings, load_settings
-from deepseaport.server import create_app
+from zourcewell.providers.deepseek import client as DS
+from zourcewell.providers.deepseek import pow as PoW
+from zourcewell.config import AccountConfig, Settings, load_settings
+from zourcewell.server import create_app
 
 REASONER = "deepseek-flash-reasoner"
 QUESTION = "Solve 6*7 step by step, keep it very short."
@@ -105,17 +105,17 @@ def _live_ready() -> tuple[bool, str]:
     if not settings.accounts:
         return False, "no accounts in config"
     if not any(a.token for a in settings.accounts):
-        return False, "no account token (run: deepseaport login)"
+        return False, "no account token (run: zourcewell login)"
     # The model catalogue is the union of the *active* providers. Selecting a
     # provider that does not serve deepseek-* would make these tests 404 with
     # "model not available" — a configuration fact, not a latency failure.
-    from deepseaport.server import active_models
+    from zourcewell.server import active_models
     if REASONER not in active_models(settings):
         return False, (
             f"active provider(s) do not serve {REASONER!r} "
             "(set provider=deepseek / providers=[deepseek])"
         )
-    from deepseaport.core.obscura_bridge import ObscuraBridge
+    from zourcewell.core.obscura_bridge import ObscuraBridge
     bridge = ObscuraBridge(settings.obscura_bin, settings.obscura_profile)
     if shutil_which(bridge.binary) is None and not _exists(bridge.binary):
         return False, f"obscura binary not found: {bridge.binary}"
@@ -142,7 +142,7 @@ def test_live_reasoner_latency(monkeypatch):
         pytest.skip(why)
 
     settings = load_settings()
-    from deepseaport.core.obscura_bridge import ObscuraBridge
+    from zourcewell.core.obscura_bridge import ObscuraBridge
 
     t_warm0 = time.perf_counter()
     bridge = ObscuraBridge(settings.obscura_bin, settings.obscura_profile)
@@ -202,7 +202,7 @@ def test_live_reasoner_nonstream_wall(monkeypatch):
         pytest.skip(why)
 
     settings = load_settings()
-    from deepseaport.core.obscura_bridge import ObscuraBridge
+    from zourcewell.core.obscura_bridge import ObscuraBridge
     bridge = ObscuraBridge(settings.obscura_bin, settings.obscura_profile)
     bridge.warmup()
     if not bridge.has_waf_token():
@@ -283,7 +283,7 @@ def _make_fakes(phases: dict[str, float]) -> dict:
 
 
 # imported late so module import never fails without fastapi/httpx
-from deepseaport.providers.deepseek.protocol import StreamEvent  # noqa: E402
+from zourcewell.providers.deepseek.protocol import StreamEvent  # noqa: E402
 
 
 def test_offline_reasoner_phase_timing(monkeypatch):

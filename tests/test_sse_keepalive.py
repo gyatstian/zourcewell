@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 
-from deepseaport.core import engine
+from zourcewell.core import engine
 
 PING = b": ping\n\n"
 # The shipped interval, spelled out: it must stay well under nginx's 60s idle

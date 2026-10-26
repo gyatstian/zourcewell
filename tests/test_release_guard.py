@@ -79,7 +79,7 @@ def _tree(tmp_path: Path, **files) -> Path:
 
 def _clean(src: Path) -> Path:
     """Minimum realistic artifact: the exe, the downloaded wasm, the template."""
-    (src / "deepseaport.exe").write_bytes(b"MZ" + b"\0" * 512)
+    (src / "zourcewell.exe").write_bytes(b"MZ" + b"\0" * 512)
     (src / "data").mkdir(exist_ok=True)
     (src / "data" / "sha3_wasm_bg.7b9ca65ddd.wasm").write_bytes(b"\0asm" + b"\0" * 64)
     (src / "config.example.json").write_text(json.dumps({
@@ -179,7 +179,7 @@ def test_clean_tree_packages(tmp_path):
     assert zip_path.is_file()
     with zipfile.ZipFile(zip_path) as zf:
         names = zf.namelist()
-    assert f"dist/deepseaport.exe" in names
+    assert f"dist/zourcewell.exe" in names
     assert f"dist/data/sha3_wasm_bg.7b9ca65ddd.wasm" in names
     # The public template passes: it holds the example key the README prints.
     assert f"dist/config.example.json" in names
@@ -212,7 +212,7 @@ def test_backups_and_temp_files_are_excluded(tmp_path):
 
 
 def test_env_and_pem_leftovers_are_excluded(tmp_path):
-    src = _clean(_tree(tmp_path, **{".env": "DEEPSEAPORT_TOKEN=x", "k.pem": "x"}))
+    src = _clean(_tree(tmp_path, **{".env": "ZOURCEWELL_TOKEN=x", "k.pem": "x"}))
     out = tmp_path / "release"
     assert prepare_release.main(["--dist", str(src), "--out", str(out)]) == 0
     with zipfile.ZipFile(out / "dist.zip") as zf:
@@ -225,7 +225,7 @@ def test_survey_classifies_without_writing(tmp_path):
     src = _clean(_tree(tmp_path, **{"config.json": _LIVE}))
     included, excluded, secrets = prepare_release.survey(src)
     assert [rel.as_posix() for rel, _r, _d in secrets] == ["config.json"]
-    assert any(rel.as_posix() == "deepseaport.exe" for rel, _s in included)
+    assert any(rel.as_posix() == "zourcewell.exe" for rel, _s in included)
     assert any(rel.as_posix() == "config.example.json" for rel, _s in included)
 
 
@@ -263,7 +263,7 @@ def test_rerunning_is_safe_and_produces_the_same_artifact(tmp_path):
     second = sorted(zipfile.ZipFile(out / "dist.zip").namelist())
     assert first == second
     assert not stale.exists(), "stale file survived a rebuild"
-    assert src.is_dir() and (src / "deepseaport.exe").is_file()
+    assert src.is_dir() and (src / "zourcewell.exe").is_file()
 
 
 # --- account identifiers are credentials too --------------------------------
@@ -362,7 +362,7 @@ def _pyproject_version() -> str:
 
 
 def test_spec_derives_the_frozen_version_from_pyproject():
-    """deepseaport.spec stamps [project] version into the exe's version
+    """zourcewell.spec stamps [project] version into the exe's version
     resource. It used to wrap that read in `except Exception: VERSION =
     "0.0.0"`, so a build on an interpreter without tomllib -- or against a
     moved pyproject.toml -- shipped an exe whose version read 0.0.0 with no
@@ -372,7 +372,7 @@ def test_spec_derives_the_frozen_version_from_pyproject():
     so putting the fallback back turns this into a SyntaxError instead of a
     silent pass.
     """
-    src = (_ROOT / "deepseaport.spec").read_text(encoding="utf-8")
+    src = (_ROOT / "zourcewell.spec").read_text(encoding="utf-8")
     # "\nVERSION = " (line-anchored) so the prose in the spec's own comment
     # about the fallback it used to have cannot be mistaken for the code.
     block = src[src.index("\nVERSION = ") + 1:src.index("datas = []")]
@@ -382,13 +382,13 @@ def test_spec_derives_the_frozen_version_from_pyproject():
 
 
 def test_package_version_is_the_pyproject_version():
-    """deepseaport.__version__ is what FastAPI's `version=` and any /health
+    """zourcewell.__version__ is what FastAPI's `version=` and any /health
     field read. It used to be a hardcoded literal that had drifted to 0.1.0
     while nothing imported it at all.
     """
-    import deepseaport
+    import zourcewell
 
-    assert deepseaport.__version__ == _pyproject_version()
+    assert zourcewell.__version__ == _pyproject_version()
 
 
 def _spec_build_helpers(**seed) -> dict:
@@ -398,7 +398,7 @@ def _spec_build_helpers(**seed) -> dict:
     call time), so the parsing/validation tier runs in CI, which has no
     PyInstaller; the PyInstaller-backed test below injects the real module.
     """
-    src = (_ROOT / "deepseaport.spec").read_text(encoding="utf-8")
+    src = (_ROOT / "zourcewell.spec").read_text(encoding="utf-8")
     ns: dict = dict(seed)
     exec(src[src.index("def _file_version("):src.index("exe = EXE(")], ns)
     return ns
@@ -435,7 +435,7 @@ def test_spec_passes_the_version_resource_object_not_the_string():
     never succeed."""
     import re
 
-    src = (_ROOT / "deepseaport.spec").read_text(encoding="utf-8")
+    src = (_ROOT / "zourcewell.spec").read_text(encoding="utf-8")
 
     assert not re.search(r"^\s*version=VERSION\s*,", src, re.M), \
         "EXE(version=VERSION) passes a string, which PyInstaller reads as a path"
@@ -460,10 +460,10 @@ def test_spec_version_resource_carries_the_version_and_product_strings():
     assert res.ffi.productVersionMS == res.ffi.fileVersionMS
     assert res.ffi.productVersionLS == res.ffi.fileVersionLS
     assert {s.name: s.val for s in res.kids[0].kids[0].kids} == {
-        "CompanyName": "deepseaport",
+        "CompanyName": "zourcewell",
         "FileVersion": version,
-        "OriginalFilename": "deepseaport.exe",
-        "ProductName": "deepseaport",
+        "OriginalFilename": "zourcewell.exe",
+        "ProductName": "zourcewell",
         "ProductVersion": version,
     }
     assert res.kids[1].kids[0].kids == [1033, 1200]

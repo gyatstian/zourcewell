@@ -6,37 +6,37 @@ import time
 
 import pytest
 
-from deepseaport.core import tools as T
-from deepseaport.core.tools.parser.tags import _tag_spans
+from zourcewell.core import tools as T
+from zourcewell.core.tools.parser.tags import _tag_spans
 
 
 # --- _int_env ---
 
 def test_int_env_missing_returns_default(monkeypatch):
-    monkeypatch.delenv("DEEPSEAPORT_TEST_INT_GAP", raising=False)
-    assert T._int_env("DEEPSEAPORT_TEST_INT_GAP", 7) == 7
+    monkeypatch.delenv("ZOURCEWELL_TEST_INT_GAP", raising=False)
+    assert T._int_env("ZOURCEWELL_TEST_INT_GAP", 7) == 7
 
 
 def test_int_env_bad_string_returns_default(monkeypatch):
-    monkeypatch.setenv("DEEPSEAPORT_TEST_INT_GAP", "notanint")
-    assert T._int_env("DEEPSEAPORT_TEST_INT_GAP", 7) == 7
+    monkeypatch.setenv("ZOURCEWELL_TEST_INT_GAP", "notanint")
+    assert T._int_env("ZOURCEWELL_TEST_INT_GAP", 7) == 7
 
 
 def test_int_env_empty_returns_default(monkeypatch):
-    monkeypatch.setenv("DEEPSEAPORT_TEST_INT_GAP", "")
-    assert T._int_env("DEEPSEAPORT_TEST_INT_GAP", 7) == 7
+    monkeypatch.setenv("ZOURCEWELL_TEST_INT_GAP", "")
+    assert T._int_env("ZOURCEWELL_TEST_INT_GAP", 7) == 7
 
 
 def test_int_env_zero_and_negative_return_default(monkeypatch):
-    monkeypatch.setenv("DEEPSEAPORT_TEST_INT_GAP", "0")
-    assert T._int_env("DEEPSEAPORT_TEST_INT_GAP", 7) == 7
-    monkeypatch.setenv("DEEPSEAPORT_TEST_INT_GAP", "-5")
-    assert T._int_env("DEEPSEAPORT_TEST_INT_GAP", 7) == 7
+    monkeypatch.setenv("ZOURCEWELL_TEST_INT_GAP", "0")
+    assert T._int_env("ZOURCEWELL_TEST_INT_GAP", 7) == 7
+    monkeypatch.setenv("ZOURCEWELL_TEST_INT_GAP", "-5")
+    assert T._int_env("ZOURCEWELL_TEST_INT_GAP", 7) == 7
 
 
 def test_int_env_valid_returns_int(monkeypatch):
-    monkeypatch.setenv("DEEPSEAPORT_TEST_INT_GAP", "42")
-    assert T._int_env("DEEPSEAPORT_TEST_INT_GAP", 7) == 42
+    monkeypatch.setenv("ZOURCEWELL_TEST_INT_GAP", "42")
+    assert T._int_env("ZOURCEWELL_TEST_INT_GAP", 7) == 42
 
 
 # --- _valid_names ---
@@ -351,7 +351,7 @@ def test_parse_tool_calls_fenced_tool_calls_array():
 def test_parse_tool_calls_debug_miss_returns_unchanged(caplog):
     tools = [{"type": "function", "function": {"name": "calc"}}]
     text = '{"tool_calls": [{"function": {"name": "nope", "arguments": "{}"}}]}'
-    with caplog.at_level(logging.DEBUG, logger="deepseaport.tools"):
+    with caplog.at_level(logging.DEBUG, logger="zourcewell.tools"):
         calls, rest = T.parse_tool_calls(text, tools)
     assert calls is None
     assert rest == text

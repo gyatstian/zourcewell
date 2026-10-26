@@ -7,17 +7,17 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from deepseaport.config import AccountConfig, Settings
-from deepseaport.core import registry
-from deepseaport.providers.opencode import client as OC
-from deepseaport.providers.opencode import completion_service as OCS
-from deepseaport.providers.opencode import protocol as OP
-from deepseaport.providers.opencode import managed_serve as MS
-from deepseaport.providers.opencode import models
-from deepseaport.providers.opencode.models import DEFAULT_MODEL, MODELS_SPEC
+from zourcewell.config import AccountConfig, Settings
+from zourcewell.core import registry
+from zourcewell.providers.opencode import client as OC
+from zourcewell.providers.opencode import completion_service as OCS
+from zourcewell.providers.opencode import protocol as OP
+from zourcewell.providers.opencode import managed_serve as MS
+from zourcewell.providers.opencode import models
+from zourcewell.providers.opencode.models import DEFAULT_MODEL, MODELS_SPEC
 from support import settings
 from functools import partial
-from deepseaport.server import create_app
+from zourcewell.server import create_app
 
 
 # Default kwargs differ per file; the shared base dict lives in
@@ -208,7 +208,7 @@ def test_live_specs_boots_the_managed_serve_when_nothing_answers(monkeypatch):
     """The list must not depend on which process asks for it.
 
     Pre-change, any process that had not already booted a serve -- a fresh
-    ``deepseaport models``, the TUI before warmup -- read nothing and fell
+    ``zourcewell models``, the TUI before warmup -- read nothing and fell
     back to the hand-written eight, so the same installation reported
     different ids depending on who asked.
     """
@@ -358,7 +358,7 @@ def test_no_account_seams():
 
 
 def test_warmup_never_raises(monkeypatch):
-    from deepseaport.providers.opencode import managed_serve as MS
+    from zourcewell.providers.opencode import managed_serve as MS
 
     prov = registry.get("opencode")
     # Managed boot is stubbed: unit tests must never spawn real processes.
@@ -370,7 +370,7 @@ def test_warmup_never_raises(monkeypatch):
 
 
 def test_preflight_passes_with_zero_accounts():
-    from deepseaport.tui import _preflight_reason
+    from zourcewell.tui import _preflight_reason
 
     assert _preflight_reason(_settings()) == ""
 
@@ -509,7 +509,7 @@ def test_200_with_error_envelope_is_502_not_content(monkeypatch):
 
 
 def test_serve_down_is_502_with_hint(monkeypatch):
-    from deepseaport.providers.opencode import managed_serve as MS
+    from zourcewell.providers.opencode import managed_serve as MS
 
     def _down(timeout=20, **kw):
         raise RuntimeError("OPENCODE_SERVE_DOWN: refused. start serve first")
@@ -533,8 +533,8 @@ def test_models_union_includes_opencode():
 
 
 def test_bridge_flags():
-    from deepseaport.providers.deepseek.provider import DeepSeekProvider
-    from deepseaport.providers.qwen.provider import QwenProvider
+    from zourcewell.providers.deepseek.provider import DeepSeekProvider
+    from zourcewell.providers.qwen.provider import QwenProvider
 
     assert registry.get("opencode").needs_bridge is False
     assert DeepSeekProvider.needs_bridge is True
@@ -542,7 +542,7 @@ def test_bridge_flags():
 
 
 def test_startup_warm_skips_obscura_for_opencode_only(monkeypatch):
-    from deepseaport import server_concurrency as SC
+    from zourcewell import server_concurrency as SC
 
     calls = {"bridge": 0, "health": 0}
     monkeypatch.setattr(OC, "health",
@@ -558,8 +558,8 @@ def test_startup_warm_skips_obscura_for_opencode_only(monkeypatch):
 
 
 def test_startup_warm_keeps_obscura_for_deepseek(monkeypatch):
-    from deepseaport import server_concurrency as SC
-    from deepseaport.providers.deepseek.provider import DeepSeekProvider
+    from zourcewell import server_concurrency as SC
+    from zourcewell.providers.deepseek.provider import DeepSeekProvider
 
     calls = {"bridge": 0, "provider": 0}
     monkeypatch.setattr(DeepSeekProvider, "warmup",

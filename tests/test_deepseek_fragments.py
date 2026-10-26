@@ -11,7 +11,7 @@ completion surfaced as 502 "empty upstream response". Offline only.
 
 from __future__ import annotations
 
-from deepseaport.providers.deepseek.sse_parser import StreamParser
+from zourcewell.providers.deepseek.sse_parser import StreamParser
 
 
 def _drain(lines):
@@ -140,7 +140,7 @@ def test_legacy_paths_still_work():
 
 
 def test_obscura_bridge_resolves_directory_to_exe(tmp_path):
-    from deepseaport.core.obscura_bridge import ObscuraBridge
+    from zourcewell.core.obscura_bridge import ObscuraBridge
 
     exe = tmp_path / "obscura.exe"
     exe.write_bytes(b"x")

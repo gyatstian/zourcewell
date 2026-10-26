@@ -17,9 +17,9 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from deepseaport.dry_run import create_dry_app
-from deepseaport.server import create_app
-from deepseaport.server_routes import _prepare
+from zourcewell.dry_run import create_dry_app
+from zourcewell.server import create_app
+from zourcewell.server_routes import _prepare
 from support import settings as _settings
 
 MSGS = [{"role": "user", "content": "hi"}]

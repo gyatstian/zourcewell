@@ -5,9 +5,9 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "deepseaport"
-# Single source of truth for the version. src/deepseaport/__init__.py derives
-# __version__ from this file, deepseaport.spec stamps it into the frozen exe,
+name = "zourcewell"
+# Single source of truth for the version. src/zourcewell/__init__.py derives
+# __version__ from this file, zourcewell.spec stamps it into the frozen exe,
 # and every bump happens here and only here.
 version = "0.28"
 description = "Unofficial web2api bridge: OpenAI-compatible API over the DeepSeek, Qwen and opencode chat backends, with stable tool_calls for agentic harnesses. Research/educational use only."
@@ -49,11 +49,11 @@ test = ["pytest>=8", "httpx>=0.27", "openai>=3.33,<4"]
 build = ["pyinstaller>=6"]
 
 [project.scripts]
-deepseaport = "deepseaport.cli:main"
+zourcewell = "zourcewell.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/gyatstian/deepseaport"
-Source = "https://github.com/gyatstian/deepseaport"
+Homepage = "https://github.com/gyatstian/zourcewell"
+Source = "https://github.com/gyatstian/zourcewell"
 
 [tool.setuptools.packages.find]
 where = ["src"]

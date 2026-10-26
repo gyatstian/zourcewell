@@ -8,9 +8,9 @@ import pytest
 
 from functools import partial
 from support import settings
-from deepseaport import tui
-from deepseaport.config import AccountConfig, Settings
-from deepseaport.tui import (
+from zourcewell import tui
+from zourcewell.config import AccountConfig, Settings
+from zourcewell.tui import (
     _ask,
     _c,
     _edit_choice,
@@ -230,8 +230,8 @@ def test_edit_port_range_keeps(monkeypatch):
 def test_edit_port_valid_with_mock(monkeypatch):
     s = _fresh(port=5001)
     monkeypatch.setattr("builtins.input", lambda *a, **k: "5002")
-    monkeypatch.setattr("deepseaport.cli._resolve_bind_host", lambda *a, **k: "127.0.0.1")
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda st, h, p: int(p))
+    monkeypatch.setattr("zourcewell.cli._resolve_bind_host", lambda *a, **k: "127.0.0.1")
+    monkeypatch.setattr("zourcewell.cli._ensure_free_port", lambda st, h, p: int(p))
     _edit_port(s)
     assert s.port == 5002
 
@@ -457,7 +457,7 @@ def test_read_interactive_non_tty_unescapes(monkeypatch):
 
 
 def test_unescape_newlines_double_backslash():
-    from deepseaport import tui_editor
+    from zourcewell import tui_editor
 
     assert tui_editor._unescape_newlines("a\\\\nb") == "a\\nb"
 
@@ -563,7 +563,7 @@ def test_accounts_menu_offer_auto_login_declined(monkeypatch):
     def _fail(*a, **k):
         raise AssertionError("login must not run on decline")
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token", _fail)
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token", _fail)
     inputs = iter(["t", "a@x.com", "", "n", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
@@ -572,7 +572,7 @@ def test_accounts_menu_offer_auto_login_declined(monkeypatch):
 
 def test_accounts_menu_offer_auto_login_confirmed(monkeypatch):
     s = _fresh(accounts=[AccountConfig(email="a@x.com", password="pw", token="")])
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token",
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token",
                         lambda email, pw, st: ("tok-confirmed", False, ""))
     inputs = iter(["t", "a@x.com", "", "", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
@@ -585,7 +585,7 @@ def test_accounts_menu_login_ban_wording_hint_is_surfaced(monkeypatch, capsys):
     must print the evidence and persist nothing."""
     s = _fresh(accounts=[AccountConfig(email="a@x.com", password="pw", token="")])
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.auth.obscura_login_token",
+        "zourcewell.providers.deepseek.auth.obscura_login_token",
         lambda email, pw, st: (None, False,
                                "captcha [ban wording seen: suspended]"))
     inputs = iter(["t", "a@x.com", "", "", "q"])
@@ -602,7 +602,7 @@ def test_accounts_menu_set_token_literal(monkeypatch):
     def _fail(*a, **k):
         raise AssertionError("login must not run for literal token")
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token", _fail)
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token", _fail)
     inputs = iter(["t", "a@x.com", "newtok123", "q"])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(inputs))
     accounts_menu(s)
@@ -756,7 +756,7 @@ def test_tui_reexports_only_the_pinned_editor_name():
     """The module-scope import exists for this one name; the rest were
     tui_editor internals leaking into the TUI namespace (and `from tui import *`).
     """
-    from deepseaport import tui_editor
+    from zourcewell import tui_editor
 
     assert tui._read_interactive is tui_editor._read_interactive
 

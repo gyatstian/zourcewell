@@ -39,7 +39,7 @@ from urllib.parse import urlparse
 import pytest
 from curl_cffi.requests.errors import CurlError
 
-from deepseaport.providers.deepseek import pow as PoW
+from zourcewell.providers.deepseek import pow as PoW
 
 wasmtime = pytest.importorskip(
     "wasmtime",
@@ -59,7 +59,7 @@ def _shipped_wasm() -> Path:
     try:
         name = PoW.validated_wasm_name()
     except RuntimeError:
-        # DEEPSEAPORT_WASM_NAME is not a plain filename; nothing to locate and
+        # ZOURCEWELL_WASM_NAME is not a plain filename; nothing to locate and
         # the skip reason below explains it.
         return _REPO_DATA / "<rejected wasm name>"
     return _REPO_DATA / name
@@ -114,7 +114,7 @@ def _restore_pow_caches():
 def pow_env():
     """Install the shipped wasm where ``pow.wasm_path()`` looks, and return it.
 
-    ``tests/conftest.py`` points ``DEEPSEAPORT_DATA`` at a throwaway temp dir, so
+    ``tests/conftest.py`` points ``ZOURCEWELL_DATA`` at a throwaway temp dir, so
     the checkout's ``data/`` asset is not on the solver's path. Copying the
     26 kB file in keeps the run hermetic -- nothing writes to the repo's own
     data dir -- while still executing the module the site would serve. The copy
@@ -723,8 +723,8 @@ def test_wasm_url_is_pinned_to_the_documented_host():
     which is the historical failure the size + magic checks exist to catch -- so
     the constant itself is worth an assertion, not just the checks.
     """
-    if os.environ.get("DEEPSEAPORT_WASM_URL"):
-        pytest.skip("DEEPSEAPORT_WASM_URL is set: WASM_URL is intentionally "
+    if os.environ.get("ZOURCEWELL_WASM_URL"):
+        pytest.skip("ZOURCEWELL_WASM_URL is set: WASM_URL is intentionally "
                     "rotated here, the pinned-host assertion does not apply")
     parsed = urlparse(PoW.WASM_URL)
     assert parsed.scheme == "https"
@@ -860,7 +860,7 @@ def test_ensure_wasm_leaves_no_tmp_when_the_install_itself_fails(
 def test_overridden_wasm_url_is_fetched_and_still_validated(tmp_path, monkeypatch):
     """An override changes WHERE from, never WHAT is accepted.
 
-    ``DEEPSEAPORT_WASM_URL`` is a rotation escape hatch, not a bypass: whatever
+    ``ZOURCEWELL_WASM_URL`` is a rotation escape hatch, not a bypass: whatever
     comes back from it is still gated by the same size + magic checks, because
     the result is INSTANTIATED and EXECUTED by wasmtime (pow.py:20-30).
 
@@ -957,17 +957,17 @@ def test_wasm_url_override_warns_once_per_process(tmp_path, monkeypatch, caplog)
     target = tmp_path / "warn.wasm"
     monkeypatch.setattr(PoW, "wasm_path", lambda: target)
     monkeypatch.setattr(PoW, "WASM_URL", "https://elsewhere.example/sha3.wasm")
-    monkeypatch.setenv("DEEPSEAPORT_WASM_URL", "https://elsewhere.example/sha3.wasm")
+    monkeypatch.setenv("ZOURCEWELL_WASM_URL", "https://elsewhere.example/sha3.wasm")
     monkeypatch.setattr(PoW, "_warned_wasm_url", False)
     monkeypatch.setattr("curl_cffi.requests.get",
                         _fake_get(_FakeResponse(_payload(2000))))
 
-    with caplog.at_level(logging.WARNING, logger="deepseaport.pow"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.pow"):
         PoW.ensure_wasm()
-        first = [r for r in caplog.records if "DEEPSEAPORT_WASM_URL" in r.getMessage()]
+        first = [r for r in caplog.records if "ZOURCEWELL_WASM_URL" in r.getMessage()]
         caplog.clear()
         PoW.ensure_wasm()
-        second = [r for r in caplog.records if "DEEPSEAPORT_WASM_URL" in r.getMessage()]
+        second = [r for r in caplog.records if "ZOURCEWELL_WASM_URL" in r.getMessage()]
 
     assert len(first) == 1
     assert "https://elsewhere.example/sha3.wasm" in first[0].getMessage()

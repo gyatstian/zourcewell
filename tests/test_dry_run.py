@@ -13,10 +13,10 @@ from fastapi.testclient import TestClient
 
 from functools import partial
 from support import settings
-from deepseaport import tui
-from deepseaport.config import Settings
-from deepseaport.dry_run import create_dry_app
-from deepseaport.tui import main_menu
+from zourcewell import tui
+from zourcewell.config import Settings
+from zourcewell.dry_run import create_dry_app
+from zourcewell.tui import main_menu
 
 
 # Default kwargs differ per file; the shared base dict lives in
@@ -156,16 +156,16 @@ def test_dry_frontend_off_sends_note_but_prints_full(capsys):
 def test_dry_frontend_flag_roundtrip_and_env(tmp_path, monkeypatch):
     import json
 
-    from deepseaport.config import load_settings
+    from zourcewell.config import load_settings
 
-    for name in ("DEEPSEAPORT_SEND_DRY_RUN_TO_FRONTEND",):
+    for name in ("ZOURCEWELL_SEND_DRY_RUN_TO_FRONTEND",):
         monkeypatch.delenv(name, raising=False)
     cfg = tmp_path / "c.json"
     cfg.write_text(json.dumps({"send_dry_run_to_frontend": False}), encoding="utf-8")
     assert load_settings(str(cfg)).send_dry_run_to_frontend is False
     assert _settings().send_dry_run_to_frontend is True  # default
     cfg.write_text(json.dumps({}), encoding="utf-8")
-    monkeypatch.setenv("DEEPSEAPORT_SEND_DRY_RUN_TO_FRONTEND", "0")
+    monkeypatch.setenv("ZOURCEWELL_SEND_DRY_RUN_TO_FRONTEND", "0")
     assert load_settings(str(cfg)).send_dry_run_to_frontend is False
 
 

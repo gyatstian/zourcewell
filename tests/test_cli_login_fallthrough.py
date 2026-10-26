@@ -19,12 +19,12 @@ from __future__ import annotations
 import pytest
 from support import on_disk, settings, write_config
 
-from deepseaport.cli import main as cli_main
+from zourcewell.cli import main as cli_main
 
 
 def _raising_login(monkeypatch, exc: BaseException) -> list:
     """Registry whose ``qwen`` provider raises from ``login``; returns its calls."""
-    import deepseaport.core.registry as reg
+    import zourcewell.core.registry as reg
 
     calls: list = []
 
@@ -41,7 +41,7 @@ def _raising_login(monkeypatch, exc: BaseException) -> list:
 
 def _spy_deepseek_driver(monkeypatch, token: str = "ds-token") -> list:
     """The shipped DeepSeek browser driver, spied on at its import site."""
-    import deepseaport.providers.deepseek.auth as ds_auth
+    import zourcewell.providers.deepseek.auth as ds_auth
 
     ran: list = []
     monkeypatch.setattr(ds_auth, "obscura_login_token",
@@ -60,7 +60,7 @@ def test_non_deepseek_login_failure_never_runs_the_deepseek_driver(
     browser login whose token is filed under qwen."""
     _raising_login(monkeypatch, exc)
     ran = _spy_deepseek_driver(monkeypatch)
-    # Flag-less: settings.provider drives the pid, which is the `deepseaport
+    # Flag-less: settings.provider drives the pid, which is the `zourcewell
     # login` form a qwen-configured deployment (and the TUI's auto-login
     # settings) reaches the wrapper with.
     cfg = write_config(tmp_path, {"keys": [], "provider": "qwen", "accounts": []})
@@ -85,8 +85,8 @@ def test_unregistered_non_deepseek_provider_is_reported_not_retried(
     unknown ``provider`` back to deepseek with a warning, so a settings value is
     never the door here.
     """
-    import deepseaport.cli as cli_mod
-    import deepseaport.core.registry as reg
+    import zourcewell.cli as cli_mod
+    import zourcewell.core.registry as reg
 
     real_get = reg.get
     monkeypatch.setattr(reg, "get",
@@ -111,7 +111,7 @@ def test_deepseek_login_still_drives_obscura_and_keeps_the_shim_identity(
     empty-credential risk guard applies, so a wrapper here would disable it
     silently.
     """
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     ran = _spy_deepseek_driver(monkeypatch, token="ds-token")
 
@@ -125,7 +125,7 @@ def test_deepseek_login_still_drives_obscura_and_keeps_the_shim_identity(
 def test_non_deepseek_login_success_is_still_returned_and_stored(
         monkeypatch, tmp_path):
     """Control: the fix must not cost the working registry login its token."""
-    import deepseaport.core.registry as reg
+    import zourcewell.core.registry as reg
 
     class _FakeQwen:
         def login(self, email, password, settings):  # noqa: A002
@@ -154,7 +154,7 @@ def test_relogin_over_a_persisted_ban_says_so_and_keeps_the_ban(
     writes the token) and the pool skips it, so "token saved" alone is a lie;
     the operator needs the one command that clears it -- and no auto-clear,
     because a suspended account can legitimately complete a login."""
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda e, p, s: ("fresh-tok", False, ""))
@@ -178,7 +178,7 @@ def test_relogin_over_a_persisted_ban_says_so_and_keeps_the_ban(
 def test_relogin_over_a_clean_account_prints_no_ban_line(
         monkeypatch, tmp_path, capsys):
     """Control: nothing to warn about, nothing printed."""
-    import deepseaport.cli as cli_mod
+    import zourcewell.cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda e, p, s: ("fresh-tok", False, ""))
@@ -195,8 +195,8 @@ def test_banned_login_with_a_token_keeps_its_banned_branch(
         monkeypatch, tmp_path, capsys):
     """The widened success path must not swallow the driver's OWN ban report:
     login_banned still wins, with its exit 3 and its persisted markers."""
-    import deepseaport.accounts as acc_mod
-    import deepseaport.cli as cli_mod
+    import zourcewell.accounts as acc_mod
+    import zourcewell.cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "_obscura_login_token",
                         lambda e, p, s: ("tok-banned", True, "suspended"))

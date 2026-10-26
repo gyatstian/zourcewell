@@ -1,4 +1,4 @@
-"""Managed isolated opencode serve: auto boot scoped to deepseaport only."""
+"""Managed isolated opencode serve: auto boot scoped to zourcewell only."""
 
 from __future__ import annotations
 
@@ -10,16 +10,16 @@ import threading
 import pytest
 from fastapi.testclient import TestClient
 
-from deepseaport.config import Settings
-from deepseaport.providers.opencode import managed_serve as MS
-from deepseaport.providers.opencode import protocol as OP
-from deepseaport.providers.opencode.models import DEFAULT_MODEL, MODELS_SPEC
-from deepseaport.server import create_app
-from deepseaport.server_routes import _prepare
-from deepseaport.providers.opencode import client as OC
+from zourcewell.config import Settings
+from zourcewell.providers.opencode import managed_serve as MS
+from zourcewell.providers.opencode import protocol as OP
+from zourcewell.providers.opencode.models import DEFAULT_MODEL, MODELS_SPEC
+from zourcewell.server import create_app
+from zourcewell.server_routes import _prepare
+from zourcewell.providers.opencode import client as OC
 from support import settings
 from functools import partial
-from deepseaport.providers.opencode import completion_service as OCS
+from zourcewell.providers.opencode import completion_service as OCS
 
 
 # Default kwargs differ per file; the shared base dict lives in
@@ -29,8 +29,8 @@ _settings = partial(settings, provider="opencode", log_level="INFO",
 
 
 def test_default_agent_is_passthrough():
-    assert OP.DEFAULT_AGENT == MS.MANAGED_AGENT == "deepseaport-passthrough"
-    assert OP.agent_name() == "deepseaport-passthrough"
+    assert OP.DEFAULT_AGENT == MS.MANAGED_AGENT == "zourcewell-passthrough"
+    assert OP.agent_name() == "zourcewell-passthrough"
 
 
 def _fake_v2_serve(monkeypatch, items: list, prompt_id: str = "msg_u") -> list:
@@ -110,9 +110,9 @@ def test_managed_config_denies_sensitive_native_tools():
 
 
 def test_client_headers_identity(monkeypatch):
-    monkeypatch.delenv("DEEPSEAPORT_OPENCODE_CLIENT", raising=False)
-    monkeypatch.delenv("DEEPSEAPORT_OPENCODE_PROJECT", raising=False)
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_USER_AGENT", "opencode/1.18.31")
+    monkeypatch.delenv("ZOURCEWELL_OPENCODE_CLIENT", raising=False)
+    monkeypatch.delenv("ZOURCEWELL_OPENCODE_PROJECT", raising=False)
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_USER_AGENT", "opencode/1.18.31")
     headers = OP.client_headers("ses_abc123")
     assert headers["User-Agent"] == "opencode/1.18.31"
     assert headers["x-opencode-client"] == "cli"
@@ -140,7 +140,7 @@ def test_permission_event_is_rejected_for_its_session(monkeypatch):
 
 
 def test_request_sends_identity_headers(monkeypatch):
-    from deepseaport.providers.opencode import client as OC
+    from zourcewell.providers.opencode import client as OC
 
     seen = {}
 
@@ -161,7 +161,7 @@ def test_request_sends_identity_headers(monkeypatch):
         return _Resp()
 
     monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_USER_AGENT", "opencode/1.18.31")
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_USER_AGENT", "opencode/1.18.31")
     assert OC.health(timeout=2) is True
     assert seen.get("x-opencode-client") == "cli"
     assert seen.get("x-opencode-project") == "global"
@@ -169,8 +169,8 @@ def test_request_sends_identity_headers(monkeypatch):
 
 
 def test_free_tier_denied_is_terminal(monkeypatch):
-    from deepseaport.providers.opencode import client as OC
-    from deepseaport.providers.opencode import completion_service as OCS
+    from zourcewell.providers.opencode import client as OC
+    from zourcewell.providers.opencode import completion_service as OCS
 
     gatekeeper = ("Error from provider (Console): OpenCode's free tier can "
                   "only be used from within OpenCode")
@@ -258,14 +258,14 @@ def test_isolated_files_stay_off_real_home(tmp_path, monkeypatch):
 
 
 def test_managed_disabled_flag(monkeypatch):
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_MANAGED", "0")
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_MANAGED", "0")
     assert MS.managed_enabled() is False
     assert MS.ensure() is None
 
 
 def test_explicit_user_base_skips_managed(monkeypatch, tmp_path):
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_BASE", "http://127.0.0.1:4999")
-    monkeypatch.delenv("DEEPSEAPORT_OPENCODE_MANAGED", raising=False)
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_BASE", "http://127.0.0.1:4999")
+    monkeypatch.delenv("ZOURCEWELL_OPENCODE_MANAGED", raising=False)
     # Must not spawn: fail loudly if it tries.
     monkeypatch.setattr("shutil.which", lambda name: (_ for _ in ()).throw(
         AssertionError("must not spawn for user-owned serve")))
@@ -316,8 +316,8 @@ def test_port_file_password_not_this_users_to_open_reads_as_missing(tmp_path):
 
 
 def test_ensure_reuses_healthy_same_hash_without_spawning(monkeypatch, tmp_path):
-    monkeypatch.delenv("DEEPSEAPORT_OPENCODE_BASE", raising=False)
-    monkeypatch.delenv("DEEPSEAPORT_OPENCODE_MANAGED", raising=False)
+    monkeypatch.delenv("ZOURCEWELL_OPENCODE_BASE", raising=False)
+    monkeypatch.delenv("ZOURCEWELL_OPENCODE_MANAGED", raising=False)
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
     MS._managed_base = ""
     MS._managed_password = ""
@@ -331,8 +331,8 @@ def test_ensure_reuses_healthy_same_hash_without_spawning(monkeypatch, tmp_path)
 
 
 def test_ensure_restarts_on_hash_mismatch(monkeypatch, tmp_path):
-    monkeypatch.delenv("DEEPSEAPORT_OPENCODE_BASE", raising=False)
-    monkeypatch.delenv("DEEPSEAPORT_OPENCODE_MANAGED", raising=False)
+    monkeypatch.delenv("ZOURCEWELL_OPENCODE_BASE", raising=False)
+    monkeypatch.delenv("ZOURCEWELL_OPENCODE_MANAGED", raising=False)
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m2")
     MS._managed_base = ""
     MS._managed_password = ""
@@ -363,14 +363,14 @@ def test_child_env_strips_secret_prefixes():
         "KEEP_ME": "harmless",
         "DEEPSEEK_PASSWORD": "hunter2",
         "DEEPSEEK_EMAIL": "a@x.com",
-        "DEEPSEAPORT_KEYS": "sk-live-abc",
-        "DEEPSEAPORT_TOKEN": "tok",
+        "ZOURCEWELL_KEYS": "sk-live-abc",
+        "ZOURCEWELL_TOKEN": "tok",
         "OPENCODE_CONFIG": "/home/op/.config/opencode/opencode.json",
         "OPENCODE_API_KEY": "oc-key",
     }
     env = MS._child_env(parent)
-    for gone in ("DEEPSEEK_PASSWORD", "DEEPSEEK_EMAIL", "DEEPSEAPORT_KEYS",
-                 "DEEPSEAPORT_TOKEN", "OPENCODE_CONFIG", "OPENCODE_API_KEY"):
+    for gone in ("DEEPSEEK_PASSWORD", "DEEPSEEK_EMAIL", "ZOURCEWELL_KEYS",
+                 "ZOURCEWELL_TOKEN", "OPENCODE_CONFIG", "OPENCODE_API_KEY"):
         assert gone not in env
     assert "hunter2" not in json.dumps(env)
     # Unrelated process env (PATH/HOME/proxies) is inherited untouched.
@@ -384,18 +384,18 @@ def test_child_env_strips_secret_prefixes():
 def test_ensure_child_env_has_no_parent_secrets(monkeypatch, tmp_path):
     """F4: the child inherited the whole parent env verbatim.
 
-    .env.example documents DEEPSEAPORT_KEYS / DEEPSEEK_EMAIL /
+    .env.example documents ZOURCEWELL_KEYS / DEEPSEEK_EMAIL /
     DEEPSEEK_PASSWORD / DEEPSEEK_TOKEN, so a sourced .env lands in a child
     that is an agentic CLI with native read/bash, rooted at the operator's cwd.
     """
     # setenv (not delenv) so monkeypatch restores the pre-test value: ensure()
-    # writes DEEPSEAPORT_OPENCODE_* into this process env on success.
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_BASE", "")
-    monkeypatch.setenv("DEEPSEAPORT_OPENCODE_MANAGED", "1")
+    # writes ZOURCEWELL_OPENCODE_* into this process env on success.
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_BASE", "")
+    monkeypatch.setenv("ZOURCEWELL_OPENCODE_MANAGED", "1")
     monkeypatch.setenv("DEEPSEEK_PASSWORD", "hunter2-s3cret")
     monkeypatch.setenv("DEEPSEEK_EMAIL", "op@example.com")
-    monkeypatch.setenv("DEEPSEAPORT_KEYS", "sk-live-abc")
-    monkeypatch.setenv("DEEPSEAPORT_TOKEN", "tok-abc")
+    monkeypatch.setenv("ZOURCEWELL_KEYS", "sk-live-abc")
+    monkeypatch.setenv("ZOURCEWELL_TOKEN", "tok-abc")
     monkeypatch.setenv("OPENCODE_CONFIG", "/home/op/.config/opencode.json")
     monkeypatch.setenv("KEEP_ME", "harmless")
 
@@ -413,8 +413,8 @@ def test_ensure_child_env_has_no_parent_secrets(monkeypatch, tmp_path):
     finally:
         (MS._managed_base, MS._managed_password, MS._proc) = saved
     env = captured["env"]
-    for gone in ("DEEPSEEK_PASSWORD", "DEEPSEEK_EMAIL", "DEEPSEAPORT_KEYS",
-                 "DEEPSEAPORT_TOKEN", "OPENCODE_CONFIG"):
+    for gone in ("DEEPSEEK_PASSWORD", "DEEPSEEK_EMAIL", "ZOURCEWELL_KEYS",
+                 "ZOURCEWELL_TOKEN", "OPENCODE_CONFIG"):
         assert gone not in env
     assert "hunter2-s3cret" not in json.dumps(env)
     # Everything the child legitimately needs is set explicitly after the strip.
@@ -473,7 +473,7 @@ def test_payload_variant_only_when_set(monkeypatch):
     assert next(b for p, b in bodies if p.endswith("/model")) == {
         "model": {"id": "m", "providerID": "opencode"}}
     assert next(b for p, b in bodies if p.endswith("/agent")) == {
-        "agent": "deepseaport-passthrough"}
+        "agent": "zourcewell-passthrough"}
     assert next(b for p, b in bodies if p.endswith("/prompt")) == {"text": "hi"}
 
     bodies.clear()
@@ -573,12 +573,12 @@ def test_variant_resend_forwards_the_cancel_event(monkeypatch):
 
 
 def test_ensure_without_binary_returns_none(monkeypatch, tmp_path):
-    monkeypatch.delenv("DEEPSEAPORT_OPENCODE_BASE", raising=False)
-    monkeypatch.delenv("DEEPSEAPORT_OPENCODE_MANAGED", raising=False)
+    monkeypatch.delenv("ZOURCEWELL_OPENCODE_BASE", raising=False)
+    monkeypatch.delenv("ZOURCEWELL_OPENCODE_MANAGED", raising=False)
     monkeypatch.setattr("shutil.which", lambda name: None)
     monkeypatch.setattr(MS, "managed_base_dir", lambda: tmp_path / "m")
     assert MS.ensure() is None
-    assert os.environ.get("DEEPSEAPORT_OPENCODE_BASE", "") == ""
+    assert os.environ.get("ZOURCEWELL_OPENCODE_BASE", "") == ""
 
 
 def test_send_message_cancel_event_aborts_the_session(monkeypatch):
@@ -595,7 +595,7 @@ def test_send_message_cancel_event_aborts_the_session(monkeypatch):
         lambda sid, timeout=20, **kw: polls.append(sid) or [_assistant_item("hi")])
     cancel = threading.Event()
     cancel.set()
-    from deepseaport.server_concurrency import _StreamCancelled
+    from zourcewell.server_concurrency import _StreamCancelled
 
     with pytest.raises(_StreamCancelled):
         OC.send_message("ses_1", "opencode", "m", OP.agent_name(), "hi",

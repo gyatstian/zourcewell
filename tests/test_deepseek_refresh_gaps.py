@@ -20,10 +20,10 @@ from __future__ import annotations
 import threading
 
 from support import app_with_bridge, on_disk, settings
-from deepseaport.accounts import PooledAccount
-from deepseaport.config import AccountConfig
-from deepseaport.providers.deepseek import completion_service as CS
-from deepseaport.server_concurrency import _StreamCancelled
+from zourcewell.accounts import PooledAccount
+from zourcewell.config import AccountConfig
+from zourcewell.providers.deepseek import completion_service as CS
+from zourcewell.server_concurrency import _StreamCancelled
 
 # Bounded waits so a regression FAILS instead of hanging the suite. Not
 # assertion bounds: on a loaded runner only an Event can tell "slow" apart

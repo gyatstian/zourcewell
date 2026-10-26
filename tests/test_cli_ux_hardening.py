@@ -9,7 +9,7 @@ tests/test_auth_hardening.py).
 * **T1** the Esc/q stop-key watcher outlived a failed bind (uvicorn's
   ``sys.exit(3)`` never sets ``should_exit``), kept draining CONIN$ every
   100 ms and silently ate every main-menu keystroke that was not Esc/q/Q.
-* **T2** ``deepseaport login`` handed an empty password to the real browser
+* **T2** ``zourcewell login`` handed an empty password to the real browser
   (the emptiness check in providers/deepseek/auth.py runs *after* the
   real-browser call) and, with a piped secret and no ``--email``, read the
   PASSWORD as the email.
@@ -41,8 +41,8 @@ from collections import deque
 
 import pytest
 
-import deepseaport.cli as cli_mod
-import deepseaport.server_runner as server_runner
+import zourcewell.cli as cli_mod
+import zourcewell.server_runner as server_runner
 from support import (
     AliveThread,
     DeadThreadNoStart,
@@ -53,8 +53,8 @@ from support import (
     settings,
     write_config,
 )
-from deepseaport import chat_repl, chat_ui, dry_run as dry_run_mod
-from deepseaport.config import AccountConfig, Settings
+from zourcewell import chat_repl, chat_ui, dry_run as dry_run_mod
+from zourcewell.config import AccountConfig, Settings
 
 # --------------------------------------------------------------------------- #
 # shared fakes                                                                   #
@@ -154,8 +154,8 @@ def _serve_with_broken_bind(monkeypatch, keys: bytes = b""):
     monkeypatch.setitem(sys.modules, "msvcrt", msvcrt)
     monkeypatch.setattr(uvicorn, "Config", FakeUvicornConfig)
     monkeypatch.setattr(uvicorn, "Server", FakeUvicornServer)
-    monkeypatch.setattr("deepseaport.server.create_app", lambda settings=None: object())
-    monkeypatch.setattr("deepseaport.server.apply_log_level", lambda *a, **k: None)
+    monkeypatch.setattr("zourcewell.server.create_app", lambda settings=None: object())
+    monkeypatch.setattr("zourcewell.server.apply_log_level", lambda *a, **k: None)
     return made, msvcrt
 
 
@@ -220,7 +220,7 @@ def test_dry_run_watcher_dies_with_the_serve_call(monkeypatch, tmp_path):
     made = _record_threads(monkeypatch)
     monkeypatch.setattr(uvicorn, "Config", FakeUvicornConfig)
     monkeypatch.setattr(uvicorn, "Server", FakeUvicornServer)
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda s, h, p: p)
+    monkeypatch.setattr("zourcewell.cli._ensure_free_port", lambda s, h, p: p)
     settings = _settings(tmp_path, port=5001, keys=[])
 
     assert dry_run_mod.run_dry_run(
@@ -267,9 +267,9 @@ def _browser_spy(monkeypatch) -> list:
         calls.append(("REAL_BROWSER", email, password))
         return (None, False, "")
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.auth.obscura_login_token", _impl)
+    monkeypatch.setattr("zourcewell.providers.deepseek.auth.obscura_login_token", _impl)
     monkeypatch.setattr(
-        "deepseaport.providers.deepseek.real_browser.login_with_real_browser", _real)
+        "zourcewell.providers.deepseek.real_browser.login_with_real_browser", _real)
     return calls
 
 
@@ -384,8 +384,8 @@ def _run_plain_serve(monkeypatch, settings) -> int:
 
     monkeypatch.setattr(uvicorn, "Config", FakeUvicornConfig)
     monkeypatch.setattr(uvicorn, "Server", FakeUvicornServer)
-    monkeypatch.setattr("deepseaport.server.create_app", lambda s=None: object())
-    monkeypatch.setattr("deepseaport.server.apply_log_level", lambda *a, **k: None)
+    monkeypatch.setattr("zourcewell.server.create_app", lambda s=None: object())
+    monkeypatch.setattr("zourcewell.server.apply_log_level", lambda *a, **k: None)
     return server_runner._run_server(
         settings, argparse.Namespace(host="", port=0),
         ensure_free=lambda s, h, p: p)
@@ -397,8 +397,8 @@ def _run_chat(monkeypatch, settings, on_input=None) -> int:
     monkeypatch.setattr(uvicorn, "Config", FakeUvicornConfig)
     monkeypatch.setattr(uvicorn, "Server", FakeUvicornServer)
     monkeypatch.setattr(threading, "Thread", AliveThread)
-    monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda s, h, p: p)
+    monkeypatch.setattr("zourcewell.server.create_app", lambda st: object())
+    monkeypatch.setattr("zourcewell.cli._ensure_free_port", lambda s, h, p: p)
     monkeypatch.setattr(chat_ui, "_wait_for_server", lambda *a, **k: True)
     monkeypatch.setattr(chat_ui, "_post_completion", lambda *a, **k: "hi")
     monkeypatch.setattr("builtins.input",
@@ -413,7 +413,7 @@ def _run_multi_chat(monkeypatch, settings, count=2) -> int:
     monkeypatch.setattr(uvicorn, "Config", FakeUvicornConfig)
     monkeypatch.setattr(uvicorn, "Server", FakeUvicornServer)
     monkeypatch.setattr(threading, "Thread", AliveThread)
-    monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
+    monkeypatch.setattr("zourcewell.server.create_app", lambda st: object())
     monkeypatch.setattr(chat_ui, "_select_usable_accounts_live",
                         lambda st: (usable, 0, 0))
     base = int(settings.port)
@@ -430,7 +430,7 @@ def _run_dry(monkeypatch, settings) -> int:
 
     monkeypatch.setattr(uvicorn, "Config", FakeUvicornConfig)
     monkeypatch.setattr(uvicorn, "Server", FakeUvicornServer)
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda s, h, p: p)
+    monkeypatch.setattr("zourcewell.cli._ensure_free_port", lambda s, h, p: p)
     monkeypatch.setattr(server_runner, "_watch_stop_keys", lambda *a, **k: None)
     return dry_run_mod.run_dry_run(
         settings, argparse.Namespace(host="", port=0))
@@ -635,8 +635,8 @@ def test_chat_server_reports_a_dead_background_server(monkeypatch, tmp_path, cap
     monkeypatch.setattr(uvicorn, "Config", FakeUvicornConfig)
     monkeypatch.setattr(uvicorn, "Server", FakeUvicornServer)
     monkeypatch.setattr(threading, "Thread", DeadThreadNoStart)
-    monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
-    monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda s, h, p: p)
+    monkeypatch.setattr("zourcewell.server.create_app", lambda st: object())
+    monkeypatch.setattr("zourcewell.cli._ensure_free_port", lambda s, h, p: p)
     monkeypatch.setattr(chat_ui, "_wait_for_server", lambda *a, **k: True)
 
     def _input(*a, **k):
@@ -747,8 +747,8 @@ def test_chat_cleanup_is_single_shot_when_the_repl_is_interrupted(monkeypatch,
         monkeypatch.setattr(uvicorn, "Config", FakeUvicornConfig)
         monkeypatch.setattr(uvicorn, "Server", _SrvExitCounted)
         monkeypatch.setattr(threading, "Thread", _remember)
-        monkeypatch.setattr("deepseaport.server.create_app", lambda st: object())
-        monkeypatch.setattr("deepseaport.cli._ensure_free_port", lambda s, h, p: p)
+        monkeypatch.setattr("zourcewell.server.create_app", lambda st: object())
+        monkeypatch.setattr("zourcewell.cli._ensure_free_port", lambda s, h, p: p)
         monkeypatch.setattr(chat_ui, "_wait_for_server", lambda *a, **k: True)
 
         def _boom(*a, **k):
@@ -779,7 +779,7 @@ def test_chat_cleanup_is_single_shot_when_the_repl_is_interrupted(monkeypatch,
                                   "chat"])
 def test_every_subcommand_has_help(capsys, path):
     """T6. Pre-change four of the six rendered as a bare {serve,waf,models,...}
-    name list, so `deepseaport --help` said nothing about what they do."""
+    name list, so `zourcewell --help` said nothing about what they do."""
     with pytest.raises(SystemExit) as exc:
         cli_mod.main(["--help"])
     assert exc.value.code == 0

@@ -8,12 +8,12 @@ import json
 
 import pytest
 
-from deepseaport.providers.qwen import protocol as QP
-from deepseaport.providers.qwen import sse_parser as QSP
-from deepseaport.providers.qwen import client as QC
-from deepseaport.providers.qwen import auth as QA
-from deepseaport.providers.qwen import provider as QProv
-from deepseaport.providers.qwen import completion_service as QCS
+from zourcewell.providers.qwen import protocol as QP
+from zourcewell.providers.qwen import sse_parser as QSP
+from zourcewell.providers.qwen import client as QC
+from zourcewell.providers.qwen import auth as QA
+from zourcewell.providers.qwen import provider as QProv
+from zourcewell.providers.qwen import completion_service as QCS
 
 
 _UNSET = object()
@@ -153,7 +153,7 @@ def test_qwen_headers_latin1_safe():
 
 
 def test_bridge_headers_fallback(monkeypatch):
-    monkeypatch.setattr("deepseaport.core.obscura_bridge.get_default_bridge",
+    monkeypatch.setattr("zourcewell.core.obscura_bridge.get_default_bridge",
                         lambda: None)
     bh = QP.bridge_headers(bearer="t")
     base = QP.base_headers(bearer="t")
@@ -854,7 +854,7 @@ def test_bridge_headers_explicit_bridge_wins_over_default(monkeypatch):
         def cookie_header(self):
             return self._c
 
-    monkeypatch.setattr("deepseaport.core.obscura_bridge.get_default_bridge",
+    monkeypatch.setattr("zourcewell.core.obscura_bridge.get_default_bridge",
                         lambda: _B("DEFAULT-UA", "acw_tc=default; token=OLDDEFAULT"))
     app_bridge = _B("APP-UA", "aws-waf-token=DSJAR")
     h = QP.bridge_headers(bearer="jwt123", bridge=app_bridge)
@@ -889,7 +889,7 @@ def test_headers_prefers_app_bridge(monkeypatch):
         class _App:
             state = _St()
 
-        monkeypatch.setattr("deepseaport.core.obscura_bridge.get_default_bridge",
+        monkeypatch.setattr("zourcewell.core.obscura_bridge.get_default_bridge",
                             lambda: _B("DEFAULT-UA", "aws-waf-token=default-jar"))
         h = QCS._headers(_App(), "jwt999")
         assert h["User-Agent"] == "APP-UA"
@@ -992,7 +992,7 @@ def test_waf_log_names_only_no_values(monkeypatch, caplog):
     _sess(monkeypatch, post=resp)
     headers = {"Authorization": "Bearer SECRETJWT",
                "Cookie": "acw_tc=SECRETACW; token=SECRETJWT"}
-    with caplog.at_level(logging.WARNING, logger="deepseaport.client"):
+    with caplog.at_level(logging.WARNING, logger="zourcewell.client"):
         with pytest.raises(RuntimeError, match="WAF"):
             QC.create_chat(dict(headers), "qwen3.7-plus")
     names_hit = any("acw_tc" in r.message and "token" in r.message
@@ -1004,9 +1004,9 @@ def test_waf_log_names_only_no_values(monkeypatch, caplog):
 
 def test_overload_rebuilds_headers_no_stale(monkeypatch):
     # First attempt overloads, retry must use fresh (not stale) headers.
-    from deepseaport.config import AccountConfig
-    from deepseaport.accounts import PooledAccount
-    from deepseaport.providers.qwen.sse_parser import StreamEvent
+    from zourcewell.config import AccountConfig
+    from zourcewell.accounts import PooledAccount
+    from zourcewell.providers.qwen.sse_parser import StreamEvent
 
     calls = {"n_headers": 0}
 
@@ -1129,7 +1129,7 @@ def test_prime_winerror5_graceful_names_only(monkeypatch, caplog):
             get = staticmethod(_raise_get)
 
         monkeypatch.setattr(QC, "_SESSION", _S())
-        with caplog.at_level(logging.WARNING, logger="deepseaport.client"):
+        with caplog.at_level(logging.WARNING, logger="zourcewell.client"):
             assert QC.prime_waf({"Cookie": "token=SECRETJWT"}) is False
         assert "WinError5" in caplog.text or "winerror5" in caplog.text.lower()
         assert "SECRETJWT" not in caplog.text
@@ -1175,8 +1175,8 @@ def test_headers_include_cached_acw_tc_plus_token(monkeypatch):
 def test_refresh_winerror5_primes_qwen_host(monkeypatch, caplog):
     import logging
     import threading
-    from deepseaport.config import AccountConfig
-    from deepseaport.accounts import PooledAccount
+    from zourcewell.config import AccountConfig
+    from zourcewell.accounts import PooledAccount
     QC._clear_waf_cache()
     try:
         prime_urls = []
@@ -1284,7 +1284,7 @@ def test_prime_qwen_bridge_stores_solved_jar(monkeypatch):
                 import json as _j
                 return {c["name"]: c["value"] for c in _j.loads(payload)}
 
-        monkeypatch.setattr("deepseaport.core.obscura_bridge.profile_lock",
+        monkeypatch.setattr("zourcewell.core.obscura_bridge.profile_lock",
                             lambda prof: __import__("contextlib").nullcontext())
         assert QC.prime_qwen_bridge(_B()) is True
         d = QC.qwen_waf_cookie_dict()
@@ -1311,7 +1311,7 @@ def test_prime_qwen_bridge_winerror5_graceful(monkeypatch):
             def _run(self, *a, **k):
                 return _raise()
 
-        monkeypatch.setattr("deepseaport.core.obscura_bridge.profile_lock",
+        monkeypatch.setattr("zourcewell.core.obscura_bridge.profile_lock",
                             lambda prof: __import__("contextlib").nullcontext())
         assert QC.prime_qwen_bridge(_B()) is False
     finally:
@@ -1319,11 +1319,11 @@ def test_prime_qwen_bridge_winerror5_graceful(monkeypatch):
 
 
 def test_no_bearer_env_omits_authorization(monkeypatch):
-    monkeypatch.setenv("DEEPSEAPORT_QWEN_NO_BEARER", "1")
+    monkeypatch.setenv("ZOURCEWELL_QWEN_NO_BEARER", "1")
     h = QP.base_headers(bearer="jwtX", waf_cookies="acw_tc=a")
     assert h["Cookie"] == "acw_tc=a; token=jwtX"
     assert "Authorization" not in h
-    monkeypatch.delenv("DEEPSEAPORT_QWEN_NO_BEARER", raising=False)
+    monkeypatch.delenv("ZOURCEWELL_QWEN_NO_BEARER", raising=False)
     h2 = QP.base_headers(bearer="jwtX", waf_cookies="acw_tc=a")
     assert h2["Authorization"] == "Bearer jwtX"
 
@@ -1385,7 +1385,7 @@ def test_login_stays_3_tuple(monkeypatch):
 
 def test_token_expired_persisted_and_jwt():
     import time as _t
-    from deepseaport.config import AccountConfig
+    from zourcewell.config import AccountConfig
 
     now = _t.time()
     assert QA.token_expired(AccountConfig(token="x", token_expires_at=now - 10)) is True
@@ -1450,9 +1450,9 @@ def _qwen_prep():
 
 def test_expired_token_proactive_relogin(monkeypatch):
     import time as _t
-    from deepseaport.config import AccountConfig
-    from deepseaport.accounts import PooledAccount
-    from deepseaport.providers.qwen.sse_parser import StreamEvent
+    from zourcewell.config import AccountConfig
+    from zourcewell.accounts import PooledAccount
+    from zourcewell.providers.qwen.sse_parser import StreamEvent
 
     monkeypatch.setattr(QCS, "_headers",
                         lambda app, token: {"Authorization": f"Bearer {token}",
@@ -1481,9 +1481,9 @@ def test_expired_token_proactive_relogin(monkeypatch):
 
 def test_401_recovers_via_relogin_once(monkeypatch):
     import time as _t
-    from deepseaport.config import AccountConfig
-    from deepseaport.accounts import PooledAccount
-    from deepseaport.providers.qwen.sse_parser import StreamEvent
+    from zourcewell.config import AccountConfig
+    from zourcewell.accounts import PooledAccount
+    from zourcewell.providers.qwen.sse_parser import StreamEvent
 
     monkeypatch.setattr(QCS, "_headers",
                         lambda app, token: {"Authorization": f"Bearer {token}",
@@ -1522,9 +1522,9 @@ def test_401_recovers_via_relogin_once(monkeypatch):
 def test_401_without_password_stays_401(monkeypatch):
     from fastapi import HTTPException
 
-    from deepseaport.config import AccountConfig
-    from deepseaport.accounts import PooledAccount
-    from deepseaport.providers.qwen.sse_parser import StreamEvent
+    from zourcewell.config import AccountConfig
+    from zourcewell.accounts import PooledAccount
+    from zourcewell.providers.qwen.sse_parser import StreamEvent
 
     monkeypatch.setattr(QCS, "_headers",
                         lambda app, token: {"Authorization": f"Bearer {token}",
@@ -1550,9 +1550,9 @@ def test_401_without_password_stays_401(monkeypatch):
 def test_401_ban_probe_fails_over_with_403(monkeypatch):
     from fastapi import HTTPException
 
-    from deepseaport.config import AccountConfig
-    from deepseaport.accounts import PooledAccount
-    from deepseaport.providers.qwen.sse_parser import StreamEvent
+    from zourcewell.config import AccountConfig
+    from zourcewell.accounts import PooledAccount
+    from zourcewell.providers.qwen.sse_parser import StreamEvent
 
     monkeypatch.setattr(QCS, "_headers",
                         lambda app, token: {"Authorization": f"Bearer {token}",

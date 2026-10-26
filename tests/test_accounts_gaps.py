@@ -1,4 +1,4 @@
-"""Offline gap tests for deepseaport.accounts (no network, <1s each)."""
+"""Offline gap tests for zourcewell.accounts (no network, <1s each)."""
 
 import asyncio
 import threading
@@ -6,9 +6,9 @@ import time
 
 import pytest
 
-import deepseaport.accounts as A
+import zourcewell.accounts as A
 from support import settings
-from deepseaport.accounts import (
+from zourcewell.accounts import (
     AccountPool,
     PooledAccount,
     _ban_cache_key,
@@ -28,7 +28,7 @@ from deepseaport.accounts import (
     set_account_token,
     sync_current_from_settings,
 )
-from deepseaport.config import AccountConfig, Settings
+from zourcewell.config import AccountConfig, Settings
 
 
 LONG = "x" * 32
@@ -349,7 +349,7 @@ def test_aacquire_no_failover_pins_current():
 def test_check_ban_short_token_no_network(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("network must not be called")
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.check_ban", _boom)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.check_ban", _boom)
     assert check_ban_for_token("t1") == (False, None)
     assert check_ban_for_token("") == (False, None)
 
@@ -362,7 +362,7 @@ def test_check_ban_long_token_calls_client(monkeypatch):
         assert "x" * 32 in str(headers.get("Authorization", ""))
         return True, 999.0
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.check_ban", _fake)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.check_ban", _fake)
     assert check_ban_for_token(LONG) == (True, 999.0)
     assert seen["timeout"] == 12
 
@@ -371,7 +371,7 @@ def test_check_ban_exception_returns_false_none(monkeypatch):
     def _boom(headers, timeout=12):
         raise RuntimeError("offline")
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.check_ban", _boom)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.check_ban", _boom)
     assert check_ban_for_token(LONG) == (False, None)
 
 
@@ -427,7 +427,7 @@ def test_get_cached_returns_persisted_plus_cached_no_network(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("no network allowed")
 
-    monkeypatch.setattr("deepseaport.providers.deepseek.client.check_ban", _boom)
+    monkeypatch.setattr("zourcewell.providers.deepseek.client.check_ban", _boom)
     out = get_cached_ban_labels([persisted, live])
     assert out["p@x.com"] is None
     assert out["live@x.com"] == 42.0
